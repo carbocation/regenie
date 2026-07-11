@@ -36,5 +36,5 @@ jobs:
             -DBUILD_TESTING=ON
           cmake --build build-cuda --target regenie step1_compute_test -j 2
 
-      - name: Run CPU conformance without a GPU
-        run: ./build-cuda/step1_compute_test --backend cpu
+      - name: Run CPU and auto-fallback conformance without a GPU
+        run: ctest --test-dir build-cuda --output-on-failure

@@ -300,6 +300,8 @@ if(BUILD_TESTING)
   configure_step1_cuda(step1_compute_test)
   add_test(NAME step1_compute_cpu
     COMMAND step1_compute_test --backend cpu)
+  add_test(NAME step1_compute_auto
+    COMMAND step1_compute_test --backend auto)
 endif()
 
 # Boost IO

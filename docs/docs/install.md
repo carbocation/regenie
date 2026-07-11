@@ -77,8 +77,9 @@ the binary contains the backend and the requested device is available,
 otherwise it uses the CPU backend.
 
 For development, the repository includes a single A100 validation command.
-It builds both backends, checks their matrix results, benchmarks them, runs a
-small end-to-end Step 1 job, and compares the CPU and CUDA LOCO files:
+It builds both backends, checks matrix shapes and failure paths, benchmarks
+them, runs small k-fold and LOOCV Step 1 jobs, and compares the CPU and CUDA
+LOCO files:
 
 ```
 BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh

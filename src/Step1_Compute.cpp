@@ -63,6 +63,10 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
       Step1GramMode mode,
       Step1ComputeTimings* timings) override {
 
+      if(genotypes.cols() != phenotypes.rows())
+        throw std::invalid_argument(
+          "Step 1 compute backend received incompatible genotype and phenotype matrices");
+
       if(mode == Step1GramMode::selfadjoint_rank_update) {
         ComputeClock::time_point start;
         if(timings) start = ComputeClock::now();

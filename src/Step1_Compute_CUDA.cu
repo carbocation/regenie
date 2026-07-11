@@ -31,6 +31,7 @@
 
 #include <chrono>
 #include <climits>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -144,7 +145,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeTimings* timings) override {
 
       if(genotypes.cols() != phenotypes.rows())
-        throw std::runtime_error("CUDA Step 1 backend received incompatible genotype and phenotype matrices");
+        throw std::invalid_argument(
+          "Step 1 compute backend received incompatible genotype and phenotype matrices");
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int blocks = checked_int(genotypes.rows(), "genotype rows");
@@ -153,19 +155,22 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       gram.resize(blocks, blocks);
       crossproduct.resize(blocks, phenotype_count);
-      if(blocks == 0 || samples == 0 || phenotype_count == 0) {
+      if(blocks == 0 || samples == 0) {
         gram.setZero();
         crossproduct.setZero();
         return;
       }
 
       ensure_capacity(d_genotypes_, genotypes_capacity_, genotypes.size(), "cudaMalloc(genotypes)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_, phenotypes.size(), "cudaMalloc(phenotypes)");
       ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(Gram matrix)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(), "cudaMalloc(crossproduct)");
+      if(phenotype_count > 0) {
+        ensure_capacity(d_phenotypes_, phenotypes_capacity_, phenotypes.size(), "cudaMalloc(phenotypes)");
+        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(), "cudaMalloc(crossproduct)");
+      }
 
       const Eigen::MatrixXd packed_genotypes = contiguous_copy_if_needed(genotypes);
-      const Eigen::MatrixXd packed_phenotypes = contiguous_copy_if_needed(phenotypes);
+      const Eigen::MatrixXd packed_phenotypes = phenotype_count > 0 ?
+        contiguous_copy_if_needed(phenotypes) : Eigen::MatrixXd();
       const double* genotype_data = packed_genotypes.size() ? packed_genotypes.data() : genotypes.data();
       const double* phenotype_data = packed_phenotypes.size() ? packed_phenotypes.data() : phenotypes.data();
 
@@ -173,23 +178,27 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(timings) transfer_start = ComputeClock::now();
       check_cuda(cudaMemcpy(d_genotypes_, genotype_data, genotypes.size() * sizeof(double),
         cudaMemcpyHostToDevice), "copy genotypes to CUDA device");
-      check_cuda(cudaMemcpy(d_phenotypes_, phenotype_data, phenotypes.size() * sizeof(double),
-        cudaMemcpyHostToDevice), "copy phenotypes to CUDA device");
+      if(phenotype_count > 0)
+        check_cuda(cudaMemcpy(d_phenotypes_, phenotype_data, phenotypes.size() * sizeof(double),
+          cudaMemcpyHostToDevice), "copy phenotypes to CUDA device");
       if(timings) timings->upload_ms += elapsed_ms(transfer_start);
 
       const double alpha = 1.0;
       const double beta = 0.0;
 
-      std::unique_ptr<CudaEventPair> crossproduct_events;
-      if(timings) {
-        crossproduct_events.reset(new CudaEventPair());
-        crossproduct_events->record_start();
+      if(phenotype_count > 0) {
+        std::unique_ptr<CudaEventPair> crossproduct_events;
+        if(timings) {
+          crossproduct_events.reset(new CudaEventPair());
+          crossproduct_events->record_start();
+        }
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+          blocks, phenotype_count, samples, &alpha,
+          d_genotypes_, blocks, d_phenotypes_, samples, &beta,
+          d_crossproduct_, blocks), "cublasDgemm(genotypes * phenotypes)");
+        if(timings)
+          timings->crossproduct_ms += crossproduct_events->record_stop_and_elapsed_ms();
       }
-      check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
-        blocks, phenotype_count, samples, &alpha,
-        d_genotypes_, blocks, d_phenotypes_, samples, &beta,
-        d_crossproduct_, blocks), "cublasDgemm(genotypes * phenotypes)");
-      if(timings) timings->crossproduct_ms += crossproduct_events->record_stop_and_elapsed_ms();
 
       std::unique_ptr<CudaEventPair> gram_events;
       if(timings) {
@@ -214,8 +223,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(timings) timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
 
       if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_, crossproduct.size() * sizeof(double),
-        cudaMemcpyDeviceToHost), "copy crossproduct from CUDA device");
+      if(phenotype_count > 0)
+        check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_, crossproduct.size() * sizeof(double),
+          cudaMemcpyDeviceToHost), "copy crossproduct from CUDA device");
       check_cuda(cudaMemcpy(gram.data(), d_gram_, gram.size() * sizeof(double),
         cudaMemcpyDeviceToHost), "copy Gram matrix from CUDA device");
       if(timings) timings->download_ms += elapsed_ms(transfer_start);
@@ -233,6 +243,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::Index required, const char* label) {
       const size_t required_size = static_cast<size_t>(required);
       if(required_size <= capacity) return;
+      if(required_size > std::numeric_limits<size_t>::max() / sizeof(double))
+        throw std::runtime_error(std::string("CUDA allocation size overflow for ") + label);
       if(pointer) check_cuda(cudaFree(pointer), "cudaFree while growing buffer");
       pointer = nullptr;
       capacity = 0;

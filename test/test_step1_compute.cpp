@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -68,6 +69,9 @@ Eigen::MatrixXd deterministic_matrix(int rows, int columns, double phase) {
 }
 
 double relative_error(const Eigen::MatrixXd& actual, const Eigen::MatrixXd& expected) {
+  if(actual.rows() != expected.rows() || actual.cols() != expected.cols())
+    return std::numeric_limits<double>::max();
+  if(actual.size() == 0) return 0;
   const double scale = std::max(1.0, expected.cwiseAbs().maxCoeff());
   return (actual - expected).cwiseAbs().maxCoeff() / scale;
 }
@@ -115,6 +119,52 @@ void run_conformance(Step1ComputeBackend& candidate) {
   padded_phenotypes.middleRows(3, 43) = phenotypes;
   check_case(candidate, *oracle, genotypes, padded_phenotypes.middleRows(3, 43),
     Step1GramMode::full_product, "strided_phenotypes");
+
+  Eigen::MatrixXd padded_genotypes = deterministic_matrix(23, 43, 0.2);
+  padded_genotypes.middleRows(2, 17) = genotypes;
+  check_case(candidate, *oracle, padded_genotypes.middleRows(2, 17), phenotypes,
+    Step1GramMode::selfadjoint_rank_update, "strided_genotypes");
+
+  check_case(candidate, *oracle,
+    deterministic_matrix(1, 1, 0.7), deterministic_matrix(1, 1, -0.8),
+    Step1GramMode::selfadjoint_rank_update, "scalar");
+  check_case(candidate, *oracle,
+    deterministic_matrix(31, 7, 0.3), deterministic_matrix(7, 3, -0.1),
+    Step1GramMode::full_product, "more_blocks_than_samples");
+
+  const Eigen::MatrixXd no_phenotypes(43, 0);
+  check_case(candidate, *oracle, genotypes, no_phenotypes,
+    Step1GramMode::selfadjoint_rank_update, "zero_phenotypes");
+  const Eigen::MatrixXd no_samples_genotypes(17, 0);
+  const Eigen::MatrixXd no_samples_phenotypes(0, 5);
+  check_case(candidate, *oracle, no_samples_genotypes, no_samples_phenotypes,
+    Step1GramMode::full_product, "zero_samples");
+  const Eigen::MatrixXd no_blocks(0, 43);
+  check_case(candidate, *oracle, no_blocks, phenotypes,
+    Step1GramMode::full_product, "zero_blocks");
+
+  Eigen::MatrixXd gram, crossproduct;
+  Step1ComputeTimings timings;
+  timings.upload_ms = timings.crossproduct_ms = timings.gram_ms = timings.download_ms = 1.0;
+  candidate.compute_products(genotypes, phenotypes, gram, crossproduct,
+    Step1GramMode::selfadjoint_rank_update, &timings);
+  if(!std::isfinite(timings.upload_ms) || !std::isfinite(timings.crossproduct_ms) ||
+     !std::isfinite(timings.gram_ms) || !std::isfinite(timings.download_ms) ||
+     timings.upload_ms < 1.0 || timings.crossproduct_ms < 1.0 ||
+     timings.gram_ms < 1.0 || timings.download_ms < 1.0)
+    throw std::runtime_error("backend returned invalid or non-accumulating timings");
+  std::cout << "STEP1_BACKEND_TEST case=timing_accumulation status=PASS\n";
+
+  bool rejected_mismatch = false;
+  try {
+    candidate.compute_products(genotypes, deterministic_matrix(42, 5, 0.0),
+      gram, crossproduct, Step1GramMode::full_product);
+  } catch(const std::invalid_argument&) {
+    rejected_mismatch = true;
+  }
+  if(!rejected_mismatch)
+    throw std::runtime_error("backend accepted incompatible matrix dimensions");
+  std::cout << "STEP1_BACKEND_TEST case=dimension_mismatch status=PASS\n";
 }
 
 void run_benchmark(Step1ComputeBackend& backend, const Options& options) {
