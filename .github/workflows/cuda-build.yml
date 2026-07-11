@@ -1,0 +1,40 @@
+name: CUDA build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      BGEN_VERSION: v1.1.7
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates cmake g++ gfortran git make python3 wget zlib1g-dev
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build BGEN
+        run: |
+          wget -O bgen.tgz "http://code.enkre.net/bgen/tarball/release/${BGEN_VERSION}"
+          tar -xzf bgen.tgz
+          cd "${BGEN_VERSION}"
+          python3 waf configure
+          python3 waf
+
+      - name: Compile CUDA targets
+        run: |
+          BGEN_PATH="${GITHUB_WORKSPACE}/${BGEN_VERSION}" cmake -S . -B build-cuda \
+            -DREGENIE_WITH_CUDA=ON \
+            -DREGENIE_CUDA_ARCHITECTURES=80 \
+            -DBUILD_TESTING=ON
+          cmake --build build-cuda --target regenie step1_compute_test -j 2
+
+      - name: Run CPU conformance without a GPU
+        run: ./build-cuda/step1_compute_test --backend cpu

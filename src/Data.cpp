@@ -93,6 +93,12 @@ void Data::run() {
   // set number of threads
   set_threads(&params);
 
+  if(!params.test_mode) {
+    step1_compute_backend = make_step1_compute_backend(params.compute_backend, params.gpu_device);
+    sout << " * Step 1 compute backend : [" << step1_compute_backend->name() << "] "
+         << step1_compute_backend->description() << "\n";
+  }
+
   if(params.streamBGEN) check_bgen(files.bgen_file, params.file_type, params.zlib_compress, params.streamBGEN, params.BGENbits, params.nChrom);
 
   if(params.test_mode){  // step 2
@@ -774,36 +780,51 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
 
     for( int i = 0; i < params.cv_folds; ++i ) {
       MapMatXd Gmat (&(Gblock.Gmat(0,cum_size_folds)), bs, params.cv_sizes(i));
-      ProfileClock::time_point profile_start;
-      if(params.profile_step1) profile_start = ProfileClock::now();
+      Step1ComputeTimings timings;
       if(params.test_l0)
-        step1_compute_backend->compute_crossproduct(Gmat, l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i)), l0->GtY[i]);
+        step1_compute_backend->compute_products(
+          Gmat,
+          l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i)),
+          l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
+          params.profile_step1 ? &timings : nullptr);
       else
-        step1_compute_backend->compute_crossproduct(Gmat, pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i)), l0->GtY[i]);
+        step1_compute_backend->compute_products(
+          Gmat,
+          pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i)),
+          l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
+          params.profile_step1 ? &timings : nullptr);
       l0->GTY += l0->GtY[i];
-      if(params.profile_step1) step1_profile.gty_ms += elapsed_ms(profile_start);
-
-      if(params.profile_step1) profile_start = ProfileClock::now();
-      step1_compute_backend->compute_gram(Gmat, l0->G_folds[i], Step1GramMode::full_product);
       l0->GGt += l0->G_folds[i];
-      if(params.profile_step1) step1_profile.gram_ms += elapsed_ms(profile_start);
+      if(params.profile_step1) {
+        step1_profile.gty_ms += timings.crossproduct_ms;
+        step1_profile.gram_ms += timings.gram_ms;
+        step1_profile.backend_upload_ms += timings.upload_ms;
+        step1_profile.backend_download_ms += timings.download_ms;
+      }
       cum_size_folds += params.cv_sizes(i);
     }
     
   } else { // loocv
 
-    ProfileClock::time_point profile_start;
-    if(params.profile_step1) profile_start = ProfileClock::now();
-    step1_compute_backend->compute_gram(Gblock.Gmat, l0->GGt, Step1GramMode::selfadjoint_rank_update);
-    if(params.profile_step1) step1_profile.gram_ms += elapsed_ms(profile_start);
-
-    if(params.profile_step1) profile_start = ProfileClock::now();
+    Step1ComputeTimings timings;
     if(params.test_l0)
-      step1_compute_backend->compute_crossproduct(Gblock.Gmat, l0->ymat_res, l0->GTY);
+      step1_compute_backend->compute_products(
+        Gblock.Gmat, l0->ymat_res, l0->GGt, l0->GTY,
+        Step1GramMode::selfadjoint_rank_update,
+        params.profile_step1 ? &timings : nullptr);
     else
-      step1_compute_backend->compute_crossproduct(Gblock.Gmat, pheno_data.phenotypes, l0->GTY);
-    if(params.profile_step1) step1_profile.gty_ms += elapsed_ms(profile_start);
+      step1_compute_backend->compute_products(
+        Gblock.Gmat, pheno_data.phenotypes, l0->GGt, l0->GTY,
+        Step1GramMode::selfadjoint_rank_update,
+        params.profile_step1 ? &timings : nullptr);
+    if(params.profile_step1) {
+      step1_profile.gty_ms += timings.crossproduct_ms;
+      step1_profile.gram_ms += timings.gram_ms;
+      step1_profile.backend_upload_ms += timings.upload_ms;
+      step1_profile.backend_download_ms += timings.download_ms;
+    }
     if(!params.test_l0){
+      ProfileClock::time_point profile_start;
       if(params.profile_step1) profile_start = ProfileClock::now();
       SelfAdjointEigenSolver<MatrixXd> esG(l0->GGt);
       l0->GGt_eig_vec = esG.eigenvectors();
@@ -824,13 +845,14 @@ void Data::print_step1_profile() {
 
   const double measured_ms = step1_profile.decode_ms + step1_profile.residualize_ms +
     step1_profile.gram_ms + step1_profile.gty_ms + step1_profile.eigensolve_ms +
+    step1_profile.backend_upload_ms + step1_profile.backend_download_ms +
     step1_profile.association_ms + step1_profile.ridge_ms;
   const double other_ms = std::max(0.0, step1_profile.total_ms - measured_ms);
   const double denominator = step1_profile.total_ms > 0 ? step1_profile.total_ms : 1;
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=1 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=2 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -847,6 +869,8 @@ void Data::print_step1_profile() {
   print_stage("residualize", step1_profile.residualize_ms);
   print_stage("gram", step1_profile.gram_ms);
   print_stage("phenotype_crossproduct", step1_profile.gty_ms);
+  print_stage("backend_upload", step1_profile.backend_upload_ms);
+  print_stage("backend_download", step1_profile.backend_download_ms);
   print_stage("eigensolve_transform", step1_profile.eigensolve_ms);
   print_stage("association", step1_profile.association_ms);
   print_stage("ridge", step1_profile.ridge_ms);

@@ -57,6 +57,37 @@ To use with Boost Iostreams and/or Intel MKL library,
 add the corresponding flags before the `cmake` command on line 3
 (e.g. `BGEN_PATH=<path_to_bgen_lib> HAS_BOOST_IOSTREAM=1 cmake ..`).
 
+### Experimental CUDA Step 1 backend
+
+The CUDA backend accelerates the FP64 Gram matrix and phenotype
+crossproduct operations in Step 1. It is disabled by default, requires CMake
+3.18 or newer and the CUDA toolkit, and currently requires a dynamic build.
+Build for an NVIDIA A100 (compute capability 8.0) with:
+
+```
+BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
+  -DREGENIE_WITH_CUDA=ON \
+  -DREGENIE_CUDA_ARCHITECTURES=80
+cmake --build build-cuda -j
+```
+
+Select it in Step 1 with `--compute-backend cuda`; use `--gpu-device` when
+more than one CUDA device is visible. `--compute-backend auto` uses CUDA when
+the binary contains the backend and the requested device is available,
+otherwise it uses the CPU backend.
+
+For development, the repository includes a single A100 validation command.
+It builds both backends, checks their matrix results, benchmarks them, runs a
+small end-to-end Step 1 job, and compares the CPU and CUDA LOCO files:
+
+```
+BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh
+```
+
+The normal build remains CUDA-free, so CPU development and regression testing
+can continue on macOS. CUDA compilation is also checked in CI without running
+GPU code.
+
 ### With Docker
 Alternatively, you can use a Docker image to run **regenie**. 
 A guide to using docker is available on 

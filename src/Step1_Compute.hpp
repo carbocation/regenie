@@ -28,11 +28,19 @@
 #define STEP1_COMPUTE_H
 
 #include <memory>
+#include <string>
 #include <Eigen/Dense>
 
 enum class Step1GramMode {
   full_product,
   selfadjoint_rank_update
+};
+
+struct Step1ComputeTimings {
+  double upload_ms = 0;
+  double crossproduct_ms = 0;
+  double gram_ms = 0;
+  double download_ms = 0;
 };
 
 class Step1ComputeBackend {
@@ -41,18 +49,21 @@ class Step1ComputeBackend {
     virtual ~Step1ComputeBackend() {}
 
     virtual const char* name() const = 0;
+    virtual std::string description() const = 0;
 
-    virtual void compute_gram(
-      const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
-      Eigen::MatrixXd& gram,
-      Step1GramMode mode) = 0;
-
-    virtual void compute_crossproduct(
+    virtual void compute_products(
       const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
       const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
-      Eigen::MatrixXd& crossproduct) = 0;
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1GramMode mode,
+      Step1ComputeTimings* timings = nullptr) = 0;
 };
 
 std::unique_ptr<Step1ComputeBackend> make_cpu_step1_compute_backend();
+std::unique_ptr<Step1ComputeBackend> make_step1_compute_backend(
+  const std::string& requested_backend,
+  int device);
+bool cuda_step1_compute_backend_compiled();
 
 #endif
