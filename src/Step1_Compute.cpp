@@ -44,6 +44,205 @@ double elapsed_ms(const ComputeClock::time_point& start) {
 
 }
 
+void Step1ComputeBackend::diagonal_penalty_predict(
+  const Eigen::Ref<const Eigen::MatrixXd>& gram,
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  const Eigen::Ref<const Eigen::MatrixXd>& prediction_matrix,
+  bool samples_in_columns,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  const Eigen::Ref<const Eigen::MatrixXd>& leave_one_out_outcomes,
+  bool leave_one_out,
+  Eigen::MatrixXd& predictions,
+  Eigen::MatrixXd& coefficients,
+  Step1ComputeTimings* timings) {
+
+  const Eigen::Index size = gram.rows();
+  const Eigen::Index sample_count = samples_in_columns ?
+    prediction_matrix.cols() : prediction_matrix.rows();
+  const Eigen::Index outcome_count = right_hand_sides.cols();
+  const Eigen::Index parameter_count = ridge_parameters.size();
+  if(gram.cols() != size || right_hand_sides.rows() != size ||
+     penalty_multipliers.size() != size ||
+     (samples_in_columns ? prediction_matrix.rows() : prediction_matrix.cols()) != size)
+    throw std::invalid_argument(
+      "Step 1 diagonal-penalty solve received incompatible matrix dimensions");
+  if((ridge_parameters.array() < 0).any())
+    throw std::invalid_argument("Step 1 diagonal-penalty parameters must be non-negative");
+  if((penalty_multipliers.array() < 0).any())
+    throw std::invalid_argument("Step 1 diagonal-penalty multipliers must be non-negative");
+  if(leave_one_out &&
+     (leave_one_out_outcomes.rows() != sample_count ||
+      leave_one_out_outcomes.cols() != outcome_count))
+    throw std::invalid_argument(
+      "Step 1 diagonal-penalty LOOCV outcomes have incompatible dimensions");
+
+  predictions.resize(sample_count, outcome_count * parameter_count);
+  coefficients.resize(size, outcome_count * parameter_count);
+  if(size == 0 || sample_count == 0 || outcome_count == 0 || parameter_count == 0) {
+    predictions.setZero();
+    coefficients.setZero();
+    return;
+  }
+
+  const Eigen::VectorXd no_additional_ridge = Eigen::VectorXd::Zero(1);
+  for(Eigen::Index parameter = 0; parameter < parameter_count; ++parameter) {
+    Eigen::MatrixXd penalized_gram = gram;
+    penalized_gram.diagonal().array() +=
+      ridge_parameters(parameter) * penalty_multipliers.array();
+    Eigen::MatrixXd eigenvectors, eigenvalues, transformed;
+    eigendecompose_and_transform(penalized_gram, right_hand_sides,
+      eigenvectors, eigenvalues, transformed, timings);
+    Eigen::MatrixXd parameter_predictions, parameter_coefficients;
+    ridge_predict(eigenvectors, eigenvalues, transformed, prediction_matrix,
+      samples_in_columns, no_additional_ridge, leave_one_out_outcomes,
+      leave_one_out, parameter_predictions, parameter_coefficients, timings);
+    predictions.middleCols(parameter * outcome_count, outcome_count) =
+      parameter_predictions;
+    coefficients.middleCols(parameter * outcome_count, outcome_count) =
+      parameter_coefficients;
+  }
+}
+
+void Step1ComputeBackend::diagonal_penalty_solve(
+  const Eigen::Ref<const Eigen::MatrixXd>& gram,
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  Eigen::MatrixXd& solutions,
+  Step1ComputeTimings* timings) {
+
+  const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(gram.rows(), gram.rows());
+  const Eigen::MatrixXd no_outcomes(0, 0);
+  Eigen::MatrixXd predictions;
+  diagonal_penalty_predict(gram, right_hand_sides, identity, false,
+    ridge_parameters, penalty_multipliers, no_outcomes, false,
+    predictions, solutions, timings);
+}
+
+void Step1ComputeBackend::compute_design_crossproduct(
+  const Eigen::Ref<const Eigen::MatrixXd>& design,
+  const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+  Eigen::MatrixXd& crossproduct,
+  Step1ComputeTimings* timings) {
+
+  if(design.rows() != outcomes.rows())
+    throw std::invalid_argument(
+      "Step 1 design crossproduct received incompatible dimensions");
+  crossproduct.resize(design.cols(), outcomes.cols());
+  if(design.cols() == 0 || outcomes.cols() == 0 || design.rows() == 0) {
+    crossproduct.setZero();
+    return;
+  }
+  ComputeClock::time_point start;
+  if(timings) start = ComputeClock::now();
+  crossproduct.noalias() = design.transpose() * outcomes;
+  if(timings) timings->crossproduct_ms += elapsed_ms(start);
+}
+
+void Step1ComputeBackend::grouped_leave_one_out_predict_factorized(
+  const Eigen::Ref<const Eigen::MatrixXd>& design,
+  const Eigen::Ref<const Eigen::VectorXd>& coefficients,
+  const Eigen::Ref<const Eigen::VectorXd>& residuals,
+  const Eigen::Ref<const Eigen::VectorXd>& leverage_weights,
+  const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+  const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+  Eigen::MatrixXd& predictions,
+  Step1ComputeTimings* timings) {
+
+  if(design.cols() != coefficients.size() ||
+     design.rows() != residuals.size() ||
+     design.rows() != leverage_weights.size() ||
+     group_offsets.size() != group_sizes.size())
+    throw std::invalid_argument(
+      "Step 1 grouped LOOCV prediction received incompatible dimensions");
+  if(!coefficients.allFinite() || !residuals.allFinite() ||
+     !leverage_weights.allFinite())
+    throw std::invalid_argument(
+      "Step 1 grouped LOOCV prediction requires finite inputs");
+  if((leverage_weights.array() < 0).any())
+    throw std::invalid_argument(
+      "Step 1 grouped LOOCV prediction requires non-negative leverage weights");
+  for(Eigen::Index group = 0; group < group_offsets.size(); ++group) {
+    if(group_offsets(group) < 0 || group_sizes(group) < 0 ||
+       group_offsets(group) > design.cols() - group_sizes(group))
+      throw std::invalid_argument(
+        "Step 1 grouped LOOCV prediction received an invalid feature group");
+  }
+
+  Eigen::MatrixXd inverse_design_transpose;
+  solve_factorized(design.transpose(), inverse_design_transpose, timings);
+  predictions.resize(design.rows(), group_offsets.size());
+  if(design.rows() == 0 || group_offsets.size() == 0) {
+    predictions.setZero();
+    return;
+  }
+
+  ComputeClock::time_point start;
+  if(timings) start = ComputeClock::now();
+  const Eigen::VectorXd leverage =
+    ((design.array() * inverse_design_transpose.transpose().array())
+      .rowwise().sum() * leverage_weights.array()).matrix();
+  const Eigen::VectorXd adjustment =
+    (residuals.array() / (1.0 - leverage.array())).matrix();
+  for(Eigen::Index group = 0; group < group_offsets.size(); ++group) {
+    const Eigen::Index offset = group_offsets(group);
+    const Eigen::Index count = group_sizes(group);
+    if(count == 0) {
+      predictions.col(group).setZero();
+      continue;
+    }
+    predictions.col(group).noalias() =
+      design.middleCols(offset, count) * coefficients.segment(offset, count);
+    predictions.col(group).array() -= adjustment.array() *
+      (design.middleCols(offset, count).array() *
+       inverse_design_transpose.middleRows(offset, count).transpose().array())
+        .rowwise().sum();
+  }
+  if(timings) timings->ridge_ms += elapsed_ms(start);
+}
+
+void Step1ComputeBackend::grouped_predict(
+  const Eigen::Ref<const Eigen::MatrixXd>& design,
+  const Eigen::Ref<const Eigen::VectorXd>& coefficients,
+  const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+  const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+  Eigen::MatrixXd& predictions,
+  Step1ComputeTimings* timings) {
+
+  if(design.cols() != coefficients.size() ||
+     group_offsets.size() != group_sizes.size())
+    throw std::invalid_argument(
+      "Step 1 grouped prediction received incompatible dimensions");
+  if(!coefficients.allFinite())
+    throw std::invalid_argument(
+      "Step 1 grouped prediction requires finite coefficients");
+  for(Eigen::Index group = 0; group < group_offsets.size(); ++group) {
+    if(group_offsets(group) < 0 || group_sizes(group) < 0 ||
+       group_offsets(group) > design.cols() - group_sizes(group))
+      throw std::invalid_argument(
+        "Step 1 grouped prediction received an invalid feature group");
+  }
+
+  predictions.resize(design.rows(), group_offsets.size());
+  if(design.rows() == 0 || group_offsets.size() == 0) {
+    predictions.setZero();
+    return;
+  }
+  ComputeClock::time_point start;
+  if(timings) start = ComputeClock::now();
+  for(Eigen::Index group = 0; group < group_offsets.size(); ++group) {
+    const Eigen::Index offset = group_offsets(group);
+    const Eigen::Index count = group_sizes(group);
+    if(count == 0)
+      predictions.col(group).setZero();
+    else
+      predictions.col(group).noalias() =
+        design.middleCols(offset, count) * coefficients.segment(offset, count);
+  }
+  if(timings) timings->ridge_ms += elapsed_ms(start);
+}
+
 class CpuStep1ComputeBackend : public Step1ComputeBackend {
 
   public:
@@ -67,6 +266,14 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
         throw std::invalid_argument(
           "Step 1 compute backend received incompatible genotype and phenotype matrices");
 
+      gram.resize(genotypes.rows(), genotypes.rows());
+      crossproduct.resize(genotypes.rows(), phenotypes.cols());
+      if(genotypes.rows() == 0 || genotypes.cols() == 0) {
+        gram.setZero();
+        crossproduct.setZero();
+        return;
+      }
+
       if(mode == Step1GramMode::selfadjoint_rank_update) {
         ComputeClock::time_point start;
         if(timings) start = ComputeClock::now();
@@ -76,18 +283,305 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
         if(timings) timings->gram_ms += elapsed_ms(start);
 
         if(timings) start = ComputeClock::now();
-        crossproduct = genotypes * phenotypes;
+        if(phenotypes.cols() > 0)
+          crossproduct.noalias() = genotypes * phenotypes;
+        else
+          crossproduct.setZero();
         if(timings) timings->crossproduct_ms += elapsed_ms(start);
       } else {
         ComputeClock::time_point start;
         if(timings) start = ComputeClock::now();
-        crossproduct = genotypes * phenotypes;
+        if(phenotypes.cols() > 0)
+          crossproduct.noalias() = genotypes * phenotypes;
+        else
+          crossproduct.setZero();
         if(timings) timings->crossproduct_ms += elapsed_ms(start);
 
         if(timings) start = ComputeClock::now();
         gram = genotypes * genotypes.transpose();
         if(timings) timings->gram_ms += elapsed_ms(start);
       }
+    }
+
+    void eigendecompose_and_transform(
+      const Eigen::Ref<const Eigen::MatrixXd>& symmetric_matrix,
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Eigen::MatrixXd& eigenvectors,
+      Eigen::MatrixXd& eigenvalues,
+      Eigen::MatrixXd& transformed_right_hand_sides,
+      Step1ComputeTimings* timings) override {
+
+      if(symmetric_matrix.rows() != symmetric_matrix.cols())
+        throw std::invalid_argument("Step 1 eigendecomposition requires a square matrix");
+      if(symmetric_matrix.rows() != right_hand_sides.rows())
+        throw std::invalid_argument(
+          "Step 1 eigendecomposition received incompatible right-hand sides");
+
+      if(symmetric_matrix.rows() == 0) {
+        eigenvectors.resize(0, 0);
+        eigenvalues.resize(0, 1);
+        transformed_right_hand_sides.resize(0, right_hand_sides.cols());
+        return;
+      }
+
+      ComputeClock::time_point start;
+      if(timings) start = ComputeClock::now();
+      Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(symmetric_matrix);
+      if(solver.info() != Eigen::Success)
+        throw std::runtime_error("Eigen CPU symmetric eigendecomposition failed");
+      eigenvectors = solver.eigenvectors();
+      eigenvalues = solver.eigenvalues();
+      if(timings) timings->eigensolve_ms += elapsed_ms(start);
+
+      if(timings) start = ComputeClock::now();
+      transformed_right_hand_sides = eigenvectors.transpose() * right_hand_sides;
+      if(timings) timings->transform_ms += elapsed_ms(start);
+    }
+
+    void compute_design_products(
+      const Eigen::Ref<const Eigen::MatrixXd>& design,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1ComputeTimings* timings) override {
+
+      if(design.rows() != outcomes.rows())
+        throw std::invalid_argument(
+          "Step 1 design products received incompatible design and outcome matrices");
+      gram.resize(design.cols(), design.cols());
+      crossproduct.resize(design.cols(), outcomes.cols());
+      ComputeClock::time_point start;
+      if(timings) start = ComputeClock::now();
+      crossproduct.noalias() = design.transpose() * outcomes;
+      if(timings) timings->crossproduct_ms += elapsed_ms(start);
+      if(timings) start = ComputeClock::now();
+      gram.noalias() = design.transpose() * design;
+      if(timings) timings->gram_ms += elapsed_ms(start);
+    }
+
+    void compute_weighted_design_products(
+      const Eigen::Ref<const Eigen::MatrixXd>& design,
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1ComputeTimings* timings) override {
+
+      if(design.rows() != weights.size() || design.rows() != outcomes.rows())
+        throw std::invalid_argument(
+          "Step 1 weighted design products received incompatible dimensions");
+      if(!weights.allFinite() || (weights.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 weighted design products require finite non-negative weights");
+      gram.resize(design.cols(), design.cols());
+      crossproduct.resize(design.cols(), outcomes.cols());
+      if(design.cols() == 0 || design.rows() == 0) {
+        gram.setZero();
+        crossproduct.setZero();
+        return;
+      }
+      const Eigen::MatrixXd weighted_design =
+        (design.array().colwise() * weights.array()).matrix();
+      ComputeClock::time_point start;
+      if(timings) start = ComputeClock::now();
+      crossproduct.noalias() = design.transpose() *
+        (outcomes.array().colwise() * weights.array()).matrix();
+      if(timings) timings->crossproduct_ms += elapsed_ms(start);
+      if(timings) start = ComputeClock::now();
+      gram.noalias() = design.transpose() * weighted_design;
+      if(timings) timings->gram_ms += elapsed_ms(start);
+    }
+
+    void factorize_diagonal_penalty(
+      const Eigen::Ref<const Eigen::MatrixXd>& gram,
+      double ridge_parameter,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Step1ComputeTimings* timings) override {
+
+      if(gram.rows() != gram.cols() || penalty_multipliers.size() != gram.rows())
+        throw std::invalid_argument(
+          "Step 1 reusable factorization received incompatible matrix dimensions");
+      if(ridge_parameter < 0)
+        throw std::invalid_argument(
+          "Step 1 reusable factorization parameter must be non-negative");
+      if((penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 reusable factorization multipliers must be non-negative");
+
+      Eigen::MatrixXd system = gram;
+      system.diagonal().array() += ridge_parameter * penalty_multipliers.array();
+      ComputeClock::time_point start;
+      if(timings) start = ComputeClock::now();
+      factorization_.compute(system);
+      if(factorization_.info() != Eigen::Success)
+        throw std::runtime_error("Eigen CPU reusable Cholesky factorization failed");
+      factorization_size_ = gram.rows();
+      if(timings) timings->ridge_ms += elapsed_ms(start);
+    }
+
+    void solve_factorized(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(factorization_size_ < 0)
+        throw std::runtime_error(
+          "Step 1 reusable solve requested before factorization");
+      if(right_hand_sides.rows() != factorization_size_)
+        throw std::invalid_argument(
+          "Step 1 reusable solve received incompatible right-hand sides");
+      solutions.resize(right_hand_sides.rows(), right_hand_sides.cols());
+      if(right_hand_sides.size() == 0) {
+        solutions.setZero();
+        return;
+      }
+      ComputeClock::time_point start;
+      if(timings) start = ComputeClock::now();
+      solutions = factorization_.solve(right_hand_sides);
+      if(factorization_.info() != Eigen::Success)
+        throw std::runtime_error("Eigen CPU reusable Cholesky solve failed");
+      if(timings) timings->ridge_ms += elapsed_ms(start);
+    }
+
+    void ridge_predict(
+      const Eigen::Ref<const Eigen::MatrixXd>& eigenvectors,
+      const Eigen::Ref<const Eigen::MatrixXd>& eigenvalues,
+      const Eigen::Ref<const Eigen::MatrixXd>& transformed_right_hand_sides,
+      const Eigen::Ref<const Eigen::MatrixXd>& prediction_matrix,
+      bool samples_in_columns,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::MatrixXd>& leave_one_out_outcomes,
+      bool leave_one_out,
+      Eigen::MatrixXd& predictions,
+      Eigen::MatrixXd& coefficients,
+      Step1ComputeTimings* timings) override {
+
+      validate_ridge_dimensions(eigenvectors, eigenvalues,
+        transformed_right_hand_sides, prediction_matrix, samples_in_columns,
+        ridge_parameters, leave_one_out_outcomes, leave_one_out);
+
+      const Eigen::Index size = eigenvectors.rows();
+      const Eigen::Index sample_count = samples_in_columns ?
+        prediction_matrix.cols() : prediction_matrix.rows();
+      const Eigen::Index phenotype_count = transformed_right_hand_sides.cols();
+      const Eigen::Index parameter_count = ridge_parameters.size();
+      const Eigen::Index combination_count = phenotype_count * parameter_count;
+      predictions.resize(sample_count, combination_count);
+      coefficients.resize(size, combination_count);
+      if(size == 0 || sample_count == 0 || combination_count == 0) {
+        predictions.setZero();
+        coefficients.setZero();
+        return;
+      }
+
+      ComputeClock::time_point start;
+      if(timings) start = ComputeClock::now();
+      Eigen::MatrixXd inverse(size, parameter_count);
+      Eigen::MatrixXd scaled_rhs(size, combination_count);
+      for(Eigen::Index parameter = 0; parameter < parameter_count; ++parameter) {
+        inverse.col(parameter) =
+          (eigenvalues.col(0).array() + ridge_parameters(parameter)).inverse().matrix();
+        for(Eigen::Index phenotype = 0; phenotype < phenotype_count; ++phenotype)
+          scaled_rhs.col(parameter * phenotype_count + phenotype) =
+            inverse.col(parameter).array() * transformed_right_hand_sides.col(phenotype).array();
+      }
+
+      coefficients.noalias() = eigenvectors * scaled_rhs;
+      if(samples_in_columns)
+        predictions.noalias() = prediction_matrix.transpose() * coefficients;
+      else
+        predictions.noalias() = prediction_matrix * coefficients;
+
+      if(leave_one_out) {
+        Eigen::MatrixXd projected_genotypes;
+        if(samples_in_columns)
+          projected_genotypes = eigenvectors.transpose() * prediction_matrix;
+        else
+          projected_genotypes = eigenvectors.transpose() * prediction_matrix.transpose();
+        const Eigen::MatrixXd leverage =
+          projected_genotypes.array().square().matrix().transpose() * inverse;
+        for(Eigen::Index parameter = 0; parameter < parameter_count; ++parameter)
+          for(Eigen::Index phenotype = 0; phenotype < phenotype_count; ++phenotype) {
+            const Eigen::Index column = parameter * phenotype_count + phenotype;
+            predictions.col(column).array() -= leverage.col(parameter).array() *
+              leave_one_out_outcomes.col(phenotype).array();
+            predictions.col(column).array() /= 1.0 - leverage.col(parameter).array();
+          }
+      }
+      if(timings) timings->ridge_ms += elapsed_ms(start);
+    }
+
+    void factorize_ridge_system(
+      const Eigen::Ref<const Eigen::MatrixXd>& symmetric_matrix,
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Step1ComputeTimings* timings) override {
+
+      eigendecompose_and_transform(symmetric_matrix, right_hand_sides,
+        factorized_ridge_vectors_, factorized_ridge_values_,
+        factorized_ridge_rhs_, timings);
+      ridge_factorized_ = true;
+    }
+
+    void compute_products_and_factorize_ridge(
+      const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      Step1GramMode mode,
+      Step1ComputeTimings* timings) override {
+
+      Eigen::MatrixXd gram, crossproduct;
+      compute_products(genotypes, phenotypes, gram, crossproduct, mode, timings);
+      factorize_ridge_system(gram, crossproduct, timings);
+    }
+
+    void ridge_predict_factorized(
+      const Eigen::Ref<const Eigen::MatrixXd>& prediction_matrix,
+      bool samples_in_columns,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::MatrixXd>& leave_one_out_outcomes,
+      bool leave_one_out,
+      Eigen::MatrixXd& predictions,
+      Eigen::MatrixXd& coefficients,
+      Step1ComputeTimings* timings) override {
+
+      if(!ridge_factorized_)
+        throw std::runtime_error(
+          "Step 1 factorized ridge prediction requested before factorization");
+      ridge_predict(factorized_ridge_vectors_, factorized_ridge_values_,
+        factorized_ridge_rhs_, prediction_matrix, samples_in_columns,
+        ridge_parameters, leave_one_out_outcomes, leave_one_out,
+        predictions, coefficients, timings);
+    }
+
+  private:
+    Eigen::LLT<Eigen::MatrixXd> factorization_;
+    Eigen::Index factorization_size_ = -1;
+    Eigen::MatrixXd factorized_ridge_vectors_;
+    Eigen::MatrixXd factorized_ridge_values_;
+    Eigen::MatrixXd factorized_ridge_rhs_;
+    bool ridge_factorized_ = false;
+
+    static void validate_ridge_dimensions(
+      const Eigen::Ref<const Eigen::MatrixXd>& eigenvectors,
+      const Eigen::Ref<const Eigen::MatrixXd>& eigenvalues,
+      const Eigen::Ref<const Eigen::MatrixXd>& transformed_right_hand_sides,
+      const Eigen::Ref<const Eigen::MatrixXd>& prediction_matrix,
+      bool samples_in_columns,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::MatrixXd>& leave_one_out_outcomes,
+      bool leave_one_out) {
+
+      const Eigen::Index size = eigenvectors.rows();
+      if(eigenvectors.cols() != size || eigenvalues.rows() != size || eigenvalues.cols() != 1 ||
+         transformed_right_hand_sides.rows() != size ||
+         (samples_in_columns ? prediction_matrix.rows() : prediction_matrix.cols()) != size)
+        throw std::invalid_argument("Step 1 ridge prediction received incompatible matrix dimensions");
+      if((ridge_parameters.array() < 0).any())
+        throw std::invalid_argument("Step 1 ridge parameters must be non-negative");
+      if(leave_one_out &&
+         (leave_one_out_outcomes.rows() !=
+            (samples_in_columns ? prediction_matrix.cols() : prediction_matrix.rows()) ||
+          leave_one_out_outcomes.cols() != transformed_right_hand_sides.cols()))
+        throw std::invalid_argument("Step 1 LOOCV outcomes have incompatible dimensions");
     }
 };
 

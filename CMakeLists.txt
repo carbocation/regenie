@@ -140,7 +140,7 @@ function(configure_step1_cuda target_name)
   if(REGENIE_WITH_CUDA)
     target_sources(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
     target_compile_definitions(${target_name} PRIVATE WITH_CUDA)
-    target_link_libraries(${target_name} PRIVATE CUDA::cublas CUDA::cudart)
+    target_link_libraries(${target_name} PRIVATE CUDA::cublas CUDA::cusolver CUDA::cudart)
     set_target_properties(${target_name} PROPERTIES
       CUDA_STANDARD 11
       CUDA_STANDARD_REQUIRED ON

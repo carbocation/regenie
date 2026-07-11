@@ -59,9 +59,16 @@ add the corresponding flags before the `cmake` command on line 3
 
 ### Experimental CUDA Step 1 backend
 
-The CUDA backend accelerates the FP64 Gram matrix and phenotype
-crossproduct operations in Step 1. It is disabled by default, requires CMake
-3.18 or newer and the CUDA toolkit, and currently requires a dynamic build.
+The CUDA backend accelerates the FP64 matrix work in Step 1, including Gram
+and phenotype crossproducts, symmetric eigensystems, batched ridge prediction,
+weighted logistic/Poisson/Cox updates, diagonal-penalty Cholesky solves, and
+chunked final-model influence solves. Level 0 products, design Gram matrices,
+weighted Hessians, score crossproducts, linear predictors, and
+chromosome-grouped LOCO predictions are streamed through bounded device
+buffers; reusable eigensystems and Cholesky factorizations remain
+device-resident across prediction chunks. The backend is disabled by default,
+requires CMake 3.18 or newer and the CUDA toolkit, and currently requires a
+dynamic build.
 Build for an NVIDIA A100 (compute capability 8.0) with:
 
 ```
@@ -76,10 +83,17 @@ more than one CUDA device is visible. `--compute-backend auto` uses CUDA when
 the binary contains the backend and the requested device is available,
 otherwise it uses the CPU backend.
 
+Sample-major device buffers are limited to approximately 1 GB by default.
+Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer
+streaming limit; this is primarily useful for validation or sharing a GPU with
+other jobs.
+
 For development, the repository includes a single A100 validation command.
 It builds both backends, checks matrix shapes and failure paths, benchmarks
-them, runs small k-fold and LOOCV Step 1 jobs, and compares the CPU and CUDA
-LOCO files:
+both the Level 0 eigensystem and nonlinear Level 1 workloads, runs quantitative,
+binary, count, time-to-event, top-SNP, k-fold, and LOOCV Step 1 jobs, and
+compares the CPU and CUDA LOCO files. It also records peak device-memory use
+for the CUDA benchmark and each end-to-end case:
 
 ```
 BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh

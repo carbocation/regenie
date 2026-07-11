@@ -34,6 +34,7 @@
 #include "cox_score.hpp"
 #include "cox_firth.hpp"
 #include "Step1_Models.hpp"
+#include "Step1_Compute.hpp"
 #include "Step2_Models.hpp"
 #include "HLM.hpp"
 #include "Pheno.hpp"
@@ -48,6 +49,38 @@ using namespace Eigen;
 using namespace boost;
 using boost::math::beta_distribution;
 using boost::math::chi_squared;
+
+namespace {
+
+template<typename Derived>
+ArrayXd compute_step1_design_score(
+  Step1ComputeBackend* compute_backend,
+  const Ref<const MatrixXd>& design,
+  const MatrixBase<Derived>& residual) {
+  const MatrixXd residual_matrix = residual;
+  MatrixXd crossproduct;
+  compute_backend->compute_design_crossproduct(
+    design, residual_matrix, crossproduct);
+  return crossproduct.col(0).array();
+}
+
+template<typename Derived>
+ArrayXd compute_step1_linear_prediction(
+  Step1ComputeBackend* compute_backend,
+  const Ref<const MatrixXd>& design,
+  const MatrixBase<Derived>& coefficients) {
+  if(!compute_backend) return (design * coefficients).array();
+  const VectorXd coefficient_vector = coefficients;
+  VectorXi group_offset(1), group_size(1);
+  group_offset(0) = 0;
+  group_size(0) = design.cols();
+  MatrixXd prediction;
+  compute_backend->grouped_predict(
+    design, coefficient_vector, group_offset, group_size, prediction);
+  return prediction.col(0).array();
+}
+
+}
 
 
 // null models
@@ -443,8 +476,19 @@ void fit_null_cox(bool const& silent, const int& chrom, struct param* params, st
   if(!silent) sout << "done (" << duration.count() << "ms) "<< endl;
 }
 
-double getCoxLambdaMax(const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& gradient) {
-    Eigen::VectorXd g = (Xmat.transpose() * gradient).array().abs();
+double getCoxLambdaMax(const Eigen::MatrixXd& Xmat,
+    const Eigen::VectorXd& gradient,
+    Step1ComputeBackend* compute_backend) {
+    Eigen::VectorXd g;
+    if(compute_backend) {
+      const MatrixXd outcome = gradient;
+      MatrixXd crossproduct;
+      compute_backend->compute_design_crossproduct(
+        Xmat, outcome, crossproduct);
+      g = crossproduct.col(0).array().abs();
+    } else {
+      g = (Xmat.transpose() * gradient).array().abs();
+    }
     double lambda_max = g.maxCoeff() / 1e-3;
     return lambda_max;
 }
@@ -455,7 +499,7 @@ double getCoxLambdaMax(const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& gradi
 /////////////////////////////////////////////////
 /////////////////////////////////////////////////
 
-void ridge_level_0(const int& block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, mstream& sout) {
+void ridge_level_0(const int& block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << "   -calc level 0 ridge..." << flush;
   auto t2 = std::chrono::high_resolution_clock::now();
@@ -465,8 +509,10 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   string op_name, out_pheno;
   ofstream ofile;
 
-  MatrixXd ww1, ww2, beta, pred, vmat, dvec, Xout;
-  MatrixXd ident_l0 = MatrixXd::Identity(bs, bs);
+  MatrixXd ww1, Xout;
+  MatrixXd batched_predictions, batched_coefficients;
+  const MatrixXd no_outcomes(0, 0);
+  const VectorXd ridge_parameters = params->lambda.matrix();
   MatrixXd p_sum = MatrixXd::Zero(params->n_ridge_l0, params->n_pheno);
   MatrixXd p_sum2 = MatrixXd::Zero(params->n_ridge_l0, params->n_pheno);
 
@@ -481,40 +527,49 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     // assign masking within folds
     masked_in_folds[i] = pheno_data->masked_indivs.block(cum_size_folds, 0, params->cv_sizes(i), pheno_data->masked_indivs.cols());
 
-    std::chrono::steady_clock::time_point eig_start;
-    if(params->profile_step1) eig_start = std::chrono::steady_clock::now();
     ww1 = l0->GGt - l0->G_folds[i];
-    SelfAdjointEigenSolver<MatrixXd> eig(ww1);
-    vmat = eig.eigenvectors();
-    dvec = eig.eigenvalues();
-    //if(i == 0)sout << ww1 << endl;
-    ww2 = vmat.transpose() * (l0->GTY - l0->GtY[i]);
-    if(params->profile_step1)
-      l0->profile_eigensolve_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - eig_start).count();
+    Step1ComputeTimings timings;
+    const MatrixXd fold_rhs = l0->GTY - l0->GtY[i];
+    compute_backend->factorize_ridge_system(
+      ww1, fold_rhs,
+      params->profile_step1 ? &timings : nullptr);
+    if(params->profile_step1) {
+      l0->profile_eigensolve_ms += timings.eigensolve_ms + timings.transform_ms;
+      l0->profile_backend_upload_ms += timings.upload_ms;
+      l0->profile_backend_download_ms += timings.download_ms;
+    }
+
+    Step1ComputeTimings ridge_timings;
+    compute_backend->ridge_predict_factorized(
+      Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i)),
+      true, ridge_parameters, no_outcomes, false,
+      batched_predictions, batched_coefficients,
+      params->profile_step1 ? &ridge_timings : nullptr);
+    if(params->profile_step1) {
+      l0->profile_backend_upload_ms += ridge_timings.upload_ms;
+      l0->profile_backend_download_ms += ridge_timings.download_ms;
+    }
 
     for(int j = 0; j < params->n_ridge_l0; ++j ) {
-
-      // b = U (D+sI)^(-1) U^t GtY
-      beta = vmat * (dvec.array() + params->lambda(j)).inverse().matrix().asDiagonal() * ww2;
-
-      // save beta for each phenotype (only when using out-of-sample pred)
-      if(!params->within_sample_l0 && params->print_block_betas)
-        for(int ph = 0; ph < params->n_pheno; ++ph ) 
-          if( params->pheno_pass(ph) )
-            params->beta_print_out[ph].row(j) += beta.col(ph).transpose();
-
-      // out-of-sample predictions (mask missing)
-      pred = ( (beta.transpose() * Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i))).array()  * masked_in_folds[i].transpose().array().cast<double>() ).matrix();
-      p_sum.row(j) += pred.rowwise().sum();
-      p_sum2.row(j) += pred.rowwise().squaredNorm();
 
       // store predictions
       for(int ph = 0; ph < params->n_pheno; ++ph ) {
         if( !params->pheno_pass(ph) ) continue;
+        const int combination = j * params->n_pheno + ph;
+        VectorXd prediction = batched_predictions.col(combination).array() *
+          masked_in_folds[i].col(ph).array().cast<double>();
+        p_sum(j, ph) += prediction.sum();
+        p_sum2(j, ph) += prediction.squaredNorm();
+
+        if(!params->within_sample_l0 && params->print_block_betas)
+          params->beta_print_out[ph].row(j) +=
+            batched_coefficients.col(combination).transpose();
+
         if (params->trait_mode != 3) {
-          l1->test_mat[ph][i].col(block_eff * params->n_ridge_l0 + j) = pred.row(ph).transpose();
+          l1->test_mat[ph][i].col(block_eff * params->n_ridge_l0 + j) = prediction;
         } else {
-          l1->test_mat_conc[ph].block(cum_size_folds, block_eff * params->n_ridge_l0 + j, params->cv_sizes(i), 1) = pred.row(ph).transpose();
+          l1->test_mat_conc[ph].block(cum_size_folds,
+            block_eff * params->n_ridge_l0 + j, params->cv_sizes(i), 1) = prediction;
         }
         if((block == 0) && (j == 0)) { // same for all blocks & ridge params
           if (params->trait_mode != 3) {
@@ -616,17 +671,18 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   sout << " (" << duration.count() << "ms) "<< endl;
 }
 
-void ridge_level_0_loocv(const int block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, mstream& sout) {
+void ridge_level_0_loocv(const int block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << "   -calc level 0 ridge..." << flush;
   auto t2 = std::chrono::high_resolution_clock::now();
-  int bs = l0->GGt_eig_val.size();
+  int bs = l0->subset_l0_snps_gmat ?
+    l0->indices_gmat_keep.size() : Gblock->Gmat.rows();
   int block_eff = params->write_l0_pred ? 0 : block; // if writing to file
   string out_pheno;
   ofstream ofile;
-  VectorXd z1, gvec;
-  MatrixXd VtG, z2, pred, Xout;
+  MatrixXd Xout, batched_predictions, batched_coefficients;
   RowVectorXd p_mean, p_sd;
+  const VectorXd ridge_parameters = params->lambda.matrix();
 
   /*
      if(bs > params->n_samples)
@@ -640,48 +696,40 @@ void ridge_level_0_loocv(const int block, struct in_files* files, struct param* 
   int chunk, size_chunk, target_size = params->cv_folds / nchunk;
   int j_start;
 
-  // make matrix of (eigen-value + lambda)^(-1)
-  MatrixXd DL_inv = ( l0->GGt_eig_val.rowwise().replicate(params->n_ridge_l0).array().rowwise() + params->lambda.matrix().transpose().array() ).inverse().matrix(); // kxR
-
-  if(!params->test_l0 || (l0->nspns_picked_block.maxCoeff() == 0) || (params->n_pheno == 1)){
-
-    if(params->print_block_betas) // assumes P=1
-      l1->beta_snp_step1.middleRows(filters->step1_snp_count, bs) = l0->GGt_eig_vec * (DL_inv.array().colwise() * l0->Wmat.col(0).array()).matrix();// K x R
-
-    for(chunk = 0; chunk < nchunk; ++chunk ) {
-      size_chunk = chunk == nchunk - 1? params->cv_folds - target_size * chunk : target_size;
-      j_start = chunk * target_size;
-
-      if((params->n_pheno == 1) && l0->subset_l0_snps_gmat)
-        VtG = l0->GGt_eig_vec.transpose() * Gblock->Gmat(l0->indices_gmat_keep, seqN(j_start, size_chunk));
-      else
-        VtG = l0->GGt_eig_vec.transpose() * Gblock->Gmat(all, seqN(j_start, size_chunk));
-      for(int i = 0; i < size_chunk; ++i ) {
-        z1 = VtG.col(i); // Kx1
-        z2 = DL_inv.array().colwise() * z1.array(); // K x R
-        gvec = z2.transpose() * z1; // R x 1
-        if(params->test_l0)
-          pred = z2.transpose() * l0->Wmat - gvec * l0->ymat_res.row(j_start + i);
-        else
-          pred = z2.transpose() * l0->Wmat - gvec * pheno_data->phenotypes.row(j_start + i);
-        pred.array().colwise() /= 1 - gvec.array(); // R x P
-
-        for(int ph = 0; ph < params->n_pheno; ++ph )
-          if( params->pheno_pass(ph) )
-            l1->test_mat_conc[ph].block(j_start + i, block_eff * params->n_ridge_l0, 1, params->n_ridge_l0) = pred.col(ph).transpose();
-      }
-    } 
-
-  } else for(chunk = 0; chunk < nchunk; ++chunk ) {
+  for(chunk = 0; chunk < nchunk; ++chunk ) {
     size_chunk = chunk == nchunk - 1? params->cv_folds - target_size * chunk : target_size;
     j_start = chunk * target_size;
-    VtG = l0->GGt_eig_vec.transpose() * Gblock->Gmat(l0->indices_gmat_keep, seqN(j_start, size_chunk)); // k x N
-    MatrixXd gamma_rho = (DL_inv.transpose() * VtG.array().square().matrix()).transpose(); // N x R
+
+    MatrixXd genotype_chunk;
+    if(l0->subset_l0_snps_gmat)
+      genotype_chunk = Gblock->Gmat(l0->indices_gmat_keep, seqN(j_start, size_chunk));
+    else
+      genotype_chunk = Gblock->Gmat(all, seqN(j_start, size_chunk));
+    MatrixXd outcome_chunk = params->test_l0 ?
+      l0->ymat_res.middleRows(j_start, size_chunk) :
+      pheno_data->phenotypes.middleRows(j_start, size_chunk);
+
+    Step1ComputeTimings ridge_timings;
+    compute_backend->ridge_predict_factorized(
+      genotype_chunk, true, ridge_parameters, outcome_chunk, true,
+      batched_predictions, batched_coefficients,
+      params->profile_step1 ? &ridge_timings : nullptr);
+    if(params->profile_step1) {
+      l0->profile_backend_upload_ms += ridge_timings.upload_ms;
+      l0->profile_backend_download_ms += ridge_timings.download_ms;
+    }
+
+    if(params->print_block_betas && chunk == 0) { // assumes P=1
+      for(int ridge = 0; ridge < params->n_ridge_l0; ++ridge)
+        l1->beta_snp_step1.middleRows(filters->step1_snp_count, bs).col(ridge) =
+          batched_coefficients.col(ridge * params->n_pheno);
+    }
+
     for(int ph = 0; ph < params->n_pheno; ++ph ) {
       if(!params->pheno_pass(ph) ) continue;
       Ref<MatrixXd> X_l1 = l1->test_mat_conc[ph].block(j_start, block_eff * params->n_ridge_l0, size_chunk, params->n_ridge_l0); // NxR
-      X_l1 = VtG.transpose() * (DL_inv.array().colwise() * l0->Wmat.col(ph).array()).matrix() - (gamma_rho.array().colwise() * l0->ymat_res.col(ph).segment(j_start, size_chunk).array()).matrix(); // N x R
-      X_l1.array() /= (1 - gamma_rho.array());
+      for(int ridge = 0; ridge < params->n_ridge_l0; ++ridge)
+        X_l1.col(ridge) = batched_predictions.col(ridge * params->n_pheno + ph);
     }
   }
 
@@ -773,15 +821,15 @@ void set_mem_l1(struct in_files* files, struct param* params, struct filter* fil
   }
 }
 
-void ridge_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, mstream& sout) {
+void ridge_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << endl << " Level 1 ridge..." << endl << flush;
 
   string in_pheno;
   ifstream infile;
-  MatrixXd X1, X2, beta_l1, p1, vmat, dvec, dl_inv, XtX_tau;
-  VectorXd VtX2;
+  MatrixXd X1, X2, beta_l1, p1;
   MatrixXd XtX_sum, XtY_sum;
+  const MatrixXd no_outcomes(0, 0);
 
   // to compute Rsq and MSE of predictions
   for (int i = 0; i < 5; i++){
@@ -809,8 +857,9 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
       XtX_sum.setZero(bs_l1, bs_l1);
       XtY_sum.setZero(bs_l1, 1);
       for( int i = 0; i < params->cv_folds; ++i ) {
-        l1->X_folds[i] = l1->test_mat[ph_eff][i].transpose() * l1->test_mat[ph_eff][i];
-        l1->XtY[i]     = l1->test_mat[ph_eff][i].transpose() * l1->test_pheno[ph][i];
+        compute_backend->compute_design_products(
+          l1->test_mat[ph_eff][i], l1->test_pheno[ph][i],
+          l1->X_folds[i], l1->XtY[i]);
         XtX_sum += l1->X_folds[i];
         XtY_sum += l1->XtY[i];
       }
@@ -821,34 +870,27 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
 
       // use either in-sample or out-of-sample predictions
       if (params->within_sample_l0) { // DEPRECATED
-        X1 = l1->pred_mat[ph][i].transpose() * l1->pred_mat[ph][i];
-        X2 = l1->pred_mat[ph][i].transpose() * l1->pred_pheno[ph][i];
+        compute_backend->compute_design_products(
+          l1->pred_mat[ph][i], l1->pred_pheno[ph][i], X1, X2);
       } else{
         X1 = XtX_sum - l1->X_folds[i];
         X2 = XtY_sum - l1->XtY[i];
       }
 
       if(use_simple_ridge){
-        SelfAdjointEigenSolver<MatrixXd> eigX1(X1);
-        vmat = eigX1.eigenvectors();
-        dvec = eigX1.eigenvalues();
-        VtX2 = vmat.transpose() * X2;
-      // compute solutions for all ridge parameters at once
-        dl_inv = ( dvec.rowwise().replicate(params->n_ridge_l1) + l1->ridge_param_mult.matrix() * params->tau[ph].matrix().transpose() ).array().inverse().matrix();
-        dl_inv.array().colwise() *= VtX2.array();
-        beta_l1 = vmat * dl_inv;
-      } else { // need to compute seperately for each parameter
-        beta_l1.resize(bs_l1, params->n_ridge_l1);
-        for(int j = 0; j < params->n_ridge_l1; ++j) {
-          XtX_tau = X1;
-          XtX_tau.diagonal().array() += params->tau[ph](j) * l1->ridge_param_mult;
-          SelfAdjointEigenSolver<MatrixXd> eigMat(XtX_tau);
-          beta_l1.col(j) = eigMat.eigenvectors() * (1/eigMat.eigenvalues().array()).matrix().asDiagonal() * eigMat.eigenvectors().transpose() * X2;
-        }
+        compute_backend->factorize_ridge_system(X1, X2);
+        const VectorXd ridge_parameters = params->tau[ph].matrix();
+        compute_backend->ridge_predict_factorized(
+          l1->test_mat[ph_eff][i], false,
+          ridge_parameters, no_outcomes, false, p1, beta_l1);
+      } else {
+        compute_backend->diagonal_penalty_predict(
+          X1, X2, l1->test_mat[ph_eff][i], false,
+          params->tau[ph].matrix(), l1->ridge_param_mult.matrix(),
+          no_outcomes, false, p1, beta_l1);
       }
       if(!params->within_sample_l0) l1->beta_hat_level_1[ph][i] = beta_l1;
       // p1 is Nfold x nridge_l1 matrix
-      p1 = l1->test_mat[ph_eff][i] * beta_l1;
       l1->cumsum_values[0].row(ph) += p1.colwise().sum();
       l1->cumsum_values[1].row(ph).array() += l1->test_pheno[ph][i].array().sum();
       l1->cumsum_values[2].row(ph) += p1.array().square().matrix().colwise().sum();
@@ -876,7 +918,7 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
 }
 
 
-void ridge_level_1_loocv(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, mstream& sout) {
+void ridge_level_1_loocv(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << endl << " Level 1 ridge..." << flush;
 
@@ -896,7 +938,9 @@ void ridge_level_1_loocv(struct in_files* files, struct param* params, struct ph
 
   uint64 max_bytes = params->chunk_mb * 1e6;
   // amount of RAM used < max_mb [ creating (target_size * bs_l1) matrix ]
-  int nchunk = ceil( params->cv_folds * bs_l1 * sizeof(double) * 1.0 / max_bytes );
+  int nchunk = std::max(1, std::min(params->cv_folds,
+    static_cast<int>(ceil(params->cv_folds * bs_l1 * sizeof(double) * 1.0 /
+                          max_bytes))));
   if (params->verbose) sout << nchunk << " chunks...";
   sout << endl;
   int chunk, size_chunk, target_size = params->cv_folds / nchunk;
@@ -912,46 +956,78 @@ void ridge_level_1_loocv(struct in_files* files, struct param* params, struct ph
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat_conc[ph_eff].cols();
+    bs_l1 = l1->test_mat[ph_eff][0].cols();
     bool use_simple_ridge = (l1->ridge_param_mult == 1).all();
     if(params->test_l0)
       Yvec = pheno_data->phenotypes.col(ph) - l1->top_snp_pgs[0].col(ph);
     else
       Yvec = pheno_data->phenotypes.col(ph);
 
-    xtx = l1->test_mat_conc[ph_eff].transpose() * l1->test_mat_conc[ph_eff]; // kxk
-    SelfAdjointEigenSolver<MatrixXd> eigX(xtx);
-    zvec = eigX.eigenvectors().transpose() * (l1->test_mat_conc[ph_eff].transpose() * Yvec); // kx1
+    if(use_simple_ridge) {
+      MatrixXd xty, chunk_predictions, coefficients;
+      MatrixXd outcome = Yvec;
+      const VectorXd ridge_parameters = params->tau[ph].matrix();
+      compute_backend->compute_design_products(
+        l1->test_mat_conc[ph_eff], outcome, xtx, xty);
+      compute_backend->factorize_ridge_system(xtx, xty);
 
-    for(chunk = 0; chunk < nchunk; ++chunk) {
-      size_chunk = chunk == nchunk - 1? params->cv_folds - target_size * chunk : target_size;
-      j_start = chunk * target_size;
-      Ref<VectorXd> Y_chunk = Yvec.segment(j_start, size_chunk);
-      Ref<MatrixXd> X_chunk = l1->test_mat_conc[ph_eff].middleRows(j_start, size_chunk);
+      for(chunk = 0; chunk < nchunk; ++chunk) {
+        size_chunk = chunk == nchunk - 1? params->cv_folds - target_size * chunk : target_size;
+        j_start = chunk * target_size;
+        Ref<VectorXd> Y_chunk = Yvec.segment(j_start, size_chunk);
+        const MatrixXd design_chunk =
+          l1->test_mat_conc[ph_eff].middleRows(j_start, size_chunk);
+        const MatrixXd outcome_chunk = outcome.middleRows(j_start, size_chunk);
+        compute_backend->ridge_predict_factorized(
+          design_chunk, false, ridge_parameters, outcome_chunk, true,
+          chunk_predictions, coefficients);
+        for(int j = 0; j < params->n_ridge_l1; ++j) {
+          pred = chunk_predictions.col(j);
+          l1->cumsum_values[0](ph, j) += pred.sum();
+          l1->cumsum_values[2](ph, j) += pred.squaredNorm();
+          l1->cumsum_values[4](ph, j) += pred.dot(Y_chunk);
+          if(params->test_l0){
+            if(j == 0) l1->cumsum_values[3].row(ph).array() += Y_chunk.squaredNorm();
+            pred += l1->top_snp_pgs[0].col(ph).segment(j_start, size_chunk);
+            l1->cumsum_values_full[0](ph, j) += pred.sum();
+            l1->cumsum_values_full[2](ph, j) += pred.squaredNorm();
+            l1->cumsum_values_full[4](ph, j) += pred.dot(
+              pheno_data->phenotypes.col(ph).segment(j_start, size_chunk));
+          }
+        }
+      }
+    } else {
+      MatrixXd xty, chunk_predictions, coefficients;
+      MatrixXd outcome = Yvec;
+      compute_backend->compute_design_products(
+        l1->test_mat_conc[ph_eff], outcome, xtx, xty);
 
-      tmpMat = X_chunk * eigX.eigenvectors(); // N_c x k
+      for(chunk = 0; chunk < nchunk; ++chunk) {
+        size_chunk = chunk == nchunk - 1? params->cv_folds - target_size * chunk : target_size;
+        j_start = chunk * target_size;
+        Ref<VectorXd> Y_chunk = Yvec.segment(j_start, size_chunk);
+        const MatrixXd design_chunk =
+          l1->test_mat_conc[ph_eff].middleRows(j_start, size_chunk);
+        const MatrixXd outcome_chunk = outcome.middleRows(j_start, size_chunk);
+        compute_backend->diagonal_penalty_predict(
+          xtx, xty, design_chunk, false,
+          params->tau[ph].matrix(), l1->ridge_param_mult.matrix(),
+          outcome_chunk, true, chunk_predictions, coefficients);
 
-      for(int j = 0; j < params->n_ridge_l1; ++j) { // compute seperately for each parameter
-        if(use_simple_ridge)
-          tmpVec = (1/(eigX.eigenvalues().array() + params->tau[ph](j))).matrix(); // kx1
-        else
-          tmpVec = (1/(eigX.eigenvalues().array() + params->tau[ph](j) * l1->ridge_param_mult)).matrix();
-        calFactor = tmpMat.array().square().matrix() * tmpVec; //N_cx1
-        pred = tmpMat * (tmpVec.array() * zvec.array()).matrix() - (calFactor.array() * Y_chunk.array()).matrix();
-        pred.array() /= (1 - calFactor.array());
+        for(int j = 0; j < params->n_ridge_l1; ++j) {
+          pred = chunk_predictions.col(j);
 
-        // compute mse and rsq
-        l1->cumsum_values[0](ph, j) += pred.sum(); // Sx
-                                                   // Y is centered so Sy = 0
-        l1->cumsum_values[2](ph, j) += pred.squaredNorm(); // Sx2
-                                                                    // Y is scaled so Sy2 = params->n_samples - ncov
-        l1->cumsum_values[4](ph, j) += pred.dot(Y_chunk); // Sxy
-        if(params->test_l0){ // pred = p1 + top_snp_pgs; Y is res pheno
-          if(j == 0) l1->cumsum_values[3].row(ph).array() += Y_chunk.squaredNorm(); // (Y-PGS) is not standardized
-          pred += l1->top_snp_pgs[0].col(ph).segment(j_start, size_chunk);
-          l1->cumsum_values_full[0](ph, j) += pred.sum(); // Sx
-          l1->cumsum_values_full[2](ph, j) += pred.squaredNorm(); // Sx2
-          l1->cumsum_values_full[4](ph, j) += pred.dot(pheno_data->phenotypes.col(ph).segment(j_start, size_chunk)); // Sxy
+          l1->cumsum_values[0](ph, j) += pred.sum();
+          l1->cumsum_values[2](ph, j) += pred.squaredNorm();
+          l1->cumsum_values[4](ph, j) += pred.dot(Y_chunk);
+          if(params->test_l0){
+            if(j == 0) l1->cumsum_values[3].row(ph).array() += Y_chunk.squaredNorm();
+            pred += l1->top_snp_pgs[0].col(ph).segment(j_start, size_chunk);
+            l1->cumsum_values_full[0](ph, j) += pred.sum();
+            l1->cumsum_values_full[2](ph, j) += pred.squaredNorm();
+            l1->cumsum_values_full[4](ph, j) += pred.dot(
+              pheno_data->phenotypes.col(ph).segment(j_start, size_chunk));
+          }
         }
       }
     }
@@ -967,7 +1043,7 @@ void ridge_level_1_loocv(struct in_files* files, struct param* params, struct ph
 
 
 // Logistic models
-void ridge_logistic_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, mstream& sout) {
+void ridge_logistic_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << endl << " Level 1 ridge with logistic regression..." << endl << flush;
 
@@ -979,6 +1055,9 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   ArrayXd Y1, W1, p1, score;
   ArrayXd betaold, etavec, pivec, wvec, zvec, betanew, etatest;
   MatrixXd X1, XtW, XtWX, XtWZ;
+  MatrixXd weighted_gram, weighted_rhs, solver_predictions, solver_coefficients;
+  const MatrixXd no_outcomes(0, 0);
+  VectorXd current_tau(1);
   l1->pheno_l1_not_converged = ArrayXb::Constant(params->n_pheno, false);
 
   for (int i = 0; i < 6; i++)
@@ -995,8 +1074,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat[ph_eff][0].cols();
-    MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+    bs_l1 = l1->test_mat_conc[ph_eff].cols();
 
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( l1->pheno_l1_not_converged(ph) ) break;
@@ -1021,7 +1099,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         while(niter_cur++ < params->niter_max_ridge){
 
           if(params->within_sample_l0) {
-            etavec = W1 + (X1 * betaold.matrix()).array();
+            etavec = W1 + compute_step1_linear_prediction(
+              compute_backend, X1, betaold.matrix());
             pivec = 1 - 1/(etavec.exp() + 1);
             wvec = pivec * (1 - pivec);
             // check none of the values are 0
@@ -1031,25 +1110,35 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               break;
             }
             zvec = (etavec - W1) + (Y1 - pivec) / wvec;
-            XtW = X1.transpose() * wvec.matrix().asDiagonal();
-            XtWX = params->tau[ph](j) * l1->ridge_param_mult.matrix().asDiagonal();
-            XtWX += XtW * X1;
-            betanew = XtWX.colPivHouseholderQr().solve(XtW * zvec.matrix()).array();
+            const MatrixXd working_outcome = zvec.matrix();
+            compute_backend->compute_weighted_design_products(
+              X1, wvec.matrix(), working_outcome, weighted_gram, weighted_rhs);
+            current_tau(0) = params->tau[ph](j);
+            compute_backend->diagonal_penalty_predict(
+              weighted_gram, weighted_rhs, X1, false, current_tau,
+              l1->ridge_param_mult.matrix(), no_outcomes, false,
+              solver_predictions, solver_coefficients);
+            betanew = solver_coefficients.col(0).array();
             // get the score
-            etavec = W1 + (X1 * betanew.matrix()).array();
+            etavec = W1 + compute_step1_linear_prediction(
+              compute_backend, X1, betanew.matrix());
             pivec = 1 - 1/(etavec.exp() + 1);
-            score = (X1.transpose() * (Y1 - pivec).matrix()).array() - params->tau[ph](j) * l1->ridge_param_mult * betanew;
+            score = compute_step1_design_score(
+              compute_backend, X1, (Y1 - pivec).matrix()) -
+              params->tau[ph](j) * l1->ridge_param_mult * betanew;
 
           } else {
 
-            XtWX = params->tau[ph](j) * l1->ridge_param_mult.matrix().asDiagonal();
+            XtWX = MatrixXd::Zero(bs_l1, bs_l1);
             XtWZ = MatrixXd::Zero(bs_l1, 1);
 
             for(int k = 0; k < params->cv_folds; ++k ) {
               if( k != i) {
 
                 // get w=p*(1-p) and check none of the values are 0
-                get_pvec(etavec, pivec, betaold, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
+                get_pvec(etavec, pivec, betaold,
+                  l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k],
+                  params->numtol_eps, compute_backend);
                 if( get_wvec(pivec, wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps) ){
                   sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
                   l1->pheno_l1_not_converged(ph) = true;
@@ -1058,14 +1147,24 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
                 zvec = masked_in_folds[k].col(ph).array().select((etavec - l1->test_offset[ph][k].array()) + (l1->test_pheno_raw[ph][k].array() - pivec) / wvec, 0);
 
-                XtW = l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(wvec,0).matrix().asDiagonal();
-                XtWX += XtW * l1->test_mat[ph_eff][k];
-                XtWZ += XtW * zvec.matrix();
+                const VectorXd active_weights =
+                  masked_in_folds[k].col(ph).array().select(wvec, 0).matrix();
+                const MatrixXd working_outcome = zvec.matrix();
+                compute_backend->compute_weighted_design_products(
+                  l1->test_mat[ph_eff][k], active_weights, working_outcome,
+                  weighted_gram, weighted_rhs);
+                XtWX += weighted_gram;
+                XtWZ += weighted_rhs;
               }
             }
             if( l1->pheno_l1_not_converged(ph) ) break;
 
-            betanew = XtWX.llt().solve(XtWZ).array();
+            current_tau(0) = params->tau[ph](j);
+            compute_backend->diagonal_penalty_predict(
+              XtWX, XtWZ, l1->test_mat[ph_eff][i], false, current_tau,
+              l1->ridge_param_mult.matrix(), no_outcomes, false,
+              solver_predictions, solver_coefficients);
+            betanew = solver_coefficients.col(0).array();
 
             // start step-halving
             for( int niter_search = 1; niter_search <= params->niter_max_line_search_ridge; niter_search++ ){
@@ -1075,7 +1174,9 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               for(int k = 0; k < params->cv_folds; ++k ) {
                 if( k != i) {
                   // get w=p*(1-p) and check none of the values are 0
-                  get_pvec(etavec, pivec, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
+                  get_pvec(etavec, pivec, betanew,
+                    l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k],
+                    params->numtol_eps, compute_backend);
                   invalid_wvec = get_wvec(pivec, wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps);
                   if( invalid_wvec ) break; // do another halving
                 }
@@ -1093,13 +1194,18 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             for(int k = 0; k < params->cv_folds; ++k ) {
               if( k != i) {
                 // get w=p*(1-p) and check none of the values are 0
-                get_pvec(etavec, pivec, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
+                get_pvec(etavec, pivec, betanew,
+                  l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k],
+                  params->numtol_eps, compute_backend);
                 if( get_wvec(pivec, wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps) ){
                   sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
                   l1->pheno_l1_not_converged(ph) = true;
                   break;
                 }
-                score += (l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix()).array();
+                score += compute_step1_design_score(compute_backend,
+                  l1->test_mat[ph_eff][k],
+                  masked_in_folds[k].col(ph).array().select(
+                    l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix());
               }
             }
             score -= params->tau[ph](j) * l1->ridge_param_mult * betanew;
@@ -1124,7 +1230,9 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         //sout << "Converged in "<< niter_cur << " iterations. Score max = " << score.abs().maxCoeff() << endl;
 
 
-        etatest = l1->test_offset[ph][i].array() + (l1->test_mat[ph_eff][i] * betanew.matrix()).array();
+        etatest = l1->test_offset[ph][i].array() +
+          compute_step1_linear_prediction(compute_backend,
+            l1->test_mat[ph_eff][i], betanew.matrix());
         p1 = (1 - 1/(etatest.exp() + 1));
 
         if(!params->within_sample_l0) l1->beta_hat_level_1[ph][i].col(j) = betanew;
@@ -1160,7 +1268,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 }
 
 
-void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ests* m_ests, struct ridgel1* l1, mstream& sout) {
+void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ests* m_ests, struct ridgel1* l1, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << endl << " Level 1 ridge with logistic regression..." << flush;
 
@@ -1170,9 +1278,9 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
   ifstream infile;
   ofstream ofile;
 
-  ArrayXd beta, pivec, wvec, v2, pred;
-  MatrixXd XtWX, V1, b_loo;
-  LLT<MatrixXd> Hinv;
+  ArrayXd beta, pivec, wvec, pred;
+  MatrixXd XtWX, weighted_gram, weighted_rhs, no_weighted_outcomes,
+    loo_predictions;
   l1->pheno_l1_not_converged = ArrayXb::Constant(params->n_pheno, false);
   for (int i = 0; i < 6; i++)
     l1->cumsum_values[i].setZero(params->n_pheno, params->n_ridge_l1);
@@ -1202,6 +1310,9 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
     MapMatXd X (l1->test_mat_conc[ph_eff].data(), pheno_data->phenotypes_raw.rows(), bs_l1);
     MapArXd offset (m_ests->offset_nullreg.col(ph).data(), pheno_data->phenotypes_raw.rows());
     MapArXb mask (pheno_data->masked_indivs.col(ph).data(), pheno_data->masked_indivs.rows());
+    VectorXi full_group_offset(1), full_group_size(1);
+    full_group_offset(0) = 0;
+    full_group_size(0) = bs_l1;
 
     // starting values for each trait
     beta = ArrayXd::Zero(bs_l1);
@@ -1211,9 +1322,11 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
       // using warm starts (i.e. set final beta of previous ridge param 
       // as initial beta for current ridge param)
       if( params->use_adam ) // run ADAM to get close to max
-        run_log_ridge_loocv_adam(ph, params->tau[ph](j), l1->ridge_param_mult, beta, pivec, wvec, Y, X, offset, mask, params, sout);
+        run_log_ridge_loocv_adam(ph, params->tau[ph](j),
+          l1->ridge_param_mult, beta, pivec, wvec, Y, X, offset, mask,
+          params, compute_backend, sout);
 
-      if(!run_log_ridge_loocv(params->tau[ph](j), l1->ridge_param_mult, target_size, nchunk, beta, pivec, wvec, Y, X, offset, mask, params, sout)){
+      if(!run_log_ridge_loocv(params->tau[ph](j), l1->ridge_param_mult, target_size, nchunk, beta, pivec, wvec, Y, X, offset, mask, params, compute_backend, sout)){
         sout << "WARNING: Ridge logistic regression did not converge! (Increase --niter)\n";
         l1->pheno_l1_not_converged(ph) = true;
         break;
@@ -1225,7 +1338,7 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
 
       // compute Hinv
       // zvec = (pheno_data->masked_indivs.col(ph).array()).select( (etavec - m_ests->offset_nullreg.col(ph).array()) + (pheno_data->phenotypes_raw.col(ph).array() - pivec) / wvec, 0);
-      XtWX = params->tau[ph](j) * l1->ridge_param_mult.matrix().asDiagonal(); // compute XtWX in chunks
+      XtWX = MatrixXd::Zero(bs_l1, bs_l1);
       for(chunk = 0; chunk < nchunk; ++chunk){
         size_chunk = ( chunk == nchunk - 1 ? params->cv_folds - target_size * chunk : target_size );
         j_start = chunk * target_size;
@@ -1234,9 +1347,15 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
         Ref<ArrayXd> w_chunk = wvec.segment(j_start, size_chunk);
         Ref<ArrayXb> mask_chunk = mask.segment(j_start, size_chunk);
 
-        XtWX.noalias() += Xmat_chunk.transpose() * mask_chunk.select(w_chunk,0).matrix().asDiagonal() * Xmat_chunk;
+        const VectorXd active_weights = mask_chunk.select(w_chunk, 0).matrix();
+        no_weighted_outcomes.resize(size_chunk, 0);
+        compute_backend->compute_weighted_design_products(
+          Xmat_chunk, active_weights, no_weighted_outcomes,
+          weighted_gram, weighted_rhs);
+        XtWX += weighted_gram;
       }
-      Hinv.compute( XtWX );
+      compute_backend->factorize_diagonal_penalty(
+        XtWX, params->tau[ph](j), l1->ridge_param_mult.matrix());
 
       // LOOCV estimates
       for(chunk = 0; chunk < nchunk; ++chunk ) {
@@ -1250,12 +1369,11 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
         Ref<ArrayXd> w_chunk = wvec.segment(j_start, size_chunk);
         Ref<ArrayXd> off_chunk = offset.segment(j_start, size_chunk);
 
-        V1 = Hinv.solve( Xmat_chunk.transpose() ); // k x n
-        v2 = (Xmat_chunk.array() * V1.transpose().array()).rowwise().sum() * w_chunk;
-        b_loo.resize(beta.size(), size_chunk);
-        b_loo.array().colwise() = beta;
-        b_loo -= V1 * ((Yvec_chunk - p_chunk)/(1-v2)).matrix().asDiagonal();
-        pred = (Xmat_chunk.array() * b_loo.transpose().array()).rowwise().sum() + off_chunk;
+        const VectorXd residual_chunk = (Yvec_chunk - p_chunk).matrix();
+        compute_backend->grouped_leave_one_out_predict_factorized(
+          Xmat_chunk, beta.matrix(), residual_chunk, w_chunk.matrix(),
+          full_group_offset, full_group_size, loo_predictions);
+        pred = loo_predictions.col(0).array() + off_chunk;
 
         for(int i = 0; i < size_chunk; ++i ) {
           if(!mask_chunk(i)) continue;
@@ -1289,19 +1407,20 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
   sout << endl;
 }
 
-bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_param_mult, const int& target_size, const int& nchunk, ArrayXd& betaold, ArrayXd& pivec, ArrayXd& wvec, const Ref<const ArrayXd>& Y, Ref<MatrixXd> X, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, struct param* params, mstream& sout) {
+bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_param_mult, const int& target_size, const int& nchunk, ArrayXd& betaold, ArrayXd& pivec, ArrayXd& wvec, const Ref<const ArrayXd>& Y, Ref<MatrixXd> X, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, struct param* params, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   bool dev_conv = false;
   int bs_l1 = X.cols();
   int niter_cur = 0, j_start, chunk, size_chunk;
   double fn_start = 0, fn_end = 0;
   ArrayXd etavec, betanew, score, step_size, vweights;
-  MatrixXd XtWX;
-  LLT<MatrixXd> Hinv;
+  MatrixXd XtWX, weighted_gram, weighted_rhs, no_weighted_outcomes, solution;
+  VectorXd current_tau(1);
 
   //// get starting values
   // get w=p*(1-p) and check none of the values are 0
-  get_pvec(etavec, pivec, betaold, offset, X, params->numtol_eps);
+  get_pvec(etavec, pivec, betaold, offset, X,
+    params->numtol_eps, compute_backend);
   // get -2f(b)
   fn_start = get_logist_dev(Y, pivec, mask) + lambda * (ridge_param_mult * betaold).square().sum();
   if( get_wvec(pivec, wvec, mask, params->l1_ridge_eps) ){
@@ -1309,7 +1428,8 @@ bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_p
     return false;
   }
   // get the score
-  score = ( X.transpose() * mask.select(Y - pivec, 0).matrix()).array() ;
+  score = compute_step1_design_score(
+    compute_backend, X, mask.select(Y - pivec, 0).matrix());
   score -= lambda * ridge_param_mult * betaold;
   // for convergence check
   //vweights = (X.array().square().matrix().transpose() * mask.select(wvec,0).matrix()).array();
@@ -1318,7 +1438,7 @@ bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_p
   while(niter_cur++ < params->niter_max_ridge) {
 
     // get step size
-    XtWX = lambda * ridge_param_mult.matrix().asDiagonal(); // compute XtWX in chunks
+    XtWX = MatrixXd::Zero(bs_l1, bs_l1);
     for(chunk = 0; chunk < nchunk; ++chunk ) {
       size_chunk = ( chunk == nchunk - 1 ? params->cv_folds - target_size * chunk : target_size );
       j_start = chunk * target_size;
@@ -1327,10 +1447,17 @@ bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_p
       Ref<ArrayXd> w_chunk = wvec.segment(j_start, size_chunk); // nx1
       Ref<const ArrayXb> mask_chunk = mask.segment(j_start, size_chunk); //nx1
 
-      XtWX.noalias() += Xmat_chunk.transpose() * mask_chunk.select(w_chunk,0).matrix().asDiagonal() * Xmat_chunk;
+      const VectorXd active_weights = mask_chunk.select(w_chunk, 0).matrix();
+      no_weighted_outcomes.resize(size_chunk, 0);
+      compute_backend->compute_weighted_design_products(
+        Xmat_chunk, active_weights, no_weighted_outcomes,
+        weighted_gram, weighted_rhs);
+      XtWX += weighted_gram;
     }
-    Hinv.compute( XtWX );
-    step_size = Hinv.solve(score.matrix()).array();
+    current_tau(0) = lambda;
+    compute_backend->diagonal_penalty_solve(
+      XtWX, score.matrix(), current_tau, ridge_param_mult.matrix(), solution);
+    step_size = solution.col(0).array();
     //cerr << (step_size * score).sum()/(.01 + abs(fn_end)) << "\n\n";
 
     // check f(b)
@@ -1339,7 +1466,8 @@ bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_p
       betanew = betaold + step_size;
 
       // get w=p*(1-p) and check none of the values are 0
-      get_pvec(etavec, pivec, betanew, offset, X, params->numtol_eps);
+      get_pvec(etavec, pivec, betanew, offset, X,
+        params->numtol_eps, compute_backend);
       // -2f(b)
       fn_end = get_logist_dev(Y, pivec, mask) + lambda * (ridge_param_mult * betanew).square().sum();
       if( get_wvec(pivec, wvec, mask, params->l1_ridge_eps) ){
@@ -1355,7 +1483,8 @@ bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_p
     }
 
     // get the score
-    score = ( X.transpose() * mask.select(Y - pivec, 0).matrix()).array() ;
+    score = compute_step1_design_score(
+      compute_backend, X, mask.select(Y - pivec, 0).matrix());
     score -= lambda * ridge_param_mult * betanew;
     if(params->debug) cerr << "#"<< niter_cur << ": score max = " << score.abs().maxCoeff() << ";dev_diff=" << setprecision(16) << abs(fn_end - fn_start)/(.01 + abs(fn_end)) << "\n";
 
@@ -1378,7 +1507,7 @@ bool run_log_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_p
 }
 
 // Ridge logistic with ADAM using mini batch
-void run_log_ridge_loocv_adam(const int& ph, const double& lambda, const Ref<const ArrayXd>& ridge_param_mult, ArrayXd& betavec, ArrayXd& pivec, ArrayXd& wvec, const Ref<const ArrayXd>& Y, Ref<MatrixXd> X, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, struct param* params, mstream& sout) {
+void run_log_ridge_loocv_adam(const int& ph, const double& lambda, const Ref<const ArrayXd>& ridge_param_mult, ArrayXd& betavec, ArrayXd& pivec, ArrayXd& wvec, const Ref<const ArrayXd>& Y, Ref<MatrixXd> X, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, struct param* params, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   int niter_cur = 0, index;
   double p_alpha = params->adam_alpha, p_beta1 = params->adam_beta1, p_beta2 = params->adam_beta2, p_eps = params->adam_eps, p_alpha_t;
@@ -1408,8 +1537,10 @@ void run_log_ridge_loocv_adam(const int& ph, const double& lambda, const Ref<con
 
     } else {
 
-      get_pvec(etavec, pivec, betavec, offset, X, params->numtol_eps);
-      gradient_f -= ( X.transpose() * mask.select(Y - pivec, 0).matrix()).array() ;
+      get_pvec(etavec, pivec, betavec, offset, X,
+        params->numtol_eps, compute_backend);
+      gradient_f -= compute_step1_design_score(
+        compute_backend, X, mask.select(Y - pivec, 0).matrix());
 
     }
     //if(niter_cur%100 == 1) sout << "At iteration #"<< niter_cur << "; score max = " << gradient_f.abs().maxCoeff() << endl;
@@ -1430,7 +1561,7 @@ void run_log_ridge_loocv_adam(const int& ph, const double& lambda, const Ref<con
 }
 
 // Poisson regression
-void ridge_poisson_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, mstream& sout) {
+void ridge_poisson_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << endl << " Level 1 ridge with poisson regression..." << endl << flush;
 
@@ -1442,6 +1573,9 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
   ArrayXd Y1, W1, p1, score;
   ArrayXd betaold, etavec, pivec, wvec, zvec, betanew, etatest;
   MatrixXd X1, XtW, XtWX, XtWZ;
+  MatrixXd weighted_gram, weighted_rhs, solver_predictions, solver_coefficients;
+  const MatrixXd no_outcomes(0, 0);
+  VectorXd current_tau(1);
   l1->pheno_l1_not_converged = ArrayXb::Constant(params->n_pheno, false);
 
   for (int i = 0; i < 6; i++)
@@ -1459,7 +1593,6 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
     bs_l1 = l1->test_mat[ph_eff][0].cols();
-    MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
 
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( l1->pheno_l1_not_converged(ph) ) break;
@@ -1477,14 +1610,16 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
 
         while(niter_cur++ < params->niter_max_ridge){
 
-          XtWX = params->tau[ph](j) * l1->ridge_param_mult.matrix().asDiagonal();
+          XtWX = MatrixXd::Zero(bs_l1, bs_l1);
           XtWZ = MatrixXd::Zero(bs_l1, 1);
 
           for(int k = 0; k < params->cv_folds; ++k ) {
             if( k != i) {
 
               // get w=p*(1-p) and check none of the values are 0
-              get_pvec_poisson(etavec, pivec, betaold, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
+              get_pvec_poisson(etavec, pivec, betaold,
+                l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k],
+                params->numtol_eps, compute_backend);
               if( (masked_in_folds[k].col(ph).array() && (pivec == 0) ).any() ){
                 sout << "ERROR: Zeros occurred in Var(Y) during ridge poisson regression! (Try with --loocv)" << endl;
                 l1->pheno_l1_not_converged(ph) = true;
@@ -1493,14 +1628,24 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
 
               zvec = masked_in_folds[k].col(ph).array().select((etavec - l1->test_offset[ph][k].array()) + (l1->test_pheno_raw[ph][k].array() - pivec) / pivec, 0);
 
-              XtW = l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(pivec,0).matrix().asDiagonal();
-              XtWX += XtW * l1->test_mat[ph_eff][k];
-              XtWZ += XtW * zvec.matrix();
+              const VectorXd active_weights =
+                masked_in_folds[k].col(ph).array().select(pivec, 0).matrix();
+              const MatrixXd working_outcome = zvec.matrix();
+              compute_backend->compute_weighted_design_products(
+                l1->test_mat[ph_eff][k], active_weights, working_outcome,
+                weighted_gram, weighted_rhs);
+              XtWX += weighted_gram;
+              XtWZ += weighted_rhs;
             }
           }
           if( l1->pheno_l1_not_converged(ph) ) break;
 
-          betanew = XtWX.llt().solve(XtWZ).array();
+          current_tau(0) = params->tau[ph](j);
+          compute_backend->diagonal_penalty_predict(
+            XtWX, XtWZ, l1->test_mat[ph_eff][i], false, current_tau,
+            l1->ridge_param_mult.matrix(), no_outcomes, false,
+            solver_predictions, solver_coefficients);
+          betanew = solver_coefficients.col(0).array();
 
           // start step-halving
           for( int niter_search = 1; niter_search <= params->niter_max_line_search_ridge; niter_search++ ){
@@ -1510,7 +1655,9 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
             for(int k = 0; k < params->cv_folds; ++k ) {
               if( k != i) {
                 // get w=p*(1-p) and check none of the values are 0
-                get_pvec_poisson(etavec, pivec, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
+                get_pvec_poisson(etavec, pivec, betanew,
+                  l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k],
+                  params->numtol_eps, compute_backend);
                 invalid_pvec = (masked_in_folds[k].col(ph).array() && (pivec == 0) ).any();
                 if( invalid_pvec ) break; // do another halving
               }
@@ -1528,13 +1675,18 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
           for(int k = 0; k < params->cv_folds; ++k ) {
             if( k != i) {
               // get w=p*(1-p) and check none of the values are 0
-              get_pvec_poisson(etavec, pivec, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
+              get_pvec_poisson(etavec, pivec, betanew,
+                l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k],
+                params->numtol_eps, compute_backend);
               if( (masked_in_folds[k].col(ph).array() && (pivec == 0) ).any() ){
                 sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
                 l1->pheno_l1_not_converged(ph) = true;
                 break;
               }
-              score += (l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix()).array();
+              score += compute_step1_design_score(compute_backend,
+                l1->test_mat[ph_eff][k],
+                masked_in_folds[k].col(ph).array().select(
+                  l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix());
             }
           }
           score -= params->tau[ph](j) * l1->ridge_param_mult * betanew;
@@ -1555,7 +1707,9 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
         } else if(l1->pheno_l1_not_converged(ph)) break;
         //sout << "Converged in "<< niter_cur << " iterations. ;
 
-        get_pvec_poisson(etatest, p1, betanew, l1->test_offset[ph][i].array(), l1->test_mat[ph_eff][i], params->numtol_eps);
+        get_pvec_poisson(etatest, p1, betanew,
+          l1->test_offset[ph][i].array(), l1->test_mat[ph_eff][i],
+          params->numtol_eps, compute_backend);
         l1->beta_hat_level_1[ph][i].col(j) = betanew;
 
         // compute mse
@@ -1586,18 +1740,18 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
 
 }
 
-void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ests* m_ests, struct ridgel1* l1, mstream& sout) {
+void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ests* m_ests, struct ridgel1* l1, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   sout << endl << " Level 1 ridge with poisson regression..." << flush;
 
   int ph_eff, bs_l1 = params->total_n_block * params->n_ridge_l0;
-  double v2, pred, p1;
+  double pred, p1;
   string in_pheno;
   ifstream infile;
 
   ArrayXd beta, pivec;
-  MatrixXd XtWX, V1, b_loo;
-  LLT<MatrixXd> Hinv;
+  MatrixXd XtWX, weighted_gram, weighted_rhs, no_weighted_outcomes,
+    loo_predictions;
   l1->pheno_l1_not_converged = ArrayXb::Constant(params->n_pheno, false);
   for (int i = 0; i < 6; i++)
     l1->cumsum_values[i].setZero(params->n_pheno, params->n_ridge_l1);
@@ -1619,13 +1773,15 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat[ph_eff][0].cols();
-    MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+    bs_l1 = l1->test_mat_conc[ph_eff].cols();
 
     MapArXd Y (pheno_data->phenotypes_raw.col(ph).data(), pheno_data->phenotypes_raw.rows());
     MapMatXd X (l1->test_mat_conc[ph_eff].data(), pheno_data->phenotypes_raw.rows(), bs_l1);
     MapArXd offset (m_ests->offset_nullreg.col(ph).data(), pheno_data->phenotypes_raw.rows());
     MapArXb mask (pheno_data->masked_indivs.col(ph).data(), pheno_data->masked_indivs.rows());
+    VectorXi full_group_offset(1), full_group_size(1);
+    full_group_offset(0) = 0;
+    full_group_size(0) = bs_l1;
 
     // starting values for each trait
     beta = ArrayXd::Zero(bs_l1);
@@ -1636,7 +1792,7 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
       if( params->use_adam ) // run ADAM to get close to max
         throw "not yet implemented"; //run_ct_ridge_loocv_adam(ph, params->tau[ph](j), beta, pivec, Y, X, offset, mask, params, sout);
 
-      if(!run_ct_ridge_loocv(params->tau[ph](j), l1->ridge_param_mult, target_size, nchunk, beta, pivec, Y, X, offset, mask, params, sout)){
+      if(!run_ct_ridge_loocv(params->tau[ph](j), l1->ridge_param_mult, target_size, nchunk, beta, pivec, Y, X, offset, mask, params, compute_backend, sout)){
         sout << "WARNING: Ridge poisson regression did not converge! (Increase --niter)\n";
         l1->pheno_l1_not_converged(ph) = true;
         break;
@@ -1649,12 +1805,19 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
         j_start = chunk * target_size;
 
         Ref<MatrixXd> Xmat_chunk = X.block(j_start, 0, size_chunk, bs_l1); // n x k
-        Ref<MatrixXd> w_chunk = pivec.matrix().block(j_start, 0, size_chunk,1);
-        Ref<MatrixXb> mask_chunk = mask.matrix().block(j_start, 0, size_chunk,1);
+        Ref<ArrayXd> w_chunk = pivec.segment(j_start, size_chunk);
+        Ref<ArrayXb> mask_chunk = mask.segment(j_start, size_chunk);
 
-        XtWX += Xmat_chunk.transpose() * mask_chunk.array().select(w_chunk.array(),0).matrix().asDiagonal() * Xmat_chunk;
+        const VectorXd active_weights =
+          mask_chunk.select(w_chunk, 0).matrix();
+        no_weighted_outcomes.resize(size_chunk, 0);
+        compute_backend->compute_weighted_design_products(
+          Xmat_chunk, active_weights, no_weighted_outcomes,
+          weighted_gram, weighted_rhs);
+        XtWX += weighted_gram;
       }
-      Hinv.compute( XtWX + params->tau[ph](j) * ident_l1 );
+      compute_backend->factorize_diagonal_penalty(
+        XtWX, params->tau[ph](j), l1->ridge_param_mult.matrix());
 
       // LOOCV estimates
       for(chunk = 0; chunk < nchunk; ++chunk ) {
@@ -1662,17 +1825,19 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
         j_start = chunk * target_size;
 
         Ref<MatrixXd> Xmat_chunk = X.block(j_start, 0, size_chunk, bs_l1); // n x k
-        Ref<MatrixXd> Yvec_chunk = Y.matrix().block(j_start, 0, size_chunk, 1);
-        Ref<MatrixXb> mask_chunk = mask.matrix().block(j_start, 0, size_chunk,1);
+        Ref<ArrayXd> Yvec_chunk = Y.segment(j_start, size_chunk);
+        Ref<ArrayXb> mask_chunk = mask.segment(j_start, size_chunk);
 
-        V1 = Hinv.solve( Xmat_chunk.transpose() ); // k x n
+        const VectorXd residual_chunk =
+          (Yvec_chunk - pivec.segment(j_start, size_chunk)).matrix();
+        const VectorXd leverage_weights =
+          pivec.segment(j_start, size_chunk).matrix();
+        compute_backend->grouped_leave_one_out_predict_factorized(
+          Xmat_chunk, beta.matrix(), residual_chunk, leverage_weights,
+          full_group_offset, full_group_size, loo_predictions);
         for(int i = 0; i < size_chunk; ++i ) {
-          if(!mask_chunk(i,0)) continue;
-          v2 = Xmat_chunk.row(i) * V1.col(i);
-          v2 *= pivec(j_start + i);
-          b_loo = (beta - V1.col(i).array() * (Yvec_chunk(i,0) - pivec(j_start + i)) / (1 - v2)).matrix();
-          pred = Xmat_chunk.row(i) * b_loo.col(0);
-          pred += offset(j_start + i);
+          if(!mask_chunk(i)) continue;
+          pred = loo_predictions(i, 0) + offset(j_start + i);
           p1 = exp(pred);
 
           // if p is within eps of 0, set to eps
@@ -1680,11 +1845,11 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
 
           // compute mse and rsq
           l1->cumsum_values[0](ph,j) += p1; // Sx
-          l1->cumsum_values[1](ph,j) += Yvec_chunk(i,0); // Sy
+          l1->cumsum_values[1](ph,j) += Yvec_chunk(i); // Sy
           l1->cumsum_values[2](ph,j) += p1 * p1; // Sx2
-          l1->cumsum_values[3](ph,j) += Yvec_chunk(i,0) * Yvec_chunk(i,0); // Sy2
-          l1->cumsum_values[4](ph,j) += p1 * Yvec_chunk(i,0); // Sxy
-          l1->cumsum_values[5](ph,j) += compute_log_lik_poisson(Yvec_chunk(i,0), p1); // -LL
+          l1->cumsum_values[3](ph,j) += Yvec_chunk(i) * Yvec_chunk(i); // Sy2
+          l1->cumsum_values[4](ph,j) += p1 * Yvec_chunk(i); // Sxy
+          l1->cumsum_values[5](ph,j) += compute_log_lik_poisson(Yvec_chunk(i), p1); // -LL
         }
       }
 
@@ -1699,20 +1864,20 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
   sout << endl;
 }
 
-bool run_ct_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_param_mult, const int& target_size, const int& nchunk, ArrayXd& betaold, ArrayXd& pivec, const Ref<const ArrayXd>& Y, Ref<MatrixXd> X, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, struct param* params, mstream& sout) {
+bool run_ct_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_param_mult, const int& target_size, const int& nchunk, ArrayXd& betaold, ArrayXd& pivec, const Ref<const ArrayXd>& Y, Ref<MatrixXd> X, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, struct param* params, Step1ComputeBackend* compute_backend, mstream& sout) {
 
   int bs_l1 = X.cols();
   int niter_cur = 0, j_start, chunk, size_chunk;
   ArrayXd etavec, zvec, betanew, score;
-  MatrixXd XtWX, XtWZ, V1;
-  LLT<MatrixXd> Hinv;
-  MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+  MatrixXd XtWX, XtWZ, V1, weighted_gram, weighted_rhs, solution;
+  VectorXd current_tau(1);
 
 
   while(niter_cur++ < params->niter_max_ridge) {
 
     // get p and check none of the values are 0
-    get_pvec_poisson(etavec, pivec, betaold, offset, X, params->numtol_eps);
+    get_pvec_poisson(etavec, pivec, betaold, offset, X,
+      params->numtol_eps, compute_backend);
     if( (mask && (pivec == 0)).any() ){
       sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression.\n";
       return false;
@@ -1720,32 +1885,41 @@ bool run_ct_ridge_loocv(const double& lambda, const Ref<const ArrayXd>& ridge_pa
     zvec = mask.select( (etavec - offset) + (Y - pivec) / pivec, 0);
 
     // compute XtWX and XtWZ in chunks
-    XtWX = lambda * ridge_param_mult.matrix().asDiagonal(); 
+    XtWX = MatrixXd::Zero(bs_l1, bs_l1);
     XtWZ = MatrixXd::Zero(bs_l1, 1);
     for(chunk = 0; chunk < nchunk; ++chunk ) {
       size_chunk = ( chunk == nchunk - 1 ? params->cv_folds - target_size * chunk : target_size );
       j_start = chunk * target_size;
 
       Ref<MatrixXd> Xmat_chunk = X.block(j_start, 0, size_chunk, bs_l1); // n x k
-      Ref<MatrixXd> w_chunk = pivec.matrix().block(j_start, 0, size_chunk, 1);
-      Ref<MatrixXd> z_chunk = zvec.matrix().block(j_start, 0, size_chunk,1);
-      Ref<const MatrixXb> mask_chunk = mask.matrix().block(j_start, 0, size_chunk,1);
+      Ref<ArrayXd> w_chunk = pivec.segment(j_start, size_chunk);
+      Ref<ArrayXd> z_chunk = zvec.segment(j_start, size_chunk);
+      Ref<const ArrayXb> mask_chunk = mask.segment(j_start, size_chunk);
 
-      V1 = Xmat_chunk.transpose() * mask_chunk.array().select(w_chunk.array(),0).matrix().asDiagonal();
-      XtWX += V1 * Xmat_chunk;
-      XtWZ += V1 * z_chunk;
+      const VectorXd active_weights =
+        mask_chunk.select(w_chunk, 0).matrix();
+      const MatrixXd working_outcome = z_chunk.matrix();
+      compute_backend->compute_weighted_design_products(
+        Xmat_chunk, active_weights, working_outcome,
+        weighted_gram, weighted_rhs);
+      XtWX += weighted_gram;
+      XtWZ += weighted_rhs;
     }
-    Hinv.compute( XtWX );
-    betanew = Hinv.solve(XtWZ).array();
+    current_tau(0) = lambda;
+    compute_backend->diagonal_penalty_solve(
+      XtWX, XtWZ, current_tau, ridge_param_mult.matrix(), solution);
+    betanew = solution.col(0).array();
 
-    get_pvec_poisson(etavec, pivec, betanew, offset, X, params->numtol_eps);
+    get_pvec_poisson(etavec, pivec, betanew, offset, X,
+      params->numtol_eps, compute_backend);
     if( (mask && (pivec == 0)).any() ){
       sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression.\n";
       return false;
     }
 
     // get the score
-    score = ( X.transpose() * mask.select(Y - pivec, 0).matrix()).array() ;
+    score = compute_step1_design_score(
+      compute_backend, X, mask.select(Y - pivec, 0).matrix());
     score -= lambda * ridge_param_mult * betanew;
 
     if( score.abs().maxCoeff() < params->l1_ridge_tol ) break;
@@ -1786,9 +1960,10 @@ bool get_wvec(ArrayXd& pivec, ArrayXd& wvec, const Ref<const ArrayXb>& mask, con
   return (wvec == 0).any();
 }
 
-void get_pvec(ArrayXd& etavec, ArrayXd& pivec, const Ref<const ArrayXd>& beta, const Ref<const ArrayXd>& offset, const Ref<const MatrixXd>& Xmat, double const& eps){
+void get_pvec(ArrayXd& etavec, ArrayXd& pivec, const Ref<const ArrayXd>& beta, const Ref<const ArrayXd>& offset, const Ref<const MatrixXd>& Xmat, double const& eps, Step1ComputeBackend* compute_backend){
 
-  etavec = offset + (Xmat * beta.matrix()).array();
+  etavec = offset + compute_step1_linear_prediction(
+    compute_backend, Xmat, beta.matrix());
   get_pvec(pivec, etavec, eps);
 
 }
@@ -1814,9 +1989,10 @@ void get_wvec(ArrayXd& pivec, ArrayXd& wvec, const Ref<const ArrayXb>& mask){
   wvec = mask.select(pivec*(1-pivec), 1);
 }
 
-void get_pvec_poisson(ArrayXd& etavec, ArrayXd& pivec, const Ref<const ArrayXd>& beta, const Ref<const ArrayXd>& offset, const Ref<const MatrixXd>& Xmat, double const& eps){
+void get_pvec_poisson(ArrayXd& etavec, ArrayXd& pivec, const Ref<const ArrayXd>& beta, const Ref<const ArrayXd>& offset, const Ref<const MatrixXd>& Xmat, double const& eps, Step1ComputeBackend* compute_backend){
 
-  etavec = offset + (Xmat * beta.matrix()).array();
+  etavec = offset + compute_step1_linear_prediction(
+    compute_backend, Xmat, beta.matrix());
   pivec = etavec.exp(); // lambda = E(Y)
 
 }
@@ -1869,7 +2045,7 @@ double get_deviance_logistic(const Ref<const ArrayXd>& Y, const Ref<const ArrayX
   return dev;
 }
 
-void test_assoc_block(int const& chrom, int const& block, struct ridgel0& l0,struct ridgel1& l1, struct geno_block* Gblock, struct phenodt* pheno_data, snp const* snpinfo, struct param const& params, mstream& sout){
+void test_assoc_block(int const& chrom, int const& block, struct ridgel0& l0,struct ridgel1& l1, struct geno_block* Gblock, struct phenodt* pheno_data, snp const* snpinfo, struct param const& params, Step1ComputeBackend* compute_backend, mstream& sout){
 
   sout << "   -extracting highly associated SNPs..." << flush;
   auto t2 = std::chrono::high_resolution_clock::now();
@@ -1881,7 +2057,8 @@ void test_assoc_block(int const& chrom, int const& block, struct ridgel0& l0,str
 
   if(run_algo){
     for(int ph = 0; ph < params.n_pheno; ph++)
-      apply_iter_cond(chrom, block, ph, l0, l1, Gblock, snpinfo, params);
+      apply_iter_cond(chrom, block, ph, l0, l1, Gblock, snpinfo, params,
+        compute_backend);
     sout << "number selected across phenotypes = [ " << l0.nspns_picked_block.matrix().transpose() << " ]...";
   }
 
@@ -1891,10 +2068,9 @@ void test_assoc_block(int const& chrom, int const& block, struct ridgel0& l0,str
   l0.indices_gmat_keep = get_true_indices(!rm_var); // resize matrices to remove the picked SNPs
   if(l0.subset_l0_snps_gmat) {
     if(params.use_loocv){
-      SelfAdjointEigenSolver<MatrixXd> esG(l0.GGt(l0.indices_gmat_keep,l0.indices_gmat_keep));
-      l0.GGt_eig_vec = esG.eigenvectors();
-      l0.GGt_eig_val = esG.eigenvalues();
-      l0.Wmat = l0.GGt_eig_vec.transpose() * l0.GTY(l0.indices_gmat_keep, all);
+      MatrixXd subset_gram = l0.GGt(l0.indices_gmat_keep,l0.indices_gmat_keep);
+      MatrixXd subset_rhs = l0.GTY(l0.indices_gmat_keep, all);
+      compute_backend->factorize_ridge_system(subset_gram, subset_rhs);
     } else {
       l0.GGt = MatrixXd::Zero(l0.indices_gmat_keep.size(),l0.indices_gmat_keep.size());
       l0.GTY = MatrixXd::Zero(l0.indices_gmat_keep.size(),params.n_pheno);
@@ -1909,10 +2085,7 @@ void test_assoc_block(int const& chrom, int const& block, struct ridgel0& l0,str
       tmpM = Gblock->Gmat(l0.indices_gmat_keep, all); Gblock->Gmat = tmpM;
     }
   } else if(params.use_loocv){ // loocv
-    SelfAdjointEigenSolver<MatrixXd> esG(l0.GGt);
-    l0.GGt_eig_vec = esG.eigenvectors();
-    l0.GGt_eig_val = esG.eigenvalues();
-    l0.Wmat = l0.GGt_eig_vec.transpose() * l0.GTY;
+    compute_backend->factorize_ridge_system(l0.GGt, l0.GTY);
   }
 
   sout << "done";
@@ -2134,7 +2307,7 @@ uint64 getSize(string const& fname){
 }
 
 //////////// dev functions
-void apply_iter_cond(int const& chrom, int const& block, int const& ph, struct ridgel0& l0, struct ridgel1& l1, struct geno_block* Gblock, snp const* snpinfo, struct param const& params){
+void apply_iter_cond(int const& chrom, int const& block, int const& ph, struct ridgel0& l0, struct ridgel1& l1, struct geno_block* Gblock, snp const* snpinfo, struct param const& params, Step1ComputeBackend* compute_backend){
 
   chi_squared chisq(1);
   int bs = l0.GGt.rows(), maxIndex = 0;
@@ -2145,7 +2318,8 @@ void apply_iter_cond(int const& chrom, int const& block, int const& ph, struct r
   MapArXd GtY (l0.GTY.col(ph).data(), bs);
   ArrayXd block_top_pgs = ArrayXd::Zero(Gblock->Gmat.cols());
   ArrayXd snp_pgs, chisq_v, bvec, v_beta, bstart, v_y;
-  MatrixXd tmpM, X2tX1_X1tX1_inv, X1tX1_inv_X1ty, LDmat = (l0.GGt.array() / (params.n_samples - params.ncov_analyzed) ).square().matrix();
+  MatrixXd X2tX1_X1tX1_inv,
+    LDmat = (l0.GGt.array() / (params.n_samples - params.ncov_analyzed) ).square().matrix();
   // initial values
   l0.nspns_picked_block(ph) = 0;
   bstart = GtY/ggt_diag; bvec = bstart;
@@ -2176,32 +2350,26 @@ void apply_iter_cond(int const& chrom, int const& block, int const& ph, struct r
     // track indices of snps not picked
     indices_start = get_true_indices(!l0.picked_top_snp.array().col(ph));
 
-    // quantities needed for beta &v(beta)
-    /* // with eigen decomp
-    SelfAdjointEigenSolver<MatrixXd> eig_x1tx1(l0.GGt(top_indices, top_indices));
-    tmpM = eig_x1tx1.eigenvectors() * (1/eig_x1tx1.eigenvalues().array().sqrt()).matrix().asDiagonal();
-    X2tX1_X1tX1_inv = l0.GGt(indices_start, top_indices) * tmpM;
-    X1tX1_inv_X1ty = tmpM.transpose() * GtY(top_indices).matrix();
-    // get bvec conditional on picked snps
-    bvec = bstart(indices_start) - (X2tX1_X1tX1_inv * X1tX1_inv_X1ty).array() / ggt_diag;
-    //if(params.debug) cerr << bvec.head(5).matrix().transpose() << "\n";
-    v_y = ((l0.ymat_res.col(ph) - block_top_pgs.matrix()).squaredNorm() - bvec * GtY(indices_start)) / (ggt_diag - itr - 1);
-    v_beta = (ggt_diag - X2tX1_X1tX1_inv.array().square().rowwise().sum()) / ggt_diag / ggt_diag;  
-*/
-    // switch to cholesky (X1tX1 should always be pd)
+    // X1tX1 should always be positive definite. Reuse one backend
+    // factorization for both the conditional crossproducts and phenotype RHS.
     if(itr == 1){
       X2tX1_X1tX1_inv = l0.GGt(indices_start,top_indices) / ggt_diag;
       ss_x1 = GtY(top_indices).square()(0) / ggt_diag;
-    } else if(itr <5) {
-      MatrixXd inv_X1tX1 = l0.GGt(top_indices, top_indices).inverse();
-      X2tX1_X1tX1_inv = l0.GGt(indices_start,top_indices) * inv_X1tX1;
-      //if(params.debug) cerr << (inv_X1tX1 * GtY(top_indices).matrix()).transpose() << "\n";
-      ss_x1 = GtY(top_indices).matrix().transpose() * inv_X1tX1 * GtY(top_indices).matrix();
     } else {
-      const LLT<MatrixXd> llt_X1tX1 = l0.GGt(top_indices, top_indices).llt();
-      X2tX1_X1tX1_inv = llt_X1tX1.solve(l0.GGt(top_indices, indices_start)).transpose();
-      //if(params.debug) cerr << llt_X1tX1.solve(GtY(top_indices).matrix()).transpose() << "\n";
-      ss_x1 = (GtY(top_indices).matrix().transpose() * llt_X1tX1.solve(GtY(top_indices).matrix()))(0,0);
+      const MatrixXd conditional_gram = l0.GGt(top_indices, top_indices);
+      MatrixXd conditional_rhs(top_indices.size(), indices_start.size() + 1);
+      conditional_rhs.leftCols(indices_start.size()) =
+        l0.GGt(top_indices, indices_start);
+      conditional_rhs.rightCols(1) = GtY(top_indices).matrix();
+      const VectorXd no_penalty = VectorXd::Ones(top_indices.size());
+      compute_backend->factorize_diagonal_penalty(
+        conditional_gram, 0.0, no_penalty);
+      MatrixXd conditional_solution;
+      compute_backend->solve_factorized(conditional_rhs, conditional_solution);
+      X2tX1_X1tX1_inv =
+        conditional_solution.leftCols(indices_start.size()).transpose();
+      ss_x1 = (GtY(top_indices).matrix().transpose() *
+        conditional_solution.rightCols(1))(0,0);
     }
     // get bvec conditional on picked snps
     bvec = bstart(indices_start) - (X2tX1_X1tX1_inv * GtY(top_indices).matrix()).array() / ggt_diag;
@@ -2229,7 +2397,7 @@ void apply_iter_cond(int const& chrom, int const& block, int const& ph, struct r
   }
 }
 
-void ridge_cox_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, struct ests* m_ests, mstream& sout) {
+void ridge_cox_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, struct ests* m_ests, Step1ComputeBackend* compute_backend, mstream& sout) {
   sout << endl << " Level 1 ridge with cox regression..." << endl << flush;
   
   int ph_eff, l0_idx;
@@ -2273,7 +2441,8 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
     cox_ridge coxRidge_null_lamb0(survivalNullData, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg(all, time_index), mask, 0, params->niter_max, params->niter_max_line_search, params->numtol_cox);
     coxRidge_null_lamb0.coxGrad(survivalNullData);
     Eigen::VectorXd gradient = coxRidge_null_lamb0.get_gradient();
-    double lambda_max = getCoxLambdaMax(l1->test_mat_conc[ph_eff], gradient);
+    double lambda_max = getCoxLambdaMax(
+      l1->test_mat_conc[ph_eff], gradient, compute_backend);
     pheno_data->cox_max_tau[time_index] = lambda_max;
 
     check_l0(time_index, ph_eff, params, l1, pheno_data, sout);
@@ -2284,7 +2453,7 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
       
       survival_data survivalData_fold;
       survivalData_fold.setup(ph_time, ph_event, fold_train_mask, true);
-      cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true);
+      cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true, compute_backend);
       coxRidgePath_fold.fit(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask);
 
       if (!coxRidgePath_fold.converge.all()) {
