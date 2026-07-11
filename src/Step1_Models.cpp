@@ -481,12 +481,16 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     // assign masking within folds
     masked_in_folds[i] = pheno_data->masked_indivs.block(cum_size_folds, 0, params->cv_sizes(i), pheno_data->masked_indivs.cols());
 
+    std::chrono::steady_clock::time_point eig_start;
+    if(params->profile_step1) eig_start = std::chrono::steady_clock::now();
     ww1 = l0->GGt - l0->G_folds[i];
     SelfAdjointEigenSolver<MatrixXd> eig(ww1);
     vmat = eig.eigenvectors();
     dvec = eig.eigenvalues();
     //if(i == 0)sout << ww1 << endl;
     ww2 = vmat.transpose() * (l0->GTY - l0->GtY[i]);
+    if(params->profile_step1)
+      l0->profile_eigensolve_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - eig_start).count();
 
     for(int j = 0; j < params->n_ridge_l0; ++j ) {
 

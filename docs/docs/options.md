@@ -286,6 +286,7 @@ Samples with missing LOCO predictions must have their corresponding phenotype va
 |`--par-region` | STRING | Optional | specify build code to determine bounds for PAR1/PAR2 regions (can be 'b36/b37/b38/hg18/hg19/hg38' or 'start,end' bp bounds of non-PAR region) [default is hg38]|
 |`--force-qt`| FLAG | Optional | force QT run for binary traits|
 |`--threads`| INT | Optional| number of computational threads to use [default=all-1]|
+|`--step1-profile`| FLAG | Optional| output structured timing data for Step 1 Level 0|
 |`--debug`| FLAG | Optional | debug flag (for use by developers)|
 |`--verbose`| FLAG | Optional| verbose screen output|
 |`--version`| FLAG | Optional| print version number and exit|
