@@ -4,7 +4,22 @@
 import argparse
 import itertools
 import math
+import re
 from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+
+FLOAT_TOKEN = r"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|inf(?:inity)?|nan)"
+NUMERIC_LINE_PATTERN = re.compile(
+    rf"\s*(?:{FLOAT_TOKEN})(?:\s+{FLOAT_TOKEN})*\s*", re.IGNORECASE
+)
+NUMERIC_TOKEN_PATTERN = re.compile(
+    rf"(?<!\S)({FLOAT_TOKEN})(?!\S)", re.IGNORECASE
+)
 
 
 def positive_int(value):
@@ -35,6 +50,12 @@ def parse_args():
             "use 6 for REGENIE's default text output"
         ),
     )
+    parser.add_argument(
+        "--engine",
+        choices=("auto", "numpy", "python"),
+        default="auto",
+        help="comparison engine (default: NumPy when installed, otherwise Python)",
+    )
     return parser.parse_args()
 
 
@@ -52,8 +73,72 @@ def significant_digit_quantum(value, digits):
     return 10.0 ** (exponent - digits + 1)
 
 
+def compare_numpy_lines(expected_line, actual_line, line_number, args):
+    expected_values = np.fromstring(expected_line, dtype=np.float64, sep=" ")
+    actual_values = np.fromstring(actual_line, dtype=np.float64, sep=" ")
+    if expected_values.size != actual_values.size:
+        raise SystemExit(f"token count differs on line {line_number}")
+
+    expected_finite = np.isfinite(expected_values)
+    actual_finite = np.isfinite(actual_values)
+    equal_infinities = (
+        np.isinf(expected_values)
+        & np.isinf(actual_values)
+        & (expected_values == actual_values)
+    )
+    bad_nonfinite = (~expected_finite | ~actual_finite) & ~equal_infinities
+    if np.any(bad_nonfinite):
+        column = int(np.flatnonzero(bad_nonfinite)[0]) + 1
+        raise SystemExit(
+            f"non-finite numeric difference at line {line_number}, "
+            f"column {column}: {expected_values[column - 1]!r} != "
+            f"{actual_values[column - 1]!r}"
+        )
+
+    finite = expected_finite & actual_finite
+    errors = np.zeros(expected_values.shape, dtype=np.float64)
+    errors[finite] = np.abs(expected_values[finite] - actual_values[finite])
+    tolerances = np.full(expected_values.shape, args.atol, dtype=np.float64)
+    tolerances[finite] = np.maximum(
+        tolerances[finite],
+        args.rtol
+        * np.maximum(
+            np.abs(expected_values[finite]), np.abs(actual_values[finite])
+        ),
+    )
+
+    candidates = np.flatnonzero(errors > tolerances)
+    for candidate in candidates:
+        tolerance = tolerances[candidate]
+        if args.output_significant_digits:
+            tolerance = max(
+                tolerance,
+                significant_digit_quantum(
+                    expected_values[candidate], args.output_significant_digits
+                )
+                * (1.0 + 1e-9),
+                significant_digit_quantum(
+                    actual_values[candidate], args.output_significant_digits
+                )
+                * (1.0 + 1e-9),
+            )
+        if errors[candidate] > tolerance:
+            column = int(candidate) + 1
+            raise SystemExit(
+                f"numeric difference at line {line_number}, column {column}: "
+                f"{expected_values[candidate]} != {actual_values[candidate]} "
+                f"(absolute error {errors[candidate]}, tolerance {tolerance})"
+            )
+
+    maximum_error = float(errors.max()) if errors.size else 0.0
+    return int(expected_values.size), maximum_error
+
+
 def main():
     args = parse_args()
+    if args.engine == "numpy" and np is None:
+        raise SystemExit("NumPy comparison engine requested but NumPy is not installed")
+    use_numpy = args.engine != "python" and np is not None
     maximum_error = 0.0
     numeric_values = 0
     missing = object()
@@ -67,6 +152,30 @@ def main():
             expected_line, actual_line = lines
             if expected_line is missing or actual_line is missing:
                 raise SystemExit(f"line count differs at line {line_number}")
+
+            if (
+                use_numpy
+                and NUMERIC_LINE_PATTERN.fullmatch(expected_line)
+                and NUMERIC_LINE_PATTERN.fullmatch(actual_line)
+            ):
+                line_values, line_error = compare_numpy_lines(
+                    expected_line, actual_line, line_number, args
+                )
+                numeric_values += line_values
+                maximum_error = max(maximum_error, line_error)
+                continue
+
+            if use_numpy and expected_line == actual_line:
+                numeric_tokens = NUMERIC_TOKEN_PATTERN.findall(expected_line)
+                for token in numeric_tokens:
+                    if math.isnan(float(token)):
+                        raise SystemExit(
+                            f"non-finite numeric difference at line {line_number}: "
+                            f"{token!r} != {token!r}"
+                        )
+                numeric_values += len(numeric_tokens)
+                continue
+
             expected_tokens = expected_line.split()
             actual_tokens = actual_line.split()
             if len(expected_tokens) != len(actual_tokens):
@@ -129,7 +238,8 @@ def main():
     )
     print(
         f"NUMERIC_FILE_COMPARE status=PASS values={numeric_values} "
-        f"maximum_absolute_error={maximum_error}{serialization}"
+        f"maximum_absolute_error={maximum_error}{serialization} "
+        f"engine={'numpy' if use_numpy else 'python'}"
     )
 
 

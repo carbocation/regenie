@@ -148,11 +148,13 @@ also records how many blocks used the CUDA path versus the bounded CPU
 fallback.
 
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
-one line at a time. Its default tolerances remain strict for full-precision
-validation. For REGENIE text written with the default six significant digits,
-pass `--output-significant-digits 6` to additionally tolerate one unit in the
-last serialized digit without weakening comparisons beyond the precision
-present in the files.
+one line at a time and automatically uses a vectorized NumPy engine when NumPy
+is installed, with a dependency-free Python fallback. Its default tolerances
+remain strict for full-precision validation. For REGENIE text written with the
+default six significant digits, pass `--output-significant-digits 6` to
+additionally tolerate one unit in the last serialized digit without weakening
+comparisons beyond the precision present in the files. `--engine` can force
+`numpy` or `python` when comparing implementations.
 
 An opt-in end-to-end benchmark generates a deterministic PLINK BED dataset in
 the validation results directory, runs matched CPU and CUDA Step 1 jobs,

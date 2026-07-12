@@ -764,10 +764,7 @@ void Data::level_0_calculations() {
       ProfileClock::time_point block_start;
       if(params.profile_step1) block_start = ProfileClock::now();
 
-      // Every Step 1 decoder writes all retained samples for every variant
-      // before missing-value imputation, so zero-filling this potentially
-      // multi-gigabyte block only adds redundant memory bandwidth.
-      Gblock.Gmat.resize(bs, params.n_samples);
+      Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
       if(params.alpha_prior != -1) Gblock.snp_afs = MatrixXd::Zero(bs, 1);
 
       ProfileClock::time_point stage_start;
