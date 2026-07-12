@@ -78,6 +78,9 @@ bool Step1ComputeBackend::preprocess_genotypes(
   return false;
 }
 
+void Step1ComputeBackend::release_preprocessed_genotypes() {
+}
+
 void Step1ComputeBackend::diagonal_penalty_predict(
   const Eigen::Ref<const Eigen::MatrixXd>& gram,
   const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,

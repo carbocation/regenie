@@ -33,6 +33,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <climits>
 #include <limits>
@@ -287,7 +288,8 @@ class CudaEventPair {
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
-      : device_(device), handle_(nullptr), solver_handle_(nullptr), d_genotypes_(nullptr),
+      : device_(device), handle_(nullptr), solver_handle_(nullptr),
+        d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
         d_factorized_(nullptr),
         d_ridge_vectors_(nullptr), d_ridge_values_(nullptr),
@@ -299,7 +301,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         d_preprocess_covariates_(nullptr), d_preprocess_weights_(nullptr),
         d_preprocess_coefficients_(nullptr), d_preprocess_scales_(nullptr),
         d_preprocess_multipliers_(nullptr),
-        genotypes_capacity_(0), phenotypes_capacity_(0), gram_capacity_(0),
+        genotypes_capacity_(0), resident_genotypes_capacity_(0),
+        resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
+        resident_valid_(false), phenotypes_capacity_(0), gram_capacity_(0),
         factorized_capacity_(0), factorized_size_(-1),
         ridge_vectors_capacity_(0), ridge_values_capacity_(0),
         ridge_rhs_capacity_(0),
@@ -345,6 +349,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(d_crossproduct_) cudaFree(d_crossproduct_);
       if(d_gram_) cudaFree(d_gram_);
       if(d_phenotypes_) cudaFree(d_phenotypes_);
+      if(d_resident_genotypes_) cudaFree(d_resident_genotypes_);
       if(d_genotypes_) cudaFree(d_genotypes_);
       if(solver_handle_) cusolverDnDestroy(solver_handle_);
       if(handle_) cublasDestroy(handle_);
@@ -374,6 +379,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeBackend::preprocess_genotypes(genotypes, covariates,
         sample_weights, degrees_of_freedom, minimum_scale,
         row_multipliers, row_scales, timings);
+      invalidate_resident_genotypes();
       const long long required_elements_long =
         static_cast<long long>(genotypes.rows()) * genotypes.cols();
       const Eigen::Index resident_limit =
@@ -394,7 +400,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(rows == 0) return true;
       if(columns == 0) return false;
 
-      ensure_capacity(d_genotypes_, genotypes_capacity_, element_count,
+      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+        element_count,
         "cudaMalloc(resident genotype preprocessing block)");
       ensure_capacity(d_preprocess_weights_, preprocess_weights_capacity_,
         columns, "cudaMalloc(genotype preprocessing sample weights)");
@@ -420,7 +427,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         packed_covariates.data() : covariates.data();
       ComputeClock::time_point transfer_start;
       if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(d_genotypes_, genotypes.data(),
+      check_cuda(cudaMemcpy(d_resident_genotypes_, genotypes.data(),
         static_cast<size_t>(element_count) * sizeof(double),
         cudaMemcpyHostToDevice),
         "copy resident genotype preprocessing block to CUDA device");
@@ -447,7 +454,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const int threads = 256;
       const int element_blocks = (element_count - 1) / threads + 1;
       mask_genotype_columns<<<element_blocks, threads>>>(
-        d_genotypes_, d_preprocess_weights_, rows, element_count);
+        d_resident_genotypes_, d_preprocess_weights_, rows, element_count);
       check_cuda(cudaGetLastError(),
         "mask genotype preprocessing columns kernel");
       if(covariate_count > 0) {
@@ -456,19 +463,20 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const double minus_one = -1.0;
         check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
           rows, covariate_count, columns, &one,
-          d_genotypes_, rows, d_preprocess_covariates_, columns, &zero,
+          d_resident_genotypes_, rows,
+          d_preprocess_covariates_, columns, &zero,
           d_preprocess_coefficients_, rows),
           "cublasDgemm(genotype preprocessing projection coefficients)");
         check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
           rows, columns, covariate_count, &minus_one,
           d_preprocess_coefficients_, rows,
           d_preprocess_covariates_, columns, &one,
-          d_genotypes_, rows),
+          d_resident_genotypes_, rows),
           "cublasDgemm(genotype preprocessing residuals)");
       }
       compute_genotype_row_scales<<<rows, threads,
-        threads * sizeof(double)>>>(d_genotypes_, d_preprocess_scales_,
-        rows, columns, degrees_of_freedom);
+        threads * sizeof(double)>>>(d_resident_genotypes_,
+        d_preprocess_scales_, rows, columns, degrees_of_freedom);
       check_cuda(cudaGetLastError(),
         "compute genotype preprocessing row scales kernel");
       if(timings)
@@ -492,7 +500,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         scale_events->record_start();
       }
       scale_genotype_rows<<<element_blocks, threads>>>(
-        d_genotypes_, d_preprocess_scales_,
+        d_resident_genotypes_, d_preprocess_scales_,
         row_multipliers.size() ? d_preprocess_multipliers_ : nullptr,
         rows, element_count);
       check_cuda(cudaGetLastError(),
@@ -502,12 +510,20 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           scale_events->record_stop_and_elapsed_ms();
 
       if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(genotypes.data(), d_genotypes_,
+      check_cuda(cudaMemcpy(genotypes.data(), d_resident_genotypes_,
         static_cast<size_t>(element_count) * sizeof(double),
         cudaMemcpyDeviceToHost),
         "copy normalized genotype preprocessing block from CUDA device");
       if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      resident_host_data_ = genotypes.data();
+      resident_rows_ = genotypes.rows();
+      resident_columns_ = genotypes.cols();
+      resident_valid_ = true;
       return true;
+    }
+
+    void release_preprocessed_genotypes() override {
+      invalidate_resident_genotypes();
     }
 
     void compute_products(
@@ -537,8 +553,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
         genotypes.cols(), genotypes.rows());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
-        chunk_samples * genotypes.rows(), "cudaMalloc(genotype chunk)");
+      const bool genotypes_are_resident =
+        resident_genotype_columns(genotypes, 0, genotypes.cols()) != nullptr;
+      if(!genotypes_are_resident)
+        ensure_capacity(d_genotypes_, genotypes_capacity_,
+          chunk_samples * genotypes.rows(), "cudaMalloc(genotype chunk)");
       ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(Gram matrix)");
       if(phenotype_count > 0) {
         ensure_capacity(d_phenotypes_, phenotypes_capacity_,
@@ -556,15 +575,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           chunk_samples, genotypes.cols() - start);
         const int count = checked_int(count_index,
           "genotype product chunk sample count");
+        const double* device_genotype_chunk =
+          resident_genotype_columns(genotypes, start, count_index);
         Eigen::MatrixXd packed_genotype_chunk;
         const double* genotype_chunk_data = nullptr;
-        if(genotypes_have_contiguous_columns)
-          genotype_chunk_data = genotypes.data() +
-            start * genotypes.outerStride();
-        else {
-          packed_genotype_chunk =
-            genotypes.middleCols(start, count_index);
-          genotype_chunk_data = packed_genotype_chunk.data();
+        if(!device_genotype_chunk) {
+          if(genotypes_have_contiguous_columns)
+            genotype_chunk_data = genotypes.data() +
+              start * genotypes.outerStride();
+          else {
+            packed_genotype_chunk =
+              genotypes.middleCols(start, count_index);
+            genotype_chunk_data = packed_genotype_chunk.data();
+          }
         }
         const Eigen::MatrixXd phenotype_chunk = phenotype_count > 0 ?
           Eigen::MatrixXd(phenotypes.middleRows(start, count_index)) :
@@ -572,10 +595,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
         ComputeClock::time_point transfer_start;
         if(timings) transfer_start = ComputeClock::now();
-        check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk_data,
-          count_index * genotypes.rows() * sizeof(double),
-          cudaMemcpyHostToDevice),
-          "copy genotype chunk to CUDA device");
+        if(!device_genotype_chunk) {
+          check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk_data,
+            count_index * genotypes.rows() * sizeof(double),
+            cudaMemcpyHostToDevice),
+            "copy genotype chunk to CUDA device");
+          device_genotype_chunk = d_genotypes_;
+        } else if(timings) {
+          timings->resident_reuse_count++;
+        }
         if(phenotype_count > 0)
           check_cuda(cudaMemcpy(d_phenotypes_, phenotype_chunk.data(),
             phenotype_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
@@ -591,7 +619,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           }
           check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
             blocks, phenotype_count, count, &alpha,
-            d_genotypes_, blocks, d_phenotypes_, count, &beta,
+            device_genotype_chunk, blocks, d_phenotypes_, count, &beta,
             d_crossproduct_, blocks),
             "cublasDgemm(genotype product chunk)");
           if(timings)
@@ -606,13 +634,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         }
         if(mode == Step1GramMode::selfadjoint_rank_update)
           check_cublas(cublasDsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
-            CUBLAS_OP_N, blocks, count, &alpha, d_genotypes_, blocks,
+            CUBLAS_OP_N, blocks, count, &alpha,
+            device_genotype_chunk, blocks,
             &beta, d_gram_, blocks),
             "cublasDsyrk(genotype Gram chunk)");
         else
           check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
             blocks, blocks, count, &alpha,
-            d_genotypes_, blocks, d_genotypes_, blocks, &beta,
+            device_genotype_chunk, blocks,
+            device_genotype_chunk, blocks, &beta,
             d_gram_, blocks), "cublasDgemm(genotype Gram chunk)");
         if(timings)
           timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
@@ -2010,9 +2040,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
         genotypes.cols(), genotypes.rows());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
-        std::max<Eigen::Index>(1, chunk_samples * genotypes.rows()),
-        "cudaMalloc(fused ridge genotype chunk)");
+      const bool genotypes_are_resident =
+        resident_genotype_columns(genotypes, 0, genotypes.cols()) != nullptr;
+      if(!genotypes_are_resident)
+        ensure_capacity(d_genotypes_, genotypes_capacity_,
+          std::max<Eigen::Index>(1, chunk_samples * genotypes.rows()),
+          "cudaMalloc(fused ridge genotype chunk)");
       ensure_capacity(d_gram_, gram_capacity_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge Gram matrix)");
@@ -2052,15 +2085,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             chunk_samples, genotypes.cols() - start);
           const int count = checked_int(
             count_index, "fused ridge chunk sample count");
+          const double* device_genotype_chunk =
+            resident_genotype_columns(genotypes, start, count_index);
           Eigen::MatrixXd packed_genotype_chunk;
           const double* genotype_chunk_data = nullptr;
-          if(genotypes_have_contiguous_columns)
-            genotype_chunk_data = genotypes.data() +
-              start * genotypes.outerStride();
-          else {
-            packed_genotype_chunk =
-              genotypes.middleCols(start, count_index);
-            genotype_chunk_data = packed_genotype_chunk.data();
+          if(!device_genotype_chunk) {
+            if(genotypes_have_contiguous_columns)
+              genotype_chunk_data = genotypes.data() +
+                start * genotypes.outerStride();
+            else {
+              packed_genotype_chunk =
+                genotypes.middleCols(start, count_index);
+              genotype_chunk_data = packed_genotype_chunk.data();
+            }
           }
           const Eigen::MatrixXd phenotype_chunk = phenotype_count > 0 ?
             Eigen::MatrixXd(phenotypes.middleRows(start, count_index)) :
@@ -2068,10 +2105,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
           ComputeClock::time_point transfer_start;
           if(timings) transfer_start = ComputeClock::now();
-          check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk_data,
-            count_index * genotypes.rows() * sizeof(double),
-            cudaMemcpyHostToDevice),
-            "copy fused ridge genotype chunk to CUDA device");
+          if(!device_genotype_chunk) {
+            check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk_data,
+              count_index * genotypes.rows() * sizeof(double),
+              cudaMemcpyHostToDevice),
+              "copy fused ridge genotype chunk to CUDA device");
+            device_genotype_chunk = d_genotypes_;
+          } else if(timings) {
+            timings->resident_reuse_count++;
+          }
           if(phenotype_count > 0)
             check_cuda(cudaMemcpy(d_phenotypes_, phenotype_chunk.data(),
               phenotype_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
@@ -2087,7 +2129,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             }
             check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
               blocks, phenotype_count, count, &alpha,
-              d_genotypes_, blocks, d_phenotypes_, count, &beta,
+              device_genotype_chunk, blocks,
+              d_phenotypes_, count, &beta,
               d_crossproduct_, blocks),
               "cublasDgemm(fused ridge crossproduct chunk)");
             if(timings)
@@ -2102,13 +2145,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           }
           if(mode == Step1GramMode::selfadjoint_rank_update)
             check_cublas(cublasDsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
-              CUBLAS_OP_N, blocks, count, &alpha, d_genotypes_, blocks,
+              CUBLAS_OP_N, blocks, count, &alpha,
+              device_genotype_chunk, blocks,
               &beta, d_gram_, blocks),
               "cublasDsyrk(fused ridge Gram chunk)");
           else
             check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
               blocks, blocks, count, &alpha,
-              d_genotypes_, blocks, d_genotypes_, blocks, &beta,
+              device_genotype_chunk, blocks,
+              device_genotype_chunk, blocks, &beta,
               d_gram_, blocks), "cublasDgemm(fused ridge Gram chunk)");
           if(timings)
             timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
@@ -2235,9 +2280,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         size, combination_count);
       const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
         sample_count_index, streaming_columns);
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
-        chunk_samples * size,
-        "cudaMalloc(factorized ridge prediction chunk)");
+      const bool prediction_is_resident = samples_in_columns &&
+        resident_genotype_columns(
+          prediction_matrix, 0, prediction_matrix.cols()) != nullptr;
+      if(!prediction_is_resident)
+        ensure_capacity(d_genotypes_, genotypes_capacity_,
+          chunk_samples * size,
+          "cudaMalloc(factorized ridge prediction chunk)");
       ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
         ridge_parameters.size(), "cudaMalloc(factorized ridge parameters)");
       ensure_capacity(d_inverse_, inverse_capacity_,
@@ -2319,19 +2368,24 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           chunk_samples, sample_count_index - start);
         const int count = checked_int(
           count_index, "factorized ridge prediction chunk sample count");
+        const double* device_prediction_chunk = samples_in_columns ?
+          resident_genotype_columns(
+            prediction_matrix, start, count_index) : nullptr;
         Eigen::MatrixXd packed_prediction_chunk;
         const double* prediction_chunk_data = nullptr;
-        if(samples_in_columns && prediction_has_contiguous_columns)
-          prediction_chunk_data = prediction_matrix.data() +
-            start * prediction_matrix.outerStride();
-        else {
-          if(samples_in_columns)
-            packed_prediction_chunk =
-              prediction_matrix.middleCols(start, count_index);
-          else
-            packed_prediction_chunk =
-              prediction_matrix.middleRows(start, count_index);
-          prediction_chunk_data = packed_prediction_chunk.data();
+        if(!device_prediction_chunk) {
+          if(samples_in_columns && prediction_has_contiguous_columns)
+            prediction_chunk_data = prediction_matrix.data() +
+              start * prediction_matrix.outerStride();
+          else {
+            if(samples_in_columns)
+              packed_prediction_chunk =
+                prediction_matrix.middleCols(start, count_index);
+            else
+              packed_prediction_chunk =
+                prediction_matrix.middleRows(start, count_index);
+            prediction_chunk_data = packed_prediction_chunk.data();
+          }
         }
         const Eigen::MatrixXd outcomes_chunk = leave_one_out ?
           Eigen::MatrixXd(
@@ -2339,9 +2393,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           Eigen::MatrixXd();
 
         if(timings) transfer_start = ComputeClock::now();
-        check_cuda(cudaMemcpy(d_genotypes_, prediction_chunk_data,
-          count_index * size * sizeof(double), cudaMemcpyHostToDevice),
-          "copy factorized ridge prediction chunk to CUDA device");
+        if(!device_prediction_chunk) {
+          check_cuda(cudaMemcpy(d_genotypes_, prediction_chunk_data,
+            count_index * size * sizeof(double), cudaMemcpyHostToDevice),
+            "copy factorized ridge prediction chunk to CUDA device");
+          device_prediction_chunk = d_genotypes_;
+        } else if(timings) {
+          timings->resident_reuse_count++;
+        }
         if(leave_one_out)
           check_cuda(cudaMemcpy(d_outcomes_, outcomes_chunk.data(),
             outcomes_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
@@ -2356,13 +2415,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(samples_in_columns)
           check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
             count, combination_count, size, &alpha,
-            d_genotypes_, size, d_phenotypes_, size, &beta,
+            device_prediction_chunk, size,
+            d_phenotypes_, size, &beta,
             d_predictions_, count),
             "cublasDgemm(factorized ridge prediction chunk)");
         else
           check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
             count, combination_count, size, &alpha,
-            d_genotypes_, count, d_phenotypes_, size, &beta,
+            device_prediction_chunk, count,
+            d_phenotypes_, size, &beta,
             d_predictions_, count),
             "cublasDgemm(design factorized ridge prediction chunk)");
 
@@ -2370,7 +2431,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           check_cublas(cublasDgemm(handle_, CUBLAS_OP_T,
             samples_in_columns ? CUBLAS_OP_N : CUBLAS_OP_T,
             size, count, size, &alpha,
-            d_ridge_vectors_, size, d_genotypes_,
+            d_ridge_vectors_, size, device_prediction_chunk,
             samples_in_columns ? size : count,
             &beta, d_projected_, size),
             "cublasDgemm(factorized ridge projected matrix chunk)");
@@ -2516,6 +2577,42 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    void invalidate_resident_genotypes() {
+      resident_host_data_ = nullptr;
+      resident_rows_ = 0;
+      resident_columns_ = 0;
+      resident_valid_ = false;
+    }
+
+    const double* resident_genotype_columns(
+      const Eigen::Ref<const Eigen::MatrixXd>& matrix,
+      Eigen::Index start_column, Eigen::Index column_count) const {
+
+      if(!resident_valid_ || !resident_host_data_ ||
+         matrix.rows() != resident_rows_ || matrix.innerStride() != 1 ||
+         matrix.outerStride() != resident_rows_ || start_column < 0 ||
+         column_count < 0 || start_column > matrix.cols() - column_count)
+        return nullptr;
+
+      const std::uintptr_t resident_address =
+        reinterpret_cast<std::uintptr_t>(resident_host_data_);
+      const std::uintptr_t matrix_address =
+        reinterpret_cast<std::uintptr_t>(matrix.data());
+      if(matrix_address < resident_address) return nullptr;
+      const std::uintptr_t byte_offset = matrix_address - resident_address;
+      if(byte_offset % sizeof(double) != 0) return nullptr;
+      const Eigen::Index element_offset =
+        static_cast<Eigen::Index>(byte_offset / sizeof(double));
+      if(resident_rows_ <= 0 || element_offset % resident_rows_ != 0)
+        return nullptr;
+      const Eigen::Index first_column = element_offset / resident_rows_;
+      if(first_column < 0 ||
+         first_column > resident_columns_ - matrix.cols())
+        return nullptr;
+      return d_resident_genotypes_ +
+        (first_column + start_column) * resident_rows_;
+    }
+
     static Eigen::MatrixXd contiguous_copy_if_needed(
       const Eigen::Ref<const Eigen::MatrixXd>& matrix) {
       if(matrix.innerStride() == 1 && matrix.outerStride() == matrix.rows())
@@ -2569,6 +2666,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     cublasHandle_t handle_;
     cusolverDnHandle_t solver_handle_;
     double* d_genotypes_;
+    double* d_resident_genotypes_;
     double* d_phenotypes_;
     double* d_gram_;
     double* d_crossproduct_;
@@ -2593,6 +2691,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     double* d_preprocess_scales_;
     double* d_preprocess_multipliers_;
     size_t genotypes_capacity_;
+    size_t resident_genotypes_capacity_;
+    const double* resident_host_data_;
+    Eigen::Index resident_rows_;
+    Eigen::Index resident_columns_;
+    bool resident_valid_;
     size_t phenotypes_capacity_;
     size_t gram_capacity_;
     size_t factorized_capacity_;

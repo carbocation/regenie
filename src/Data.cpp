@@ -832,6 +832,7 @@ void Data::level_0_calculations() {
       if(params.print_block_betas && params.use_loocv) // keep on raw scale
         l1_ests.beta_snp_step1.middleRows(in_filters.step1_snp_count, bs).array().colwise() /= scale_G.array() / pheno_data.scale_Y(0);
 
+      step1_compute_backend->release_preprocessed_genotypes();
       block++; in_filters.step1_snp_count += bs;
     }
   }

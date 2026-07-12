@@ -147,6 +147,56 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
     throw std::runtime_error(
       "genotype preprocessing conformance tolerance exceeded");
 
+  const Eigen::MatrixXd outcomes = deterministic_matrix(samples, 2, -0.47);
+  const Eigen::MatrixXd expected_gram = expected * expected.transpose();
+  const Eigen::MatrixXd expected_crossproduct = expected * outcomes;
+  Eigen::MatrixXd actual_gram, actual_crossproduct;
+  Step1ComputeTimings reuse_timings;
+  candidate.compute_products(actual, outcomes, actual_gram,
+    actual_crossproduct, Step1GramMode::full_product, &reuse_timings);
+  const double reuse_gram_error = relative_error(actual_gram, expected_gram);
+  const double reuse_crossproduct_error =
+    relative_error(actual_crossproduct, expected_crossproduct);
+  if(reuse_gram_error > tolerance || reuse_crossproduct_error > tolerance ||
+     (backend_processed && reuse_timings.resident_reuse_count == 0) ||
+     (!backend_processed && reuse_timings.resident_reuse_count != 0))
+    throw std::runtime_error(
+      "resident genotype preprocessing reuse conformance failed");
+
+  const int slice_start = 5;
+  const int slice_size = 23;
+  const Eigen::MatrixXd slice_outcomes =
+    outcomes.middleRows(slice_start, slice_size);
+  const Eigen::MatrixXd expected_slice =
+    expected.middleCols(slice_start, slice_size);
+  const Eigen::MatrixXd expected_slice_gram =
+    expected_slice * expected_slice.transpose();
+  const Eigen::MatrixXd expected_slice_crossproduct =
+    expected_slice * slice_outcomes;
+  Step1ComputeTimings slice_timings;
+  candidate.compute_products(
+    actual.middleCols(slice_start, slice_size), slice_outcomes,
+    actual_gram, actual_crossproduct, Step1GramMode::full_product,
+    &slice_timings);
+  if(relative_error(actual_gram, expected_slice_gram) > tolerance ||
+     relative_error(actual_crossproduct, expected_slice_crossproduct) > tolerance ||
+     (backend_processed && slice_timings.resident_reuse_count == 0) ||
+     (!backend_processed && slice_timings.resident_reuse_count != 0))
+    throw std::runtime_error(
+      "resident genotype preprocessing slice reuse conformance failed");
+  reuse_timings.resident_reuse_count +=
+    slice_timings.resident_reuse_count;
+
+  candidate.release_preprocessed_genotypes();
+  Step1ComputeTimings released_timings;
+  candidate.compute_products(actual, outcomes, actual_gram,
+    actual_crossproduct, Step1GramMode::full_product, &released_timings);
+  if(released_timings.resident_reuse_count != 0 ||
+     relative_error(actual_gram, expected_gram) > tolerance ||
+     relative_error(actual_crossproduct, expected_crossproduct) > tolerance)
+    throw std::runtime_error(
+      "released genotype preprocessing state was reused");
+
   bool rejected_dimensions = false;
   try {
     Eigen::MatrixXd invalid = deterministic_matrix(rows, samples, 0.2);
@@ -165,6 +215,7 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
 
   std::cout << "STEP1_BACKEND_TEST case=genotype_preprocessing"
             << " backend_processed=" << (backend_processed ? 1 : 0)
+            << " resident_reuses=" << reuse_timings.resident_reuse_count
             << " genotype_relative_error=" << genotype_error
             << " scale_relative_error=" << scale_error
             << " status=PASS\n";
@@ -180,6 +231,7 @@ void accumulate_timings(Step1ComputeTimings& destination,
   destination.transform_ms += source.transform_ms;
   destination.ridge_ms += source.ridge_ms;
   destination.download_ms += source.download_ms;
+  destination.resident_reuse_count += source.resident_reuse_count;
 }
 
 double total_timing_ms(const Step1ComputeTimings& timings) {

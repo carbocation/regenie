@@ -94,11 +94,13 @@ other jobs.
 
 CUDA genotype preprocessing uses a resident full-block buffer when the block
 fits within `REGENIE_CUDA_RESIDENT_MB` (1,024 MB by default), then copies the
-normalized block back to host for the existing Step 1 pipeline. Larger blocks
-fall back to CPU preprocessing. Set the limit to `0` to disable GPU
-preprocessing, or raise it deliberately when a larger block fits comfortably
-in device memory. The validation harness exposes the same setting as
-`CUDA_RESIDENT_MB`.
+normalized block back to host for compatibility with the existing Step 1
+pipeline. While that host block remains active, CUDA operations reuse the
+resident full block and its full-row column slices instead of uploading the
+same genotype values again. Larger blocks fall back to CPU preprocessing. Set
+the limit to `0` to disable GPU preprocessing, or raise it deliberately when a
+larger block fits comfortably in device memory. The validation harness exposes
+the same setting as `CUDA_RESIDENT_MB`.
 
 For development, the repository includes a hardware-parameterized GPU
 validation command. It builds both backends, checks matrix shapes and failure
