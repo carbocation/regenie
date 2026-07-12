@@ -139,11 +139,20 @@ performing a deliberately reduced smoke test.
 
 Application runs using `--step1-profile` report both additive stage totals and
 scope-level breakdowns for genotype preprocessing, cross-validation matrix
-construction, and Level 0 ridge prediction. The scope records separate backend
-compute, transfers, and host/orchestration time, making them useful for
-distinguishing accelerated linear algebra from data packing and result
-assembly. The preprocessing scope also records how many blocks used the CUDA
-path versus the bounded CPU fallback.
+construction, and Level 0 ridge prediction. A final end-to-end record also
+separates initialization, Level 0 wall time, Level 1 preparation, Level 1
+fitting, and output. The scope records separate backend compute, transfers, and
+host/orchestration time, making them useful for distinguishing accelerated
+linear algebra from data packing and result assembly. The preprocessing scope
+also records how many blocks used the CUDA path versus the bounded CPU
+fallback.
+
+`scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
+one line at a time. Its default tolerances remain strict for full-precision
+validation. For REGENIE text written with the default six significant digits,
+pass `--output-significant-digits 6` to additionally tolerate one unit in the
+last serialized digit without weakening comparisons beyond the precision
+present in the files.
 
 An opt-in end-to-end benchmark generates a deterministic PLINK BED dataset in
 the validation results directory, runs matched CPU and CUDA Step 1 jobs,

@@ -93,6 +93,8 @@ elif ! grep -q '^STEP1_PROFILE version=4 backend=cpu mode=loocv ' ${REGENIE_PATH
   print_custom_err "Step 1 profiling header is missing."
 elif [ "`grep -c '^STEP1_PROFILE scope=' ${REGENIE_PATH}test/fit_bin_out.log`" != "3" ]; then
   print_custom_err "Step 1 profiling scope output is incomplete."
+elif ! grep -q '^STEP1_PROFILE_FINAL version=1 backend=cpu ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 final profiling output is missing."
 fi
 
 #### Run step 1 splitting across jobs for level 0

@@ -146,6 +146,9 @@ void Data::run() {
 
 void Data::run_step1(){
 
+  ProfileClock::time_point profile_run_start;
+  ProfileClock::time_point profile_stage_start;
+  if(params.profile_step1) profile_run_start = ProfileClock::now();
   sout << "Fitting null model\n";
 
   // set up file for reading
@@ -160,12 +163,24 @@ void Data::run_step1(){
   set_blocks();
   // some initializations
   setmem();
+  if(params.profile_step1) {
+    step1_profile.initialization_ms = elapsed_ms(profile_run_start);
+    profile_stage_start = ProfileClock::now();
+  }
   // level 0
   level_0_calculations();
+  if(params.profile_step1) {
+    step1_profile.level0_wall_ms = elapsed_ms(profile_stage_start);
+    profile_stage_start = ProfileClock::now();
+  }
   // print y/x/logreg offset used for level 1 
   if(params.debug) write_inputs();
   // prep for level 1 models
   prep_l1_models();
+  if(params.profile_step1) {
+    step1_profile.level1_prepare_ms = elapsed_ms(profile_stage_start);
+    profile_stage_start = ProfileClock::now();
+  }
   // level 1 ridge
   if(params.trait_mode == 0){ // QT
     if(params.use_loocv) ridge_level_1_loocv(&files, &params, &pheno_data, &l1_ests, step1_compute_backend.get(), sout);
@@ -179,8 +194,17 @@ void Data::run_step1(){
   } else if(params.trait_mode == 3){ // T2E
     ridge_cox_level_1(&files, &params, &pheno_data, &l1_ests, &m_ests, step1_compute_backend.get(), sout);
   }
+  if(params.profile_step1) {
+    step1_profile.level1_fit_ms = elapsed_ms(profile_stage_start);
+    profile_stage_start = ProfileClock::now();
+  }
   // output results
   output();
+  if(params.profile_step1) {
+    step1_profile.output_ms = elapsed_ms(profile_stage_start);
+    step1_profile.end_to_end_ms = elapsed_ms(profile_run_start);
+    print_step1_final_profile();
+  }
 
 }
 
@@ -1021,6 +1045,29 @@ void Data::print_step1_profile() {
       << " transfer_ms=" << step1_profile.ridge_transfer_ms
       << " host_orchestration_ms=" <<
         step1_profile.ridge_host_orchestration_ms
+      << "\n";
+  sout << out.str();
+}
+
+void Data::print_step1_final_profile() {
+
+  const double measured_ms = step1_profile.initialization_ms +
+    step1_profile.level0_wall_ms + step1_profile.level1_prepare_ms +
+    step1_profile.level1_fit_ms + step1_profile.output_ms;
+  const double other_ms = std::max(
+    0.0, step1_profile.end_to_end_ms - measured_ms);
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(3);
+  out << "STEP1_PROFILE_FINAL version=1 backend=" <<
+        step1_compute_backend->name()
+      << " initialization_ms=" << step1_profile.initialization_ms
+      << " level0_wall_ms=" << step1_profile.level0_wall_ms
+      << " level0_block_ms=" << step1_profile.total_ms
+      << " level1_prepare_ms=" << step1_profile.level1_prepare_ms
+      << " level1_fit_ms=" << step1_profile.level1_fit_ms
+      << " output_ms=" << step1_profile.output_ms
+      << " other_ms=" << other_ms
+      << " total_ms=" << step1_profile.end_to_end_ms
       << "\n";
   sout << out.str();
 }

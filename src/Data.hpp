@@ -59,6 +59,12 @@ struct Step1Profile {
   double preprocess_upload_ms = 0;
   double preprocess_download_ms = 0;
   double preprocess_host_orchestration_ms = 0;
+  double initialization_ms = 0;
+  double level0_wall_ms = 0;
+  double level1_prepare_ms = 0;
+  double level1_fit_ms = 0;
+  double output_ms = 0;
+  double end_to_end_ms = 0;
 };
 
 class Data {
@@ -121,6 +127,7 @@ class Data {
     void calc_cv_matrices(struct ridgel0*);
     void level_0_calculations();
     void print_step1_profile();
+    void print_step1_final_profile();
     void prep_l1_models();
     void write_inputs(); 
     void exit_early();
