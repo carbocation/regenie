@@ -842,7 +842,7 @@ void check_streamed_design_operations(Step1ComputeBackend& candidate) {
     actual_grouped_loo_predictions, expected_grouped_loo_predictions);
 
   const double tolerance = 5e-12;
-  if(crossproduct_error > tolerance ||
+  const bool passed = !(crossproduct_error > tolerance ||
      design_gram_error > tolerance ||
      design_product_crossproduct_error > tolerance ||
      weighted_gram_error > tolerance ||
@@ -861,9 +861,7 @@ void check_streamed_design_operations(Step1ComputeBackend& candidate) {
      diagonal_loo_coefficient_error > 2e-11 ||
      streamed_solve_error > 2e-11 ||
      grouped_loo_prediction_error > 2e-11 ||
-     prediction_error > tolerance)
-    throw std::runtime_error(
-      "streamed design operation conformance tolerance exceeded");
+     prediction_error > tolerance);
   std::cout << "STEP1_BACKEND_TEST case=streamed_design_operations"
             << " chunk_mb=" << chunk_mb
             << " rows=" << rows
@@ -893,7 +891,10 @@ void check_streamed_design_operations(Step1ComputeBackend& candidate) {
             << " grouped_loo_prediction_relative_error="
             << grouped_loo_prediction_error
             << " prediction_relative_error=" << prediction_error
-            << " status=PASS\n";
+            << " status=" << (passed ? "PASS" : "FAIL") << "\n";
+  if(!passed)
+    throw std::runtime_error(
+      "streamed design operation conformance tolerance exceeded");
 }
 
 void run_conformance(Step1ComputeBackend& candidate) {
