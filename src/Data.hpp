@@ -42,6 +42,16 @@ struct Step1Profile {
   double eigensolve_ms = 0;
   double association_ms = 0;
   double ridge_ms = 0;
+  double backend_ridge_compute_ms = 0;
+  double cv_wall_ms = 0;
+  double cv_backend_compute_ms = 0;
+  double cv_transfer_ms = 0;
+  double cv_host_orchestration_ms = 0;
+  double ridge_wall_ms = 0;
+  double ridge_eigensolve_ms = 0;
+  double ridge_transfer_ms = 0;
+  double ridge_backend_compute_ms = 0;
+  double ridge_host_orchestration_ms = 0;
 };
 
 class Data {

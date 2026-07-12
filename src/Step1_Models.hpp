@@ -56,6 +56,7 @@ struct ridgel0 {
   double profile_eigensolve_ms = 0;
   double profile_backend_upload_ms = 0;
   double profile_backend_download_ms = 0;
+  double profile_backend_ridge_compute_ms = 0;
 };
 
 struct ridgel1 {

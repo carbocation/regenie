@@ -126,6 +126,12 @@ host/orchestration time. The validation requires `compute-sanitizer` by
 default; set `RUN_COMPUTE_SANITIZER=0` only when running it separately or when
 performing a deliberately reduced smoke test.
 
+Application runs using `--step1-profile` report both additive stage totals and
+scope-level breakdowns for cross-validation matrix construction and Level 0
+ridge prediction. The scope records separate backend compute, transfers, and
+host/orchestration time, making them useful for distinguishing accelerated
+linear algebra from data packing and result assembly.
+
 An opt-in end-to-end benchmark generates a deterministic PLINK BED dataset in
 the validation results directory, runs matched CPU and CUDA Step 1 jobs,
 compares every LOCO output, and reports elapsed time, speedup, and peak device

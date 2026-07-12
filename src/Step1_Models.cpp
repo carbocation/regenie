@@ -537,6 +537,7 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
       l0->profile_eigensolve_ms += timings.eigensolve_ms + timings.transform_ms;
       l0->profile_backend_upload_ms += timings.upload_ms;
       l0->profile_backend_download_ms += timings.download_ms;
+      l0->profile_backend_ridge_compute_ms += timings.ridge_ms;
     }
 
     Step1ComputeTimings ridge_timings;
@@ -548,6 +549,7 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     if(params->profile_step1) {
       l0->profile_backend_upload_ms += ridge_timings.upload_ms;
       l0->profile_backend_download_ms += ridge_timings.download_ms;
+      l0->profile_backend_ridge_compute_ms += ridge_timings.ridge_ms;
     }
 
     for(int j = 0; j < params->n_ridge_l0; ++j ) {
@@ -717,6 +719,7 @@ void ridge_level_0_loocv(const int block, struct in_files* files, struct param* 
     if(params->profile_step1) {
       l0->profile_backend_upload_ms += ridge_timings.upload_ms;
       l0->profile_backend_download_ms += ridge_timings.download_ms;
+      l0->profile_backend_ridge_compute_ms += ridge_timings.ridge_ms;
     }
 
     if(params->print_block_betas && chunk == 0) { // assumes P=1
