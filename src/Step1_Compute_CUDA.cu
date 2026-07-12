@@ -337,22 +337,34 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
 
       const double alpha = 1.0;
+      const bool genotypes_have_contiguous_columns =
+        genotypes.innerStride() == 1 &&
+        genotypes.outerStride() == genotypes.rows();
       for(Eigen::Index start = 0; start < genotypes.cols();
           start += chunk_samples) {
         const Eigen::Index count_index = std::min(
           chunk_samples, genotypes.cols() - start);
         const int count = checked_int(count_index,
           "genotype product chunk sample count");
-        const Eigen::MatrixXd genotype_chunk =
-          genotypes.middleCols(start, count_index);
+        Eigen::MatrixXd packed_genotype_chunk;
+        const double* genotype_chunk_data = nullptr;
+        if(genotypes_have_contiguous_columns)
+          genotype_chunk_data = genotypes.data() +
+            start * genotypes.outerStride();
+        else {
+          packed_genotype_chunk =
+            genotypes.middleCols(start, count_index);
+          genotype_chunk_data = packed_genotype_chunk.data();
+        }
         const Eigen::MatrixXd phenotype_chunk = phenotype_count > 0 ?
           Eigen::MatrixXd(phenotypes.middleRows(start, count_index)) :
           Eigen::MatrixXd();
 
         ComputeClock::time_point transfer_start;
         if(timings) transfer_start = ComputeClock::now();
-        check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk.data(),
-          genotype_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
+        check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk_data,
+          count_index * genotypes.rows() * sizeof(double),
+          cudaMemcpyHostToDevice),
           "copy genotype chunk to CUDA device");
         if(phenotype_count > 0)
           check_cuda(cudaMemcpy(d_phenotypes_, phenotype_chunk.data(),
@@ -1812,6 +1824,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
 
       const double alpha = 1.0;
+      const bool genotypes_have_contiguous_columns =
+        genotypes.innerStride() == 1 &&
+        genotypes.outerStride() == genotypes.rows();
       if(samples == 0) {
         check_cuda(cudaMemset(d_gram_, 0,
           static_cast<size_t>(blocks) * blocks * sizeof(double)),
@@ -1827,16 +1842,25 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             chunk_samples, genotypes.cols() - start);
           const int count = checked_int(
             count_index, "fused ridge chunk sample count");
-          const Eigen::MatrixXd genotype_chunk =
-            genotypes.middleCols(start, count_index);
+          Eigen::MatrixXd packed_genotype_chunk;
+          const double* genotype_chunk_data = nullptr;
+          if(genotypes_have_contiguous_columns)
+            genotype_chunk_data = genotypes.data() +
+              start * genotypes.outerStride();
+          else {
+            packed_genotype_chunk =
+              genotypes.middleCols(start, count_index);
+            genotype_chunk_data = packed_genotype_chunk.data();
+          }
           const Eigen::MatrixXd phenotype_chunk = phenotype_count > 0 ?
             Eigen::MatrixXd(phenotypes.middleRows(start, count_index)) :
             Eigen::MatrixXd();
 
           ComputeClock::time_point transfer_start;
           if(timings) transfer_start = ComputeClock::now();
-          check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk.data(),
-            genotype_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
+          check_cuda(cudaMemcpy(d_genotypes_, genotype_chunk_data,
+            count_index * genotypes.rows() * sizeof(double),
+            cudaMemcpyHostToDevice),
             "copy fused ridge genotype chunk to CUDA device");
           if(phenotype_count > 0)
             check_cuda(cudaMemcpy(d_phenotypes_, phenotype_chunk.data(),
@@ -2076,25 +2100,37 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "copy factorized ridge coefficients from CUDA device");
       if(timings) timings->download_ms += elapsed_ms(transfer_start);
 
+      const bool prediction_has_contiguous_columns =
+        prediction_matrix.innerStride() == 1 &&
+        prediction_matrix.outerStride() == prediction_matrix.rows();
       for(Eigen::Index start = 0; start < sample_count_index;
           start += chunk_samples) {
         const Eigen::Index count_index = std::min(
           chunk_samples, sample_count_index - start);
         const int count = checked_int(
           count_index, "factorized ridge prediction chunk sample count");
-        Eigen::MatrixXd prediction_chunk;
-        if(samples_in_columns)
-          prediction_chunk = prediction_matrix.middleCols(start, count_index);
-        else
-          prediction_chunk = prediction_matrix.middleRows(start, count_index);
+        Eigen::MatrixXd packed_prediction_chunk;
+        const double* prediction_chunk_data = nullptr;
+        if(samples_in_columns && prediction_has_contiguous_columns)
+          prediction_chunk_data = prediction_matrix.data() +
+            start * prediction_matrix.outerStride();
+        else {
+          if(samples_in_columns)
+            packed_prediction_chunk =
+              prediction_matrix.middleCols(start, count_index);
+          else
+            packed_prediction_chunk =
+              prediction_matrix.middleRows(start, count_index);
+          prediction_chunk_data = packed_prediction_chunk.data();
+        }
         const Eigen::MatrixXd outcomes_chunk = leave_one_out ?
           Eigen::MatrixXd(
             leave_one_out_outcomes.middleRows(start, count_index)) :
           Eigen::MatrixXd();
 
         if(timings) transfer_start = ComputeClock::now();
-        check_cuda(cudaMemcpy(d_genotypes_, prediction_chunk.data(),
-          prediction_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
+        check_cuda(cudaMemcpy(d_genotypes_, prediction_chunk_data,
+          count_index * size * sizeof(double), cudaMemcpyHostToDevice),
           "copy factorized ridge prediction chunk to CUDA device");
         if(leave_one_out)
           check_cuda(cudaMemcpy(d_outcomes_, outcomes_chunk.data(),
