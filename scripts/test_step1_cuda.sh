@@ -307,7 +307,7 @@ compare_loco_files() {
     loco_numeric_values=$((loco_numeric_values + compare_values))
     loco_maximum_absolute_error="$(awk \
       -v current="${loco_maximum_absolute_error}" -v candidate="${compare_error}" \
-      'BEGIN { print candidate > current ? candidate : current }')"
+      'BEGIN { print (candidate > current ? candidate : current) }')"
   done
 }
 
