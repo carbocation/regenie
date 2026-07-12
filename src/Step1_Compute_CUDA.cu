@@ -1039,11 +1039,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             outcome_count) = parameter_coefficients;
           for(int outcome = 0; outcome < outcome_count; ++outcome) {
             Eigen::MatrixXd outcome_predictions;
-            grouped_leave_one_out_predict_factorized(
+            grouped_leave_one_out_predict_factorized_impl(
               loo_design, parameter_coefficients.col(outcome),
               leave_one_out_outcomes.col(outcome), leverage_weights,
-              full_group_offset, full_group_size, outcome_predictions,
-              timings);
+              full_group_offset, full_group_size, true,
+              outcome_predictions, timings);
             predictions.col(
               static_cast<Eigen::Index>(parameter) * outcome_count +
               outcome) = outcome_predictions.col(0);
@@ -1224,17 +1224,33 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& predictions,
       Step1ComputeTimings* timings) override {
 
+      grouped_leave_one_out_predict_factorized_impl(
+        design, coefficients, residuals, leverage_weights,
+        group_offsets, group_sizes, false, predictions, timings);
+    }
+
+    void grouped_leave_one_out_predict_factorized_impl(
+      const Eigen::Ref<const Eigen::MatrixXd>& design,
+      const Eigen::Ref<const Eigen::VectorXd>& coefficients,
+      const Eigen::Ref<const Eigen::VectorXd>& residuals_or_outcomes,
+      const Eigen::Ref<const Eigen::VectorXd>& leverage_weights,
+      const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+      bool inputs_are_outcomes,
+      Eigen::MatrixXd& predictions,
+      Step1ComputeTimings* timings) {
+
       if(factorized_size_ < 0)
         throw std::runtime_error(
           "Step 1 grouped LOOCV prediction requested before factorization");
       if(design.cols() != factorized_size_ ||
          coefficients.size() != factorized_size_ ||
-         design.rows() != residuals.size() ||
+         design.rows() != residuals_or_outcomes.size() ||
          design.rows() != leverage_weights.size() ||
          group_offsets.size() != group_sizes.size())
         throw std::invalid_argument(
           "Step 1 grouped LOOCV prediction received incompatible dimensions");
-      if(!coefficients.allFinite() || !residuals.allFinite() ||
+      if(!coefficients.allFinite() || !residuals_or_outcomes.allFinite() ||
          !leverage_weights.allFinite())
         throw std::invalid_argument(
           "Step 1 grouped LOOCV prediction requires finite inputs");
@@ -1247,6 +1263,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           throw std::invalid_argument(
             "Step 1 grouped LOOCV prediction received an invalid feature group");
       }
+      if(inputs_are_outcomes &&
+         (group_offsets.size() != 1 || group_offsets(0) != 0 ||
+          group_sizes(0) != design.cols()))
+        throw std::invalid_argument(
+          "Step 1 outcome-based LOOCV prediction requires one full feature group");
 
       predictions.resize(design.rows(), group_offsets.size());
       if(design.rows() == 0 || group_offsets.size() == 0 || factorized_size_ == 0) {
@@ -1300,8 +1321,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           count_index, "grouped LOOCV chunk row count");
         const Eigen::MatrixXd design_chunk =
           design.middleRows(start, count_index);
-        const Eigen::VectorXd residual_chunk =
-          residuals.segment(start, count_index);
+        const Eigen::VectorXd residual_or_outcome_chunk =
+          residuals_or_outcomes.segment(start, count_index);
         const Eigen::VectorXd weight_chunk =
           leverage_weights.segment(start, count_index);
 
@@ -1309,9 +1330,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         check_cuda(cudaMemcpy(d_genotypes_, design_chunk.data(),
           design_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
           "copy grouped LOOCV design chunk to CUDA device");
-        check_cuda(cudaMemcpy(d_outcomes_, residual_chunk.data(),
-          residual_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
-          "copy grouped LOOCV residual chunk to CUDA device");
+        check_cuda(cudaMemcpy(d_outcomes_, residual_or_outcome_chunk.data(),
+          residual_or_outcome_chunk.size() * sizeof(double),
+          cudaMemcpyHostToDevice),
+          inputs_are_outcomes ?
+            "copy grouped LOOCV outcome chunk to CUDA device" :
+            "copy grouped LOOCV residual chunk to CUDA device");
         check_cuda(cudaMemcpy(d_ridge_parameters_, weight_chunk.data(),
           weight_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
           "copy grouped LOOCV leverage weight chunk to CUDA device");
@@ -1369,13 +1393,22 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             check_cuda(cudaMemset(group_predictions, 0,
               count * sizeof(double)),
               "clear empty grouped LOOCV prediction chunk");
-          grouped_leave_one_out_predictions<<<
-            (count + threads - 1) / threads, threads>>>(
-            d_genotypes_, d_projected_, d_outcomes_, d_leverage_,
-            d_predictions_, count, group,
-            group_offsets(group), group_size);
-          check_cuda(cudaGetLastError(),
-            "compute grouped LOOCV prediction chunk kernel");
+          if(inputs_are_outcomes) {
+            apply_leave_one_out_correction<<<
+              (count + threads - 1) / threads, threads>>>(
+              group_predictions, d_leverage_, d_outcomes_, count, 1,
+              count);
+            check_cuda(cudaGetLastError(),
+              "apply full-group LOOCV outcome correction chunk kernel");
+          } else {
+            grouped_leave_one_out_predictions<<<
+              (count + threads - 1) / threads, threads>>>(
+              d_genotypes_, d_projected_, d_outcomes_, d_leverage_,
+              d_predictions_, count, group,
+              group_offsets(group), group_size);
+            check_cuda(cudaGetLastError(),
+              "compute grouped LOOCV prediction chunk kernel");
+          }
         }
         if(timings) timings->ridge_ms +=
           solve_events->record_stop_and_elapsed_ms();
