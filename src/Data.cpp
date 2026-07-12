@@ -254,11 +254,13 @@ void Data::residualize_genotypes() {
       0.5 * (params.alpha_prior + 1)).matrix();
 
   Step1ComputeTimings timings;
+  const bool copy_preprocessed_genotypes_to_host =
+    params.use_loocv || params.test_l0;
   const bool backend_processed =
     step1_compute_backend->preprocess_genotypes(
       Gblock.Gmat, pheno_data.new_cov, sample_weights,
       params.n_analyzed - params.ncov, params.numtol,
-      row_multipliers, scale_G,
+      row_multipliers, copy_preprocessed_genotypes_to_host, scale_G,
       params.profile_step1 ? &timings : nullptr);
 
   if(!backend_processed) {

@@ -373,12 +373,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       double degrees_of_freedom,
       double minimum_scale,
       const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+      bool copy_to_host,
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings) override {
 
       Step1ComputeBackend::preprocess_genotypes(genotypes, covariates,
         sample_weights, degrees_of_freedom, minimum_scale,
-        row_multipliers, row_scales, timings);
+        row_multipliers, copy_to_host, row_scales, timings);
       invalidate_resident_genotypes();
       const long long required_elements_long =
         static_cast<long long>(genotypes.rows()) * genotypes.cols();
@@ -509,12 +510,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->preprocess_ms +=
           scale_events->record_stop_and_elapsed_ms();
 
-      if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(genotypes.data(), d_resident_genotypes_,
-        static_cast<size_t>(element_count) * sizeof(double),
-        cudaMemcpyDeviceToHost),
-        "copy normalized genotype preprocessing block from CUDA device");
-      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      if(copy_to_host) {
+        if(timings) transfer_start = ComputeClock::now();
+        check_cuda(cudaMemcpy(genotypes.data(), d_resident_genotypes_,
+          static_cast<size_t>(element_count) * sizeof(double),
+          cudaMemcpyDeviceToHost),
+          "copy normalized genotype preprocessing block from CUDA device");
+        if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      }
       resident_host_data_ = genotypes.data();
       resident_rows_ = genotypes.rows();
       resident_columns_ = genotypes.cols();

@@ -64,6 +64,7 @@ class Step1ComputeBackend {
       double degrees_of_freedom,
       double minimum_scale,
       const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+      bool copy_to_host,
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings = nullptr);
 
