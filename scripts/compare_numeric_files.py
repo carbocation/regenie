@@ -5,6 +5,7 @@ import argparse
 import itertools
 import math
 import re
+import warnings
 from pathlib import Path
 
 try:
@@ -14,9 +15,7 @@ except ImportError:
 
 
 FLOAT_TOKEN = r"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|inf(?:inity)?|nan)"
-NUMERIC_LINE_PATTERN = re.compile(
-    rf"\s*(?:{FLOAT_TOKEN})(?:\s+{FLOAT_TOKEN})*\s*", re.IGNORECASE
-)
+FLOAT_TOKEN_PATTERN = re.compile(rf"(?:{FLOAT_TOKEN})", re.IGNORECASE)
 NUMERIC_TOKEN_PATTERN = re.compile(
     rf"(?<!\S)({FLOAT_TOKEN})(?!\S)", re.IGNORECASE
 )
@@ -60,6 +59,8 @@ def parse_args():
 
 
 def as_float(token):
+    if not FLOAT_TOKEN_PATTERN.fullmatch(token):
+        return None
     try:
         return float(token)
     except ValueError:
@@ -73,9 +74,33 @@ def significant_digit_quantum(value, digits):
     return 10.0 ** (exponent - digits + 1)
 
 
+def begins_with_numeric_token(line):
+    start = 0
+    while start < len(line) and line[start].isspace():
+        start += 1
+    end = start
+    while end < len(line) and not line[end].isspace():
+        end += 1
+    return start < end and FLOAT_TOKEN_PATTERN.fullmatch(line[start:end]) is not None
+
+
+def numpy_values(line):
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            values = np.fromstring(line, dtype=np.float64, sep=" ")
+    except ValueError:
+        return None
+    if caught:
+        return None
+    return values
+
+
 def compare_numpy_lines(expected_line, actual_line, line_number, args):
-    expected_values = np.fromstring(expected_line, dtype=np.float64, sep=" ")
-    actual_values = np.fromstring(actual_line, dtype=np.float64, sep=" ")
+    expected_values = numpy_values(expected_line)
+    actual_values = numpy_values(actual_line)
+    if expected_values is None or actual_values is None:
+        return None
     if expected_values.size != actual_values.size:
         raise SystemExit(f"token count differs on line {line_number}")
 
@@ -153,19 +178,18 @@ def main():
             if expected_line is missing or actual_line is missing:
                 raise SystemExit(f"line count differs at line {line_number}")
 
-            if (
-                use_numpy
-                and NUMERIC_LINE_PATTERN.fullmatch(expected_line)
-                and NUMERIC_LINE_PATTERN.fullmatch(actual_line)
-            ):
-                line_values, line_error = compare_numpy_lines(
-                    expected_line, actual_line, line_number, args
-                )
-                numeric_values += line_values
-                maximum_error = max(maximum_error, line_error)
-                continue
-
             if use_numpy and expected_line == actual_line:
+                if begins_with_numeric_token(expected_line):
+                    values = numpy_values(expected_line)
+                    if values is not None:
+                        if np.any(np.isnan(values)):
+                            column = int(np.flatnonzero(np.isnan(values))[0]) + 1
+                            raise SystemExit(
+                                f"non-finite numeric difference at line "
+                                f"{line_number}, column {column}: nan != nan"
+                            )
+                        numeric_values += int(values.size)
+                        continue
                 numeric_tokens = NUMERIC_TOKEN_PATTERN.findall(expected_line)
                 for token in numeric_tokens:
                     if math.isnan(float(token)):
@@ -175,6 +199,20 @@ def main():
                         )
                 numeric_values += len(numeric_tokens)
                 continue
+
+            if (
+                use_numpy
+                and begins_with_numeric_token(expected_line)
+                and begins_with_numeric_token(actual_line)
+            ):
+                comparison = compare_numpy_lines(
+                    expected_line, actual_line, line_number, args
+                )
+                if comparison is not None:
+                    line_values, line_error = comparison
+                    numeric_values += line_values
+                    maximum_error = max(maximum_error, line_error)
+                    continue
 
             expected_tokens = expected_line.split()
             actual_tokens = actual_line.split()
