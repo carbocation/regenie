@@ -78,6 +78,10 @@ BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
 cmake --build build-cuda -j
 ```
 
+For an NVIDIA T4, use `-DREGENIE_CUDA_ARCHITECTURES=75`. Multiple
+architectures may be supplied as a semicolon-separated CMake list when a
+portable binary is required.
+
 Select it in Step 1 with `--compute-backend cuda`; use `--gpu-device` when
 more than one CUDA device is visible. `--compute-backend auto` uses CUDA when
 the binary contains the backend and the requested device is available,
@@ -88,16 +92,70 @@ Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer
 streaming limit; this is primarily useful for validation or sharing a GPU with
 other jobs.
 
-For development, the repository includes a single A100 validation command.
-It builds both backends, checks matrix shapes and failure paths, benchmarks
-both the Level 0 eigensystem and nonlinear Level 1 workloads, runs quantitative,
-binary, count, time-to-event, top-SNP, k-fold, and LOOCV Step 1 jobs, and
-compares the CPU and CUDA LOCO files. It also records peak device-memory use
-for the CUDA benchmark and each end-to-end case:
+For development, the repository includes a hardware-parameterized GPU
+validation command. It builds both backends, checks matrix shapes and failure
+paths, benchmarks both the Level 0 eigensystem and nonlinear Level 1 workloads,
+runs quantitative, binary, count, time-to-event, top-SNP, k-fold, and LOOCV
+Step 1 jobs, and compares the CPU and CUDA LOCO files. It also records peak
+device-memory use for the CUDA benchmark and each end-to-end case. The defaults
+target an A100 and write to `build-cuda/a100-validation`:
 
 ```
 BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh
 ```
+
+Validate a T4 in a separate build and results directory with:
+
+```
+BGEN_PATH=<path_to_bgen_lib> \
+BUILD_DIR=build-cuda-t4 \
+CUDA_ARCHITECTURES=75 \
+GPU_VALIDATION_LABEL=t4 \
+CUDA_STREAM_CHUNK_MB=64 \
+scripts/test_step1_cuda.sh
+```
+
+`VALIDATION_DIR` can override the results directory, and `GPU_DEVICE` selects
+the CUDA device. Benchmark dimensions remain configurable with
+`BENCHMARK_BLOCKS`, `BENCHMARK_SAMPLES`, `BENCHMARK_PHENOTYPES`, and
+`BENCHMARK_REPEATS`. One warmup iteration is run by default before steady-state
+measurements; set `BENCHMARK_WARMUP_REPEATS` to a different positive integer.
+Benchmark records report first-warmup wall time, mean warmup wall time,
+steady-state wall time, backend-accounted time, and the remaining unaccounted
+host/orchestration time. The validation requires `compute-sanitizer` by
+default; set `RUN_COMPUTE_SANITIZER=0` only when running it separately or when
+performing a deliberately reduced smoke test.
+
+An opt-in end-to-end benchmark generates a deterministic PLINK BED dataset in
+the validation results directory, runs matched CPU and CUDA Step 1 jobs,
+compares every LOCO output, and reports elapsed time, speedup, and peak device
+memory. The generated data is not stored in the repository. This A100 example
+creates 20,000 samples by 20,000 variants (a BED file of approximately 100 MB):
+
+```
+BGEN_PATH=<path_to_bgen_lib> \
+BUILD_DIR=build-cuda-a100 \
+CUDA_ARCHITECTURES=80 \
+GPU_VALIDATION_LABEL=a100-large \
+RUN_SYNTHETIC_BENCHMARK=1 \
+SYNTHETIC_SAMPLES=20000 \
+SYNTHETIC_VARIANTS=20000 \
+SYNTHETIC_PHENOTYPES=4 \
+SYNTHETIC_BSIZE=512 \
+SYNTHETIC_THREADS=8 \
+scripts/test_step1_cuda.sh
+```
+
+The synthetic dimensions, phenotype count, chromosome count, block size,
+thread count, and random seed can be changed with `SYNTHETIC_SAMPLES`,
+`SYNTHETIC_VARIANTS`, `SYNTHETIC_PHENOTYPES`, `SYNTHETIC_CHROMOSOMES`,
+`SYNTHETIC_BSIZE`, `SYNTHETIC_THREADS`, and `SYNTHETIC_SEED`. The BED payload
+uses approximately `samples * variants / 4` bytes. Generation fails before
+writing when the result would exceed `SYNTHETIC_MAX_BED_GB` (4 GiB by
+default). The generated files and a JSON manifest containing dimensions,
+seed, size, and BED SHA-256 remain under the validation directory so the run
+can be archived. Set `RUN_COMPUTE_SANITIZER=0` for a benchmark-only rerun only
+if the same binary has already passed the sanitizer validation separately.
 
 The normal build remains CUDA-free, so CPU development and regression testing
 can continue on macOS. CUDA compilation is also checked in CI without running

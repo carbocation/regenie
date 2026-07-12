@@ -25,6 +25,7 @@ struct Options {
   int samples = 20000;
   int phenotypes = 10;
   int repeats = 3;
+  int warmup_repeats = 1;
 };
 
 int parse_positive(const char* value, const char* option, bool allow_zero = false) {
@@ -51,6 +52,8 @@ Options parse_options(int argc, char** argv) {
       options.phenotypes = parse_positive(argv[++i], "--phenotypes");
     else if(argument == "--repeats" && i + 1 < argc)
       options.repeats = parse_positive(argv[++i], "--repeats");
+    else if(argument == "--warmup-repeats" && i + 1 < argc)
+      options.warmup_repeats = parse_positive(argv[++i], "--warmup-repeats");
     else
       throw std::runtime_error("unknown or incomplete option: " + argument);
   }
@@ -74,6 +77,23 @@ double relative_error(const Eigen::MatrixXd& actual, const Eigen::MatrixXd& expe
   if(actual.size() == 0) return 0;
   const double scale = std::max(1.0, expected.cwiseAbs().maxCoeff());
   return (actual - expected).cwiseAbs().maxCoeff() / scale;
+}
+
+void accumulate_timings(Step1ComputeTimings& destination,
+  const Step1ComputeTimings& source) {
+  destination.upload_ms += source.upload_ms;
+  destination.crossproduct_ms += source.crossproduct_ms;
+  destination.gram_ms += source.gram_ms;
+  destination.eigensolve_ms += source.eigensolve_ms;
+  destination.transform_ms += source.transform_ms;
+  destination.ridge_ms += source.ridge_ms;
+  destination.download_ms += source.download_ms;
+}
+
+double total_timing_ms(const Step1ComputeTimings& timings) {
+  return timings.upload_ms + timings.crossproduct_ms + timings.gram_ms +
+    timings.eigensolve_ms + timings.transform_ms + timings.ridge_ms +
+    timings.download_ms;
 }
 
 void check_case(Step1ComputeBackend& candidate, Step1ComputeBackend& oracle,
@@ -1167,30 +1187,47 @@ void run_benchmark(Step1ComputeBackend& backend, const Options& options) {
   Step1ComputeTimings totals;
   double wall_ms = 0;
 
-  for(int repeat = 0; repeat < options.repeats; ++repeat) {
-    Step1ComputeTimings timings;
+  const auto run_iteration = [&] (Step1ComputeTimings* timings) {
     const Clock::time_point start = Clock::now();
     backend.compute_products_and_factorize_ridge(genotypes, phenotypes,
-      Step1GramMode::selfadjoint_rank_update, &timings);
+      Step1GramMode::selfadjoint_rank_update, timings);
     backend.ridge_predict_factorized(genotypes, true, ridge_parameters,
-      phenotypes, true, predictions, coefficients, &timings);
-    wall_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-    totals.upload_ms += timings.upload_ms;
-    totals.crossproduct_ms += timings.crossproduct_ms;
-    totals.gram_ms += timings.gram_ms;
-    totals.eigensolve_ms += timings.eigensolve_ms;
-    totals.transform_ms += timings.transform_ms;
-    totals.ridge_ms += timings.ridge_ms;
-    totals.download_ms += timings.download_ms;
+      phenotypes, true, predictions, coefficients, timings);
+    return std::chrono::duration<double, std::milli>(
+      Clock::now() - start).count();
+  };
+
+  double warmup_wall_ms = 0;
+  double first_warmup_wall_ms = 0;
+  for(int repeat = 0; repeat < options.warmup_repeats; ++repeat) {
+    Step1ComputeTimings ignored_timings;
+    const double iteration_wall_ms = run_iteration(&ignored_timings);
+    if(repeat == 0) first_warmup_wall_ms = iteration_wall_ms;
+    warmup_wall_ms += iteration_wall_ms;
+  }
+
+  for(int repeat = 0; repeat < options.repeats; ++repeat) {
+    Step1ComputeTimings timings;
+    wall_ms += run_iteration(&timings);
+    accumulate_timings(totals, timings);
   }
 
   const double divisor = options.repeats;
+  const double steady_wall_ms = wall_ms / divisor;
+  const double accounted_ms = total_timing_ms(totals) / divisor;
   std::cout << "STEP1_BACKEND_BENCHMARK backend=" << backend.name()
             << " blocks=" << options.blocks
             << " samples=" << options.samples
             << " phenotypes=" << options.phenotypes
+            << " warmup_repeats=" << options.warmup_repeats
+            << " first_warmup_wall_ms=" << first_warmup_wall_ms
+            << " mean_warmup_wall_ms=" <<
+              warmup_wall_ms / options.warmup_repeats
             << " repeats=" << options.repeats
-            << " wall_ms=" << wall_ms / divisor
+            << " wall_ms=" << steady_wall_ms
+            << " steady_wall_ms=" << steady_wall_ms
+            << " accounted_ms=" << accounted_ms
+            << " unaccounted_ms=" << steady_wall_ms - accounted_ms
             << " upload_ms=" << totals.upload_ms / divisor
             << " crossproduct_ms=" << totals.crossproduct_ms / divisor
             << " gram_ms=" << totals.gram_ms / divisor
@@ -1232,39 +1269,49 @@ void run_nonlinear_benchmark(Step1ComputeBackend& backend,
   Step1ComputeTimings totals;
   double wall_ms = 0;
   const Eigen::MatrixXd no_outcomes(0, 0);
-  for(int repeat = 0; repeat < options.repeats; ++repeat) {
-    Step1ComputeTimings timings;
+
+  const auto run_iteration = [&] (Step1ComputeTimings* timings) {
     const Clock::time_point start = Clock::now();
     backend.compute_weighted_design_products(
-      design, weights, outcomes, gram, crossproduct, &timings);
+      design, weights, outcomes, gram, crossproduct, timings);
     backend.compute_design_crossproduct(
-      design, outcomes, crossproduct_only, &timings);
+      design, outcomes, crossproduct_only, timings);
     backend.diagonal_penalty_predict(
       gram, crossproduct, design, false, ridge_parameters,
       penalty_multipliers, no_outcomes, false,
-      predictions, coefficients, &timings);
+      predictions, coefficients, timings);
     backend.factorize_diagonal_penalty(
-      gram, ridge_parameters(1), penalty_multipliers, &timings);
-    backend.solve_factorized(reusable_rhs, reusable_solution, &timings);
+      gram, ridge_parameters(1), penalty_multipliers, timings);
+    backend.solve_factorized(reusable_rhs, reusable_solution, timings);
     backend.grouped_predict(design.topRows(solve_columns),
       reusable_solution.col(0), group_offsets, group_sizes,
-      grouped_predictions, &timings);
+      grouped_predictions, timings);
     backend.grouped_leave_one_out_predict_factorized(
       design.topRows(solve_columns), reusable_solution.col(0),
       outcomes.topRows(solve_columns).col(0), weights.head(solve_columns),
-      group_offsets, group_sizes, grouped_predictions, &timings);
-    wall_ms += std::chrono::duration<double, std::milli>(
+      group_offsets, group_sizes, grouped_predictions, timings);
+    return std::chrono::duration<double, std::milli>(
       Clock::now() - start).count();
-    totals.upload_ms += timings.upload_ms;
-    totals.crossproduct_ms += timings.crossproduct_ms;
-    totals.gram_ms += timings.gram_ms;
-    totals.eigensolve_ms += timings.eigensolve_ms;
-    totals.transform_ms += timings.transform_ms;
-    totals.ridge_ms += timings.ridge_ms;
-    totals.download_ms += timings.download_ms;
+  };
+
+  double warmup_wall_ms = 0;
+  double first_warmup_wall_ms = 0;
+  for(int repeat = 0; repeat < options.warmup_repeats; ++repeat) {
+    Step1ComputeTimings ignored_timings;
+    const double iteration_wall_ms = run_iteration(&ignored_timings);
+    if(repeat == 0) first_warmup_wall_ms = iteration_wall_ms;
+    warmup_wall_ms += iteration_wall_ms;
+  }
+
+  for(int repeat = 0; repeat < options.repeats; ++repeat) {
+    Step1ComputeTimings timings;
+    wall_ms += run_iteration(&timings);
+    accumulate_timings(totals, timings);
   }
 
   const double divisor = options.repeats;
+  const double steady_wall_ms = wall_ms / divisor;
+  const double accounted_ms = total_timing_ms(totals) / divisor;
   std::cout << "STEP1_BACKEND_BENCHMARK_NONLINEAR backend=" << backend.name()
             << " features=" << options.blocks
             << " samples=" << options.samples
@@ -1272,8 +1319,15 @@ void run_nonlinear_benchmark(Step1ComputeBackend& backend,
             << " parameters=" << ridge_parameters.size()
             << " groups=" << group_offsets.size()
             << " solve_columns=" << solve_columns
+            << " warmup_repeats=" << options.warmup_repeats
+            << " first_warmup_wall_ms=" << first_warmup_wall_ms
+            << " mean_warmup_wall_ms=" <<
+              warmup_wall_ms / options.warmup_repeats
             << " repeats=" << options.repeats
-            << " wall_ms=" << wall_ms / divisor
+            << " wall_ms=" << steady_wall_ms
+            << " steady_wall_ms=" << steady_wall_ms
+            << " accounted_ms=" << accounted_ms
+            << " unaccounted_ms=" << steady_wall_ms - accounted_ms
             << " upload_ms=" << totals.upload_ms / divisor
             << " crossproduct_ms=" << totals.crossproduct_ms / divisor
             << " gram_ms=" << totals.gram_ms / divisor

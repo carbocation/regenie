@@ -7,12 +7,66 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${BUILD_DIR:-${repo_root}/build-cuda}"
 device="${GPU_DEVICE:-0}"
 jobs="${JOBS:-4}"
+cuda_architectures="${CUDA_ARCHITECTURES:-80}"
+validation_label="${GPU_VALIDATION_LABEL:-a100}"
 benchmark_blocks="${BENCHMARK_BLOCKS:-512}"
 benchmark_samples="${BENCHMARK_SAMPLES:-20000}"
 benchmark_phenotypes="${BENCHMARK_PHENOTYPES:-10}"
 benchmark_repeats="${BENCHMARK_REPEATS:-3}"
+benchmark_warmup_repeats="${BENCHMARK_WARMUP_REPEATS:-1}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
-validation_dir="${build_dir}/a100-validation"
+validation_dir="${VALIDATION_DIR:-${build_dir}/${validation_label}-validation}"
+run_synthetic_benchmark="${RUN_SYNTHETIC_BENCHMARK:-0}"
+synthetic_samples="${SYNTHETIC_SAMPLES:-20000}"
+synthetic_variants="${SYNTHETIC_VARIANTS:-20000}"
+synthetic_phenotypes="${SYNTHETIC_PHENOTYPES:-4}"
+synthetic_chromosomes="${SYNTHETIC_CHROMOSOMES:-22}"
+synthetic_bsize="${SYNTHETIC_BSIZE:-512}"
+synthetic_threads="${SYNTHETIC_THREADS:-${jobs}}"
+synthetic_seed="${SYNTHETIC_SEED:-20260712}"
+synthetic_max_bed_gb="${SYNTHETIC_MAX_BED_GB:-4}"
+
+if [[ -z "${cuda_architectures}" ]]; then
+  echo "CUDA_ARCHITECTURES must not be empty" >&2
+  exit 2
+fi
+if [[ ! "${validation_label}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "GPU_VALIDATION_LABEL must contain only letters, digits, '.', '_', or '-'" >&2
+  exit 2
+fi
+for numeric_setting in jobs benchmark_blocks benchmark_samples \
+  benchmark_phenotypes benchmark_repeats benchmark_warmup_repeats \
+  stream_chunk_mb; do
+  numeric_value="${!numeric_setting}"
+  if [[ ! "${numeric_value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${numeric_setting} must be a positive integer (received '${numeric_value}')" >&2
+    exit 2
+  fi
+done
+if [[ ! "${run_synthetic_benchmark}" =~ ^[01]$ ]]; then
+  echo "RUN_SYNTHETIC_BENCHMARK must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "${run_synthetic_benchmark}" == "1" ]]; then
+  for numeric_setting in synthetic_samples synthetic_variants \
+    synthetic_phenotypes synthetic_chromosomes synthetic_bsize \
+    synthetic_threads synthetic_seed; do
+    numeric_value="${!numeric_setting}"
+    if [[ ! "${numeric_value}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "${numeric_setting} must be a positive integer (received '${numeric_value}')" >&2
+      exit 2
+    fi
+  done
+  if (( synthetic_chromosomes > synthetic_variants )); then
+    echo "synthetic_chromosomes must not exceed synthetic_variants" >&2
+    exit 2
+  fi
+  if [[ ! "${synthetic_max_bed_gb}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
+    ! awk -v value="${synthetic_max_bed_gb}" 'BEGIN { exit !(value > 0) }'; then
+    echo "synthetic_max_bed_gb must be positive (received '${synthetic_max_bed_gb}')" >&2
+    exit 2
+  fi
+fi
 
 run_with_memory_log() {
   local label="$1"
@@ -62,6 +116,19 @@ run_with_memory_log() {
 }
 
 nvcc --version
+echo "STEP1_CUDA_VALIDATION_CONFIG architectures=${cuda_architectures} \
+label=${validation_label} device=${device} validation_dir=${validation_dir} \
+benchmark_blocks=${benchmark_blocks} benchmark_samples=${benchmark_samples} \
+benchmark_phenotypes=${benchmark_phenotypes} \
+benchmark_repeats=${benchmark_repeats} \
+benchmark_warmup_repeats=${benchmark_warmup_repeats} \
+stream_chunk_mb=${stream_chunk_mb} \
+run_synthetic_benchmark=${run_synthetic_benchmark} \
+synthetic_samples=${synthetic_samples} synthetic_variants=${synthetic_variants} \
+synthetic_phenotypes=${synthetic_phenotypes} \
+synthetic_chromosomes=${synthetic_chromosomes} synthetic_bsize=${synthetic_bsize} \
+synthetic_threads=${synthetic_threads} synthetic_seed=${synthetic_seed} \
+synthetic_max_bed_gb=${synthetic_max_bed_gb}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then
@@ -71,7 +138,7 @@ fi
 
 cmake -S "${repo_root}" -B "${build_dir}" \
   -DREGENIE_WITH_CUDA=ON \
-  -DREGENIE_CUDA_ARCHITECTURES=80 \
+  -DREGENIE_CUDA_ARCHITECTURES="${cuda_architectures}" \
   -DBUILD_TESTING=ON
 cmake --build "${build_dir}" --target regenie step1_compute_test -j "${jobs}"
 mkdir -p "${validation_dir}"
@@ -82,8 +149,11 @@ auto_output="$("${build_dir}/step1_compute_test" --backend auto --device "${devi
 printf '%s\n' "${auto_output}"
 grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${auto_output}"
 
-if [[ "${RUN_COMPUTE_SANITIZER:-1}" != "0" ]] && \
-   command -v compute-sanitizer >/dev/null 2>&1; then
+if [[ "${RUN_COMPUTE_SANITIZER:-1}" != "0" ]]; then
+  if ! command -v compute-sanitizer >/dev/null 2>&1; then
+    echo "compute-sanitizer is required unless RUN_COMPUTE_SANITIZER=0" >&2
+    exit 2
+  fi
   REGENIE_CUDA_CHUNK_MB="${stream_chunk_mb}" \
     compute-sanitizer --tool memcheck --error-exitcode 99 \
     "${build_dir}/step1_compute_test" --backend cuda --device "${device}"
@@ -91,12 +161,14 @@ fi
 
 "${build_dir}/step1_compute_test" --backend cpu --benchmark \
   --blocks "${benchmark_blocks}" --samples "${benchmark_samples}" \
-  --phenotypes "${benchmark_phenotypes}" --repeats "${benchmark_repeats}"
+  --phenotypes "${benchmark_phenotypes}" --repeats "${benchmark_repeats}" \
+  --warmup-repeats "${benchmark_warmup_repeats}"
 run_with_memory_log backend_benchmark \
   env REGENIE_CUDA_CHUNK_MB="${stream_chunk_mb}" \
   "${build_dir}/step1_compute_test" --backend cuda --device "${device}" --benchmark \
   --blocks "${benchmark_blocks}" --samples "${benchmark_samples}" \
-  --phenotypes "${benchmark_phenotypes}" --repeats "${benchmark_repeats}"
+  --phenotypes "${benchmark_phenotypes}" --repeats "${benchmark_repeats}" \
+  --warmup-repeats "${benchmark_warmup_repeats}"
 
 awk '
   NR == FNR {
@@ -185,20 +257,139 @@ run_end_to_end_pair() {
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
   grep -q "^STEP1_PROFILE version=2 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
 
+  compare_loco_files "${label}" "${cpu_prefix}" "${cuda_prefix}"
+}
+
+compare_loco_files() {
+  local label="$1"
+  local cpu_prefix="$2"
+  local cuda_prefix="$3"
+  loco_files_compared=0
+  loco_numeric_values=0
+  loco_maximum_absolute_error=0
   shopt -s nullglob
   local cpu_loco_files=("${cpu_prefix}"_*.loco)
   if (( ${#cpu_loco_files[@]} == 0 )); then
     echo "No CPU LOCO files were produced for ${label}" >&2
     exit 1
   fi
-  local cpu_file suffix cuda_file
+  local cpu_file suffix cuda_file compare_output compare_values compare_error
   for cpu_file in "${cpu_loco_files[@]}"; do
     suffix="${cpu_file#${cpu_prefix}_}"
     cuda_file="${cuda_prefix}_${suffix}"
-    python3 "${repo_root}/scripts/compare_numeric_files.py" \
+    compare_output="$(python3 "${repo_root}/scripts/compare_numeric_files.py" \
       "${cpu_file}" "${cuda_file}" \
-      --rtol "${LOCO_RTOL:-1e-7}" --atol "${LOCO_ATOL:-1e-9}"
+      --rtol "${LOCO_RTOL:-1e-7}" --atol "${LOCO_ATOL:-1e-9}")"
+    printf '%s\n' "${compare_output}"
+    compare_values="$(awk '{
+      for (field = 1; field <= NF; ++field) {
+        if ($field ~ /^values=/) {
+          sub(/^values=/, "", $field)
+          print $field
+          exit
+        }
+      }
+    }' <<<"${compare_output}")"
+    compare_error="$(awk '{
+      for (field = 1; field <= NF; ++field) {
+        if ($field ~ /^maximum_absolute_error=/) {
+          sub(/^maximum_absolute_error=/, "", $field)
+          print $field
+          exit
+        }
+      }
+    }' <<<"${compare_output}")"
+    if [[ ! "${compare_values}" =~ ^[0-9]+$ ]] || [[ -z "${compare_error}" ]]; then
+      echo "Could not parse numeric comparison result for ${label}" >&2
+      exit 1
+    fi
+    loco_files_compared=$((loco_files_compared + 1))
+    loco_numeric_values=$((loco_numeric_values + compare_values))
+    loco_maximum_absolute_error="$(awk \
+      -v current="${loco_maximum_absolute_error}" -v candidate="${compare_error}" \
+      'BEGIN { print candidate > current ? candidate : current }')"
   done
+}
+
+elapsed_seconds() {
+  local log_file="$1"
+  awk '
+    /^Elapsed time : / {
+      value = $4
+      sub(/s$/, "", value)
+      elapsed = value
+    }
+    END {
+      if (elapsed == "") exit 1
+      print elapsed
+    }
+  ' "${log_file}"
+}
+
+run_synthetic_end_to_end_benchmark() {
+  local synthetic_case="n${synthetic_samples}_m${synthetic_variants}_p${synthetic_phenotypes}_s${synthetic_seed}"
+  local synthetic_dir="${validation_dir}/synthetic/${synthetic_case}"
+  local synthetic_prefix="${synthetic_dir}/step1"
+  local cpu_prefix="${synthetic_dir}/cpu_kfold"
+  local cuda_prefix="${synthetic_dir}/cuda_kfold"
+
+  python3 "${repo_root}/scripts/generate_step1_bed.py" \
+    --prefix "${synthetic_prefix}" \
+    --samples "${synthetic_samples}" \
+    --variants "${synthetic_variants}" \
+    --phenotypes "${synthetic_phenotypes}" \
+    --chromosomes "${synthetic_chromosomes}" \
+    --seed "${synthetic_seed}" \
+    --max-bed-gb "${synthetic_max_bed_gb}"
+
+  local synthetic_common_args=(
+    --step 1
+    --bed "${synthetic_prefix}"
+    --covarFile "${synthetic_prefix}.covar"
+    --phenoFile "${synthetic_prefix}.pheno"
+    --qt
+    --bsize "${synthetic_bsize}"
+    --threads "${synthetic_threads}"
+    --seed "${synthetic_seed}"
+    --step1-profile
+  )
+
+  "${build_dir}/regenie" "${synthetic_common_args[@]}" \
+    --compute-backend cpu --out "${cpu_prefix}"
+  run_with_memory_log synthetic_kfold \
+    env REGENIE_CUDA_CHUNK_MB="${stream_chunk_mb}" \
+    "${build_dir}/regenie" "${synthetic_common_args[@]}" \
+    --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
+
+  grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
+  grep -q '^STEP1_PROFILE version=2 backend=cuda mode=kfold ' "${cuda_prefix}.log"
+  compare_loco_files synthetic_kfold "${cpu_prefix}" "${cuda_prefix}"
+
+  local cpu_elapsed_s
+  local cuda_elapsed_s
+  local speedup
+  local peak_mib
+  cpu_elapsed_s="$(elapsed_seconds "${cpu_prefix}.log")"
+  cuda_elapsed_s="$(elapsed_seconds "${cuda_prefix}.log")"
+  speedup="$(awk -v cpu="${cpu_elapsed_s}" -v cuda="${cuda_elapsed_s}" \
+    'BEGIN { if (cuda <= 0) exit 1; printf "%.6g", cpu / cuda }')"
+  peak_mib="$(awk '
+    BEGIN { peak = 0 }
+    /^[[:space:]]*[0-9]+([.][0-9]+)?[[:space:]]*$/ {
+      value = $1 + 0
+      if (value > peak) peak = value
+    }
+    END { print peak }
+  ' "${validation_dir}/memory_synthetic_kfold.txt")"
+  echo "STEP1_SYNTHETIC_BENCHMARK status=PASS samples=${synthetic_samples} \
+variants=${synthetic_variants} phenotypes=${synthetic_phenotypes} \
+chromosomes=${synthetic_chromosomes} bsize=${synthetic_bsize} \
+threads=${synthetic_threads} seed=${synthetic_seed} \
+cpu_elapsed_s=${cpu_elapsed_s} cuda_elapsed_s=${cuda_elapsed_s} speedup=${speedup} \
+peak_mib=${peak_mib} loco_files=${loco_files_compared} \
+loco_numeric_values=${loco_numeric_values} \
+maximum_absolute_error=${loco_maximum_absolute_error} \
+data_prefix=${synthetic_prefix}"
 }
 
 run_end_to_end_pair kfold kfold "${qt_common_args[@]}"
@@ -215,5 +406,8 @@ run_end_to_end_pair binary_loocv loocv "${binary_common_args[@]}"
 run_end_to_end_pair binary_full loocv \
   "${binary_common_args[@]}" --loocv --l1-full
 run_end_to_end_pair t2e_kfold kfold "${t2e_common_args[@]}"
+if [[ "${run_synthetic_benchmark}" == "1" ]]; then
+  run_synthetic_end_to_end_benchmark
+fi
 
-echo "STEP1_CUDA_VALIDATION status=PASS device=${device} results=${validation_dir}"
+echo "STEP1_CUDA_VALIDATION status=PASS device=${device} architectures=${cuda_architectures} label=${validation_label} results=${validation_dir}"
