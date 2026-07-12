@@ -665,8 +665,17 @@ void check_streamed_design_operations(Step1ComputeBackend& candidate) {
     static_cast<Eigen::Index>(chunk_mb) * 1000000 / sizeof(double);
   const Eigen::Index columns = 16;
   const Eigen::Index rows = max_elements / columns + 17;
-  const Eigen::MatrixXd design = deterministic_matrix(
+  Eigen::MatrixXd design = deterministic_matrix(
     static_cast<int>(rows), static_cast<int>(columns), 0.71);
+  // deterministic_matrix has only two row frequencies, so sufficiently tall
+  // instances have rank at most four regardless of the column count. Add
+  // column-specific frequencies so this streaming stress case compares
+  // coefficients from a well-conditioned full-rank system instead of
+  // amplifying harmless accumulation-order differences in null directions.
+  for(Eigen::Index column = 0; column < columns; ++column)
+    for(Eigen::Index row = 0; row < rows; ++row)
+      design(row, column) += 0.2 * std::sin(
+        0.0013 * (row + 1) * (column + 1) + 0.17 * column);
   const Eigen::MatrixXd outcomes = deterministic_matrix(
     static_cast<int>(rows), 2, -0.38);
 
