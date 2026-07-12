@@ -92,6 +92,14 @@ Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer
 streaming limit; this is primarily useful for validation or sharing a GPU with
 other jobs.
 
+CUDA genotype preprocessing uses a resident full-block buffer when the block
+fits within `REGENIE_CUDA_RESIDENT_MB` (1,024 MB by default), then copies the
+normalized block back to host for the existing Step 1 pipeline. Larger blocks
+fall back to CPU preprocessing. Set the limit to `0` to disable GPU
+preprocessing, or raise it deliberately when a larger block fits comfortably
+in device memory. The validation harness exposes the same setting as
+`CUDA_RESIDENT_MB`.
+
 For development, the repository includes a hardware-parameterized GPU
 validation command. It builds both backends, checks matrix shapes and failure
 paths, benchmarks both the Level 0 eigensystem and nonlinear Level 1 workloads,
@@ -127,10 +135,12 @@ default; set `RUN_COMPUTE_SANITIZER=0` only when running it separately or when
 performing a deliberately reduced smoke test.
 
 Application runs using `--step1-profile` report both additive stage totals and
-scope-level breakdowns for cross-validation matrix construction and Level 0
-ridge prediction. The scope records separate backend compute, transfers, and
-host/orchestration time, making them useful for distinguishing accelerated
-linear algebra from data packing and result assembly.
+scope-level breakdowns for genotype preprocessing, cross-validation matrix
+construction, and Level 0 ridge prediction. The scope records separate backend
+compute, transfers, and host/orchestration time, making them useful for
+distinguishing accelerated linear algebra from data packing and result
+assembly. The preprocessing scope also records how many blocks used the CUDA
+path versus the bounded CPU fallback.
 
 An opt-in end-to-end benchmark generates a deterministic PLINK BED dataset in
 the validation results directory, runs matched CPU and CUDA Step 1 jobs,

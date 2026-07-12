@@ -89,9 +89,9 @@ elif [ "`grep \"0.4504\" ${REGENIE_PATH}test/fit_bin_out.log | grep \"min value\
   print_custom_err "$fail_msg"
 elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "11" ]; then
   print_custom_err "Step 1 profiling output is incomplete."
-elif ! grep -q '^STEP1_PROFILE version=3 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
+elif ! grep -q '^STEP1_PROFILE version=4 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 profiling header is missing."
-elif [ "`grep -c '^STEP1_PROFILE scope=' ${REGENIE_PATH}test/fit_bin_out.log`" != "2" ]; then
+elif [ "`grep -c '^STEP1_PROFILE scope=' ${REGENIE_PATH}test/fit_bin_out.log`" != "3" ]; then
   print_custom_err "Step 1 profiling scope output is incomplete."
 fi
 

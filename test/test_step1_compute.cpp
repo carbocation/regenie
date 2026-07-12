@@ -79,9 +79,101 @@ double relative_error(const Eigen::MatrixXd& actual, const Eigen::MatrixXd& expe
   return (actual - expected).cwiseAbs().maxCoeff() / scale;
 }
 
+void reference_preprocess_genotypes(Eigen::MatrixXd& genotypes,
+  const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+  const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+  double degrees_of_freedom,
+  const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+  Eigen::VectorXd& row_scales) {
+
+  genotypes.array().rowwise() *= sample_weights.transpose().array();
+  const Eigen::MatrixXd coefficients = genotypes * covariates;
+  genotypes.noalias() -= coefficients * covariates.transpose();
+  row_scales = genotypes.rowwise().norm() / std::sqrt(degrees_of_freedom);
+  genotypes.array().colwise() /= row_scales.array();
+  if(row_multipliers.size())
+    genotypes.array().colwise() *= row_multipliers.array();
+}
+
+void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
+  const int rows = 13;
+  const int samples = 37;
+  Eigen::MatrixXd raw_covariates =
+    deterministic_matrix(samples, 3, -0.19);
+  Eigen::VectorXd sample_weights = Eigen::VectorXd::Ones(samples);
+  for(int sample = 0; sample < samples; sample += 7) {
+    sample_weights(sample) = 0;
+    raw_covariates.row(sample).setZero();
+  }
+  const Eigen::MatrixXd covariate_gram =
+    raw_covariates.transpose() * raw_covariates;
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> covariate_solver(
+    covariate_gram);
+  if(covariate_solver.info() != Eigen::Success)
+    throw std::runtime_error(
+      "genotype preprocessing covariate setup failed");
+  const Eigen::MatrixXd covariates = raw_covariates *
+    covariate_solver.eigenvectors() *
+    covariate_solver.eigenvalues().array().sqrt().inverse().matrix().asDiagonal() *
+    covariate_solver.eigenvectors().transpose();
+  const Eigen::VectorXd row_multipliers =
+    Eigen::VectorXd::LinSpaced(rows, 0.55, 1.45);
+  const double degrees_of_freedom = sample_weights.sum() - covariates.cols();
+  Eigen::MatrixXd expected = deterministic_matrix(rows, samples, 0.61);
+  Eigen::MatrixXd actual = expected;
+  Eigen::VectorXd expected_scales, actual_scales;
+  reference_preprocess_genotypes(expected, covariates, sample_weights,
+    degrees_of_freedom, row_multipliers, expected_scales);
+
+  Step1ComputeTimings timings;
+  timings.upload_ms = timings.preprocess_ms = timings.download_ms = 1.0;
+  const bool backend_processed = candidate.preprocess_genotypes(
+    actual, covariates, sample_weights, degrees_of_freedom, 1e-12,
+    row_multipliers, actual_scales, &timings);
+  if(!backend_processed)
+    reference_preprocess_genotypes(actual, covariates, sample_weights,
+      degrees_of_freedom, row_multipliers, actual_scales);
+
+  const double genotype_error = relative_error(actual, expected);
+  const double scale_error =
+    (actual_scales - expected_scales).cwiseAbs().maxCoeff() /
+    std::max(1.0, expected_scales.cwiseAbs().maxCoeff());
+  const double tolerance = 3e-11;
+  if(genotype_error > tolerance || scale_error > tolerance ||
+     !std::isfinite(timings.upload_ms) ||
+     !std::isfinite(timings.preprocess_ms) ||
+     !std::isfinite(timings.download_ms) || timings.upload_ms < 1.0 ||
+     timings.preprocess_ms < 1.0 || timings.download_ms < 1.0)
+    throw std::runtime_error(
+      "genotype preprocessing conformance tolerance exceeded");
+
+  bool rejected_dimensions = false;
+  try {
+    Eigen::MatrixXd invalid = deterministic_matrix(rows, samples, 0.2);
+    Eigen::VectorXd invalid_scales;
+    const Eigen::VectorXd invalid_weights =
+      Eigen::VectorXd::Ones(samples - 1);
+    candidate.preprocess_genotypes(invalid, covariates,
+      invalid_weights, degrees_of_freedom, 1e-12,
+      row_multipliers, invalid_scales);
+  } catch(const std::invalid_argument&) {
+    rejected_dimensions = true;
+  }
+  if(!rejected_dimensions)
+    throw std::runtime_error(
+      "genotype preprocessing accepted incompatible dimensions");
+
+  std::cout << "STEP1_BACKEND_TEST case=genotype_preprocessing"
+            << " backend_processed=" << (backend_processed ? 1 : 0)
+            << " genotype_relative_error=" << genotype_error
+            << " scale_relative_error=" << scale_error
+            << " status=PASS\n";
+}
+
 void accumulate_timings(Step1ComputeTimings& destination,
   const Step1ComputeTimings& source) {
   destination.upload_ms += source.upload_ms;
+  destination.preprocess_ms += source.preprocess_ms;
   destination.crossproduct_ms += source.crossproduct_ms;
   destination.gram_ms += source.gram_ms;
   destination.eigensolve_ms += source.eigensolve_ms;
@@ -91,7 +183,8 @@ void accumulate_timings(Step1ComputeTimings& destination,
 }
 
 double total_timing_ms(const Step1ComputeTimings& timings) {
-  return timings.upload_ms + timings.crossproduct_ms + timings.gram_ms +
+  return timings.upload_ms + timings.preprocess_ms +
+    timings.crossproduct_ms + timings.gram_ms +
     timings.eigensolve_ms + timings.transform_ms + timings.ridge_ms +
     timings.download_ms;
 }
@@ -967,6 +1060,8 @@ void run_conformance(Step1ComputeBackend& candidate) {
      !rejected_unfactorized_grouped_loo)
     throw std::runtime_error("backend accepted a reusable solve before factorization");
   std::cout << "STEP1_BACKEND_TEST case=reusable_state_validation status=PASS\n";
+
+  check_genotype_preprocessing(candidate);
 
   check_case(candidate, *oracle, genotypes, phenotypes,
     Step1GramMode::full_product, "contiguous_full_product");

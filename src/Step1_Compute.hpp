@@ -38,6 +38,7 @@ enum class Step1GramMode {
 
 struct Step1ComputeTimings {
   double upload_ms = 0;
+  double preprocess_ms = 0;
   double crossproduct_ms = 0;
   double gram_ms = 0;
   double eigensolve_ms = 0;
@@ -53,6 +54,16 @@ class Step1ComputeBackend {
 
     virtual const char* name() const = 0;
     virtual std::string description() const = 0;
+
+    virtual bool preprocess_genotypes(
+      Eigen::MatrixXd& genotypes,
+      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale,
+      const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+      Eigen::VectorXd& row_scales,
+      Step1ComputeTimings* timings = nullptr);
 
     virtual void compute_products(
       const Eigen::Ref<const Eigen::MatrixXd>& genotypes,

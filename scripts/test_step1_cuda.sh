@@ -15,6 +15,7 @@ benchmark_phenotypes="${BENCHMARK_PHENOTYPES:-10}"
 benchmark_repeats="${BENCHMARK_REPEATS:-3}"
 benchmark_warmup_repeats="${BENCHMARK_WARMUP_REPEATS:-1}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
+resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
 validation_dir="${VALIDATION_DIR:-${build_dir}/${validation_label}-validation}"
 run_synthetic_benchmark="${RUN_SYNTHETIC_BENCHMARK:-0}"
 synthetic_samples="${SYNTHETIC_SAMPLES:-20000}"
@@ -43,6 +44,10 @@ for numeric_setting in jobs benchmark_blocks benchmark_samples \
     exit 2
   fi
 done
+if [[ ! "${resident_mb}" =~ ^[0-9]+$ ]]; then
+  echo "resident_mb must be a non-negative integer (received '${resident_mb}')" >&2
+  exit 2
+fi
 if [[ ! "${run_synthetic_benchmark}" =~ ^[01]$ ]]; then
   echo "RUN_SYNTHETIC_BENCHMARK must be 0 or 1" >&2
   exit 2
@@ -123,12 +128,14 @@ benchmark_phenotypes=${benchmark_phenotypes} \
 benchmark_repeats=${benchmark_repeats} \
 benchmark_warmup_repeats=${benchmark_warmup_repeats} \
 stream_chunk_mb=${stream_chunk_mb} \
+resident_mb=${resident_mb} \
 run_synthetic_benchmark=${run_synthetic_benchmark} \
 synthetic_samples=${synthetic_samples} synthetic_variants=${synthetic_variants} \
 synthetic_phenotypes=${synthetic_phenotypes} \
 synthetic_chromosomes=${synthetic_chromosomes} synthetic_bsize=${synthetic_bsize} \
 synthetic_threads=${synthetic_threads} synthetic_seed=${synthetic_seed} \
 synthetic_max_bed_gb=${synthetic_max_bed_gb}"
+export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then
@@ -144,7 +151,25 @@ cmake --build "${build_dir}" --target regenie step1_compute_test -j "${jobs}"
 mkdir -p "${validation_dir}"
 
 "${build_dir}/step1_compute_test" --backend cpu
-"${build_dir}/step1_compute_test" --backend cuda --device "${device}"
+cuda_output="$("${build_dir}/step1_compute_test" --backend cuda --device "${device}")"
+printf '%s\n' "${cuda_output}"
+grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${cuda_output}"
+if (( resident_mb > 0 )); then
+  grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=1 .* status=PASS$' \
+    <<<"${cuda_output}"
+else
+  grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=0 .* status=PASS$' \
+    <<<"${cuda_output}"
+fi
+
+if (( resident_mb > 0 )); then
+  fallback_output="$(REGENIE_CUDA_RESIDENT_MB=0 \
+    "${build_dir}/step1_compute_test" --backend cuda --device "${device}")"
+  printf '%s\n' "${fallback_output}"
+  grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=0 .* status=PASS$' \
+    <<<"${fallback_output}"
+  grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${fallback_output}"
+fi
 auto_output="$("${build_dir}/step1_compute_test" --backend auto --device "${device}")"
 printf '%s\n' "${auto_output}"
 grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${auto_output}"
@@ -255,7 +280,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=3 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=4 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
 
   compare_loco_files "${label}" "${cpu_prefix}" "${cuda_prefix}"
 }
@@ -362,7 +387,7 @@ run_synthetic_end_to_end_benchmark() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q '^STEP1_PROFILE version=3 backend=cuda mode=kfold ' "${cuda_prefix}.log"
+  grep -q '^STEP1_PROFILE version=4 backend=cuda mode=kfold ' "${cuda_prefix}.log"
   compare_loco_files synthetic_kfold "${cpu_prefix}" "${cuda_prefix}"
 
   local cpu_elapsed_s

@@ -242,17 +242,38 @@ void Data::file_read_initialization() {
 void Data::residualize_genotypes() {
 
   sout << "   -residualizing and scaling genotypes..." << flush;
-  auto t1 = std::chrono::high_resolution_clock::now();
+  const ProfileClock::time_point t1 = ProfileClock::now();
 
-  // mask missing individuals
-  Gblock.Gmat.array().rowwise() *= in_filters.ind_in_analysis.matrix().transpose().array().cast<double>();
+  const VectorXd sample_weights =
+    in_filters.ind_in_analysis.matrix().cast<double>();
+  VectorXd row_multipliers;
+  if(params.alpha_prior != -1)
+    row_multipliers = pow(
+      Gblock.snp_afs.col(0).array() *
+        (1 - Gblock.snp_afs.col(0).array()),
+      0.5 * (params.alpha_prior + 1)).matrix();
 
-  // residuals (centered)
-  MatrixXd beta = Gblock.Gmat * pheno_data.new_cov;
-  Gblock.Gmat -= beta * pheno_data.new_cov.transpose();
+  Step1ComputeTimings timings;
+  const bool backend_processed =
+    step1_compute_backend->preprocess_genotypes(
+      Gblock.Gmat, pheno_data.new_cov, sample_weights,
+      params.n_analyzed - params.ncov, params.numtol,
+      row_multipliers, scale_G,
+      params.profile_step1 ? &timings : nullptr);
 
-  // scaling (use [N-C] where C=#covariates)
-  scale_G = Gblock.Gmat.rowwise().norm() / sqrt(params.n_analyzed - params.ncov);
+  if(!backend_processed) {
+    // mask missing individuals
+    Gblock.Gmat.array().rowwise() *=
+      sample_weights.transpose().array();
+
+    // residuals (centered)
+    MatrixXd beta = Gblock.Gmat * pheno_data.new_cov;
+    Gblock.Gmat -= beta * pheno_data.new_cov.transpose();
+
+    // scaling (use [N-C] where C=#covariates)
+    scale_G = Gblock.Gmat.rowwise().norm() /
+      sqrt(params.n_analyzed - params.ncov);
+  }
 
   // check sd
   MatrixXd::Index minIndex;
@@ -260,18 +281,32 @@ void Data::residualize_genotypes() {
     throw "!! Uh-oh, SNP " + snpinfo[in_filters.step1_snp_count+minIndex].ID + 
       " has low variance (=" + to_string( scale_G(minIndex,0) ) + ").";
 
-  Gblock.Gmat.array().colwise() /= scale_G.array();
+  if(!backend_processed) {
+    Gblock.Gmat.array().colwise() /= scale_G.array();
 
-  // to use MAF dependent prior on effect size [only for step 1]
-  // multiply by [p*(1-p)]^(1+alpha)/2
-  if(params.alpha_prior != -1) 
-    Gblock.Gmat.array().colwise() *= pow(Gblock.snp_afs.col(0).array() * (1-Gblock.snp_afs.col(0).array()), 0.5 * (params.alpha_prior + 1) );
+    // to use MAF dependent prior on effect size [only for step 1]
+    // multiply by [p*(1-p)]^(1+alpha)/2
+    if(row_multipliers.size())
+      Gblock.Gmat.array().colwise() *= row_multipliers.array();
+  }
 
 
   sout << "done";
-  auto t2 = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
-  sout << " (" << duration.count() << "ms) "<< endl;
+  const double wall_ms = elapsed_ms(t1);
+  sout << " (" << static_cast<long long>(wall_ms) << "ms) "<< endl;
+  if(params.profile_step1) {
+    step1_profile.preprocess_wall_ms += wall_ms;
+    step1_profile.preprocess_backend_compute_ms += timings.preprocess_ms;
+    step1_profile.preprocess_upload_ms += timings.upload_ms;
+    step1_profile.preprocess_download_ms += timings.download_ms;
+    if(backend_processed)
+      step1_profile.preprocess_backend_blocks++;
+    else
+      step1_profile.preprocess_fallback_blocks++;
+    step1_profile.preprocess_host_orchestration_ms += backend_processed ?
+      std::max(0.0, wall_ms - timings.preprocess_ms - timings.upload_ms -
+        timings.download_ms) : wall_ms;
+  }
 
 }
 
@@ -935,7 +970,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=3 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=4 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -959,6 +994,17 @@ void Data::print_step1_profile() {
   print_stage("ridge", step1_profile.ridge_ms);
   print_stage("other", other_ms);
   print_stage("block_total", step1_profile.total_ms);
+  out << "STEP1_PROFILE scope=genotype_preprocess"
+      << " backend_blocks=" << step1_profile.preprocess_backend_blocks
+      << " fallback_blocks=" << step1_profile.preprocess_fallback_blocks
+      << " wall_ms=" << step1_profile.preprocess_wall_ms
+      << " backend_compute_ms=" <<
+        step1_profile.preprocess_backend_compute_ms
+      << " upload_ms=" << step1_profile.preprocess_upload_ms
+      << " download_ms=" << step1_profile.preprocess_download_ms
+      << " host_orchestration_ms=" <<
+        step1_profile.preprocess_host_orchestration_ms
+      << "\n";
   out << "STEP1_PROFILE scope=cv_matrices"
       << " wall_ms=" << step1_profile.cv_wall_ms
       << " backend_compute_ms=" << step1_profile.cv_backend_compute_ms
