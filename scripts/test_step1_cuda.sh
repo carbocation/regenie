@@ -16,6 +16,7 @@ benchmark_repeats="${BENCHMARK_REPEATS:-3}"
 benchmark_warmup_repeats="${BENCHMARK_WARMUP_REPEATS:-1}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
+gram_precision="${CUDA_GRAM_PRECISION:-${REGENIE_CUDA_GRAM_PRECISION:-fp64}}"
 validation_dir="${VALIDATION_DIR:-${build_dir}/${validation_label}-validation}"
 run_synthetic_benchmark="${RUN_SYNTHETIC_BENCHMARK:-0}"
 synthetic_samples="${SYNTHETIC_SAMPLES:-20000}"
@@ -46,6 +47,10 @@ for numeric_setting in jobs benchmark_blocks benchmark_samples \
 done
 if [[ ! "${resident_mb}" =~ ^[0-9]+$ ]]; then
   echo "resident_mb must be a non-negative integer (received '${resident_mb}')" >&2
+  exit 2
+fi
+if [[ "${gram_precision}" != "fp64" && "${gram_precision}" != "fp32" ]]; then
+  echo "gram_precision must be fp64 or fp32 (received '${gram_precision}')" >&2
   exit 2
 fi
 if [[ ! "${run_synthetic_benchmark}" =~ ^[01]$ ]]; then
@@ -129,6 +134,7 @@ benchmark_repeats=${benchmark_repeats} \
 benchmark_warmup_repeats=${benchmark_warmup_repeats} \
 stream_chunk_mb=${stream_chunk_mb} \
 resident_mb=${resident_mb} \
+gram_precision=${gram_precision} \
 run_synthetic_benchmark=${run_synthetic_benchmark} \
 synthetic_samples=${synthetic_samples} synthetic_variants=${synthetic_variants} \
 synthetic_phenotypes=${synthetic_phenotypes} \
@@ -136,6 +142,7 @@ synthetic_chromosomes=${synthetic_chromosomes} synthetic_bsize=${synthetic_bsize
 synthetic_threads=${synthetic_threads} synthetic_seed=${synthetic_seed} \
 synthetic_max_bed_gb=${synthetic_max_bed_gb}"
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
+export REGENIE_CUDA_GRAM_PRECISION="${gram_precision}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then

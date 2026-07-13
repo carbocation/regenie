@@ -79,6 +79,22 @@ double relative_error(const Eigen::MatrixXd& actual, const Eigen::MatrixXd& expe
   return (actual - expected).cwiseAbs().maxCoeff() / scale;
 }
 
+bool uses_mixed_gram_products(const Step1ComputeBackend& backend) {
+  const char* precision = std::getenv("REGENIE_CUDA_GRAM_PRECISION");
+  return std::string(backend.name()) == "cuda" && precision &&
+    std::string(precision) == "fp32";
+}
+
+double gram_conformance_tolerance(const Step1ComputeBackend& backend,
+  double fp64_tolerance) {
+  return uses_mixed_gram_products(backend) ? 2e-5 : fp64_tolerance;
+}
+
+double factorized_conformance_tolerance(
+  const Step1ComputeBackend& backend, double fp64_tolerance) {
+  return uses_mixed_gram_products(backend) ? 2e-4 : fp64_tolerance;
+}
+
 void reference_preprocess_genotypes(Eigen::MatrixXd& genotypes,
   const Eigen::Ref<const Eigen::MatrixXd>& covariates,
   const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
@@ -138,8 +154,11 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
   const double scale_error =
     (actual_scales - expected_scales).cwiseAbs().maxCoeff() /
     std::max(1.0, expected_scales.cwiseAbs().maxCoeff());
-  const double tolerance = 3e-11;
-  if(genotype_error > tolerance || scale_error > tolerance ||
+  const double preprocessing_tolerance = 3e-11;
+  const double gram_tolerance = gram_conformance_tolerance(
+    candidate, preprocessing_tolerance);
+  if(genotype_error > preprocessing_tolerance ||
+     scale_error > preprocessing_tolerance ||
      !std::isfinite(timings.upload_ms) ||
      !std::isfinite(timings.preprocess_ms) ||
      !std::isfinite(timings.download_ms) || timings.upload_ms < 1.0 ||
@@ -157,7 +176,8 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
   const double reuse_gram_error = relative_error(actual_gram, expected_gram);
   const double reuse_crossproduct_error =
     relative_error(actual_crossproduct, expected_crossproduct);
-  if(reuse_gram_error > tolerance || reuse_crossproduct_error > tolerance ||
+  if(reuse_gram_error > gram_tolerance ||
+     reuse_crossproduct_error > preprocessing_tolerance ||
      (backend_processed && reuse_timings.resident_reuse_count == 0) ||
      (!backend_processed && reuse_timings.resident_reuse_count != 0))
     throw std::runtime_error(
@@ -178,8 +198,9 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
     actual.middleCols(slice_start, slice_size), slice_outcomes,
     actual_gram, actual_crossproduct, Step1GramMode::full_product,
     &slice_timings);
-  if(relative_error(actual_gram, expected_slice_gram) > tolerance ||
-     relative_error(actual_crossproduct, expected_slice_crossproduct) > tolerance ||
+  if(relative_error(actual_gram, expected_slice_gram) > gram_tolerance ||
+     relative_error(actual_crossproduct, expected_slice_crossproduct) >
+       preprocessing_tolerance ||
      (backend_processed && slice_timings.resident_reuse_count == 0) ||
      (!backend_processed && slice_timings.resident_reuse_count != 0))
     throw std::runtime_error(
@@ -191,9 +212,12 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
   Step1ComputeTimings released_timings;
   candidate.compute_products(actual, outcomes, actual_gram,
     actual_crossproduct, Step1GramMode::full_product, &released_timings);
+  const double released_gram_error = relative_error(
+    actual_gram, expected_gram);
   if(released_timings.resident_reuse_count != 0 ||
-     relative_error(actual_gram, expected_gram) > tolerance ||
-     relative_error(actual_crossproduct, expected_crossproduct) > tolerance)
+     released_gram_error > gram_tolerance ||
+     relative_error(actual_crossproduct, expected_crossproduct) >
+       preprocessing_tolerance)
     throw std::runtime_error(
       "released genotype preprocessing state was reused");
 
@@ -219,12 +243,15 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
   candidate.compute_products(device_only_actual, outcomes, actual_gram,
     actual_crossproduct, Step1GramMode::full_product,
     &device_only_reuse_timings);
+  const double device_only_gram_error = relative_error(
+    actual_gram, expected_gram);
   const double device_only_scale_error =
     (device_only_scales - expected_scales).cwiseAbs().maxCoeff() /
     std::max(1.0, expected_scales.cwiseAbs().maxCoeff());
-  if(relative_error(actual_gram, expected_gram) > tolerance ||
-     relative_error(actual_crossproduct, expected_crossproduct) > tolerance ||
-     device_only_scale_error > tolerance ||
+  if(device_only_gram_error > gram_tolerance ||
+     relative_error(actual_crossproduct, expected_crossproduct) >
+       preprocessing_tolerance ||
+     device_only_scale_error > preprocessing_tolerance ||
      (device_only_processed &&
       device_only_reuse_timings.resident_reuse_count == 0) ||
      (!device_only_processed &&
@@ -258,6 +285,10 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
               device_only_reuse_timings.resident_reuse_count
             << " genotype_relative_error=" << genotype_error
             << " scale_relative_error=" << scale_error
+            << " gram_relative_error=" << reuse_gram_error
+            << " released_gram_relative_error=" << released_gram_error
+            << " device_only_gram_relative_error=" <<
+              device_only_gram_error
             << " status=PASS\n";
 }
 
@@ -293,8 +324,9 @@ void check_case(Step1ComputeBackend& candidate, Step1ComputeBackend& oracle,
   const double gram_error = relative_error(actual_gram, expected_gram);
   const double crossproduct_error = relative_error(actual_crossproduct, expected_crossproduct);
   const double symmetry_error = relative_error(actual_gram, actual_gram.transpose());
-  const double tolerance = 5e-12;
-  if(gram_error > tolerance || crossproduct_error > tolerance || symmetry_error > tolerance) {
+  const double gram_tolerance = gram_conformance_tolerance(candidate, 5e-12);
+  if(gram_error > gram_tolerance || crossproduct_error > 5e-12 ||
+     symmetry_error > gram_tolerance) {
     std::cerr << "STEP1_BACKEND_TEST case=" << case_name
               << " gram_relative_error=" << gram_error
               << " crossproduct_relative_error=" << crossproduct_error
@@ -1056,19 +1088,23 @@ void check_streamed_design_operations(Step1ComputeBackend& candidate) {
     actual_grouped_loo_predictions, expected_grouped_loo_predictions);
 
   const double tolerance = 5e-12;
+  const double l0_gram_tolerance = gram_conformance_tolerance(
+    candidate, tolerance);
+  const double fused_tolerance = factorized_conformance_tolerance(
+    candidate, 2e-11);
   const bool passed = !(crossproduct_error > tolerance ||
      design_gram_error > tolerance ||
      design_product_crossproduct_error > tolerance ||
      weighted_gram_error > tolerance ||
      weighted_crossproduct_error > tolerance ||
-     l0_full_gram_error > tolerance ||
+     l0_full_gram_error > l0_gram_tolerance ||
      l0_full_crossproduct_error > tolerance ||
-     l0_rank_gram_error > tolerance ||
+     l0_rank_gram_error > l0_gram_tolerance ||
      l0_rank_crossproduct_error > tolerance ||
-     fused_prediction_error > 2e-11 ||
-     fused_coefficient_error > 2e-11 ||
-     fused_loo_prediction_error > 2e-11 ||
-     fused_loo_coefficient_error > 2e-11 ||
+     fused_prediction_error > fused_tolerance ||
+     fused_coefficient_error > fused_tolerance ||
+     fused_loo_prediction_error > fused_tolerance ||
+     fused_loo_coefficient_error > fused_tolerance ||
      diagonal_prediction_error > 2e-11 ||
      diagonal_coefficient_error > 2e-11 ||
      diagonal_loo_prediction_error > 2e-11 ||
@@ -1260,7 +1296,10 @@ void run_conformance(Step1ComputeBackend& candidate) {
     actual_fused_predictions, expected_fused_predictions);
   const double fused_coefficient_error = relative_error(
     actual_fused_coefficients, expected_fused_coefficients);
-  if(fused_prediction_error > 2e-11 || fused_coefficient_error > 2e-11)
+  const double fused_tolerance = factorized_conformance_tolerance(
+    candidate, 2e-11);
+  if(fused_prediction_error > fused_tolerance ||
+     fused_coefficient_error > fused_tolerance)
     throw std::runtime_error("fused ridge pipeline tolerance exceeded");
   if(!std::isfinite(fused_timings.upload_ms) ||
      !std::isfinite(fused_timings.crossproduct_ms) ||

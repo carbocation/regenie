@@ -45,6 +45,21 @@ namespace {
 
 using ComputeClock = std::chrono::steady_clock;
 
+enum class CudaGramPrecision {
+  fp64,
+  fp32_products_fp64_accumulation
+};
+
+CudaGramPrecision cuda_gram_precision() {
+  const char* precision = std::getenv("REGENIE_CUDA_GRAM_PRECISION");
+  if(!precision || !*precision || std::string(precision) == "fp64")
+    return CudaGramPrecision::fp64;
+  if(std::string(precision) == "fp32")
+    return CudaGramPrecision::fp32_products_fp64_accumulation;
+  throw std::invalid_argument(
+    "REGENIE_CUDA_GRAM_PRECISION must be 'fp64' or 'fp32'");
+}
+
 void check_cuda(cudaError_t status, const char* operation) {
   if(status != cudaSuccess)
     throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
@@ -120,6 +135,23 @@ __global__ void mirror_lower_triangle(double* matrix, int size) {
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if(row < size && column < size && row < column)
     matrix[row + column * size] = matrix[column + row * size];
+}
+
+__global__ void convert_double_to_float(const double* input, float* output,
+  int count) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < count) output[index] = static_cast<float>(input[index]);
+}
+
+__global__ void accumulate_float_gram(const float* input, double* output,
+  int size, int count, bool lower_triangle_only) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < count) {
+    const int row = index % size;
+    const int column = index / size;
+    if(!lower_triangle_only || row >= column)
+      output[index] += static_cast<double>(input[index]);
+  }
 }
 
 __global__ void build_ridge_inverse(const double* eigenvalues,
@@ -289,7 +321,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
       : device_(device), handle_(nullptr), solver_handle_(nullptr),
+        gram_precision_(cuda_gram_precision()),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
+        d_fp32_genotypes_(nullptr), d_fp32_gram_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
         d_factorized_(nullptr),
         d_ridge_vectors_(nullptr), d_ridge_values_(nullptr),
@@ -302,6 +336,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         d_preprocess_coefficients_(nullptr), d_preprocess_scales_(nullptr),
         d_preprocess_multipliers_(nullptr),
         genotypes_capacity_(0), resident_genotypes_capacity_(0),
+        fp32_genotypes_capacity_(0), fp32_gram_capacity_(0),
         resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
         resident_valid_(false), phenotypes_capacity_(0), gram_capacity_(0),
         factorized_capacity_(0), factorized_size_(-1),
@@ -349,6 +384,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(d_crossproduct_) cudaFree(d_crossproduct_);
       if(d_gram_) cudaFree(d_gram_);
       if(d_phenotypes_) cudaFree(d_phenotypes_);
+      if(d_fp32_gram_) cudaFree(d_fp32_gram_);
+      if(d_fp32_genotypes_) cudaFree(d_fp32_genotypes_);
       if(d_resident_genotypes_) cudaFree(d_resident_genotypes_);
       if(d_genotypes_) cudaFree(d_genotypes_);
       if(solver_handle_) cusolverDnDestroy(solver_handle_);
@@ -362,7 +399,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     std::string description() const override {
       std::ostringstream result;
       result << properties_.name << " (device " << device_ << ", compute capability "
-             << properties_.major << "." << properties_.minor << ")";
+             << properties_.major << "." << properties_.minor
+             << ", Gram precision " <<
+               (gram_precision_ == CudaGramPrecision::fp64 ?
+                 "fp64" : "fp32-products/fp64-accumulation") << ")";
       return result.str();
     }
 
@@ -562,6 +602,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ensure_capacity(d_genotypes_, genotypes_capacity_,
           chunk_samples * genotypes.rows(), "cudaMalloc(genotype chunk)");
       ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(Gram matrix)");
+      if(gram_precision_ ==
+         CudaGramPrecision::fp32_products_fp64_accumulation) {
+        ensure_capacity(d_fp32_genotypes_, fp32_genotypes_capacity_,
+          chunk_samples * genotypes.rows(),
+          "cudaMalloc(FP32 genotype Gram chunk)");
+        ensure_capacity(d_fp32_gram_, fp32_gram_capacity_, gram.size(),
+          "cudaMalloc(FP32 Gram product)");
+      }
       if(phenotype_count > 0) {
         ensure_capacity(d_phenotypes_, phenotypes_capacity_,
           chunk_samples * phenotypes.cols(), "cudaMalloc(phenotype chunk)");
@@ -613,7 +661,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             "copy phenotype chunk to CUDA device");
         if(timings) timings->upload_ms += elapsed_ms(transfer_start);
 
-        const double beta = start == 0 ? 0.0 : 1.0;
+        const bool first_chunk = start == 0;
+        const double beta = first_chunk ? 0.0 : 1.0;
         if(phenotype_count > 0) {
           std::unique_ptr<CudaEventPair> crossproduct_events;
           if(timings) {
@@ -635,18 +684,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           gram_events.reset(new CudaEventPair());
           gram_events->record_start();
         }
-        if(mode == Step1GramMode::selfadjoint_rank_update)
-          check_cublas(cublasDsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
-            CUBLAS_OP_N, blocks, count, &alpha,
-            device_genotype_chunk, blocks,
-            &beta, d_gram_, blocks),
-            "cublasDsyrk(genotype Gram chunk)");
-        else
-          check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
-            blocks, blocks, count, &alpha,
-            device_genotype_chunk, blocks,
-            device_genotype_chunk, blocks, &beta,
-            d_gram_, blocks), "cublasDgemm(genotype Gram chunk)");
+        accumulate_genotype_gram(device_genotype_chunk, blocks, count,
+          mode, first_chunk, alpha, beta);
         if(timings)
           timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
       }
@@ -2052,6 +2091,16 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       ensure_capacity(d_gram_, gram_capacity_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge Gram matrix)");
+      if(gram_precision_ ==
+         CudaGramPrecision::fp32_products_fp64_accumulation) {
+        ensure_capacity(d_fp32_genotypes_, fp32_genotypes_capacity_,
+          std::max<Eigen::Index>(1,
+            chunk_samples * genotypes.rows()),
+          "cudaMalloc(FP32 fused ridge genotype chunk)");
+        ensure_capacity(d_fp32_gram_, fp32_gram_capacity_,
+          static_cast<Eigen::Index>(blocks) * blocks,
+          "cudaMalloc(FP32 fused ridge Gram product)");
+      }
       ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge eigenvectors)");
@@ -2123,7 +2172,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
               "copy fused ridge phenotype chunk to CUDA device");
           if(timings) timings->upload_ms += elapsed_ms(transfer_start);
 
-          const double beta = start == 0 ? 0.0 : 1.0;
+          const bool first_chunk = start == 0;
+          const double beta = first_chunk ? 0.0 : 1.0;
           if(phenotype_count > 0) {
             std::unique_ptr<CudaEventPair> crossproduct_events;
             if(timings) {
@@ -2146,18 +2196,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             gram_events.reset(new CudaEventPair());
             gram_events->record_start();
           }
-          if(mode == Step1GramMode::selfadjoint_rank_update)
-            check_cublas(cublasDsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
-              CUBLAS_OP_N, blocks, count, &alpha,
-              device_genotype_chunk, blocks,
-              &beta, d_gram_, blocks),
-              "cublasDsyrk(fused ridge Gram chunk)");
-          else
-            check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
-              blocks, blocks, count, &alpha,
-              device_genotype_chunk, blocks,
-              device_genotype_chunk, blocks, &beta,
-              d_gram_, blocks), "cublasDgemm(fused ridge Gram chunk)");
+          accumulate_genotype_gram(device_genotype_chunk, blocks, count,
+            mode, first_chunk, alpha, beta);
           if(timings)
             timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
         }
@@ -2580,6 +2620,59 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    void accumulate_genotype_gram(const double* genotypes, int rows,
+      int columns, Step1GramMode mode, bool first_chunk,
+      double fp64_alpha, double fp64_beta) {
+
+      if(gram_precision_ == CudaGramPrecision::fp64) {
+        if(mode == Step1GramMode::selfadjoint_rank_update)
+          check_cublas(cublasDsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
+            CUBLAS_OP_N, rows, columns, &fp64_alpha,
+            genotypes, rows, &fp64_beta, d_gram_, rows),
+            "cublasDsyrk(genotype Gram chunk)");
+        else
+          check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
+            rows, rows, columns, &fp64_alpha,
+            genotypes, rows, genotypes, rows, &fp64_beta,
+            d_gram_, rows), "cublasDgemm(genotype Gram chunk)");
+        return;
+      }
+
+      const int input_count = checked_element_count(rows, columns,
+        "mixed-precision genotype Gram input");
+      const int output_count = checked_element_count(rows, rows,
+        "mixed-precision genotype Gram output");
+      const int threads = 256;
+      if(first_chunk)
+        check_cuda(cudaMemset(d_gram_, 0,
+          static_cast<size_t>(output_count) * sizeof(double)),
+          "clear mixed-precision FP64 Gram accumulator");
+      convert_double_to_float<<<(input_count - 1) / threads + 1, threads>>>(
+        genotypes, d_fp32_genotypes_, input_count);
+      check_cuda(cudaGetLastError(),
+        "convert genotype Gram chunk from FP64 to FP32");
+
+      const float alpha = 1.0f;
+      const float beta = 0.0f;
+      if(mode == Step1GramMode::selfadjoint_rank_update)
+        check_cublas(cublasSsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
+          CUBLAS_OP_N, rows, columns, &alpha,
+          d_fp32_genotypes_, rows, &beta, d_fp32_gram_, rows),
+          "cublasSsyrk(mixed-precision genotype Gram chunk)");
+      else
+        check_cublas(cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
+          rows, rows, columns, &alpha,
+          d_fp32_genotypes_, rows, d_fp32_genotypes_, rows, &beta,
+          d_fp32_gram_, rows),
+          "cublasSgemm(mixed-precision genotype Gram chunk)");
+
+      accumulate_float_gram<<<(output_count - 1) / threads + 1, threads>>>(
+        d_fp32_gram_, d_gram_, rows, output_count,
+        mode == Step1GramMode::selfadjoint_rank_update);
+      check_cuda(cudaGetLastError(),
+        "accumulate FP32 Gram product into FP64 matrix");
+    }
+
     void invalidate_resident_genotypes() {
       resident_host_data_ = nullptr;
       resident_rows_ = 0;
@@ -2664,12 +2757,34 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       capacity = required_size;
     }
 
+    static void ensure_capacity(float*& pointer, size_t& capacity,
+      Eigen::Index required, const char* label) {
+      if(required < 0)
+        throw std::runtime_error(
+          std::string("negative CUDA allocation size for ") + label);
+      const size_t required_size = static_cast<size_t>(required);
+      if(required_size <= capacity) return;
+      if(required_size > std::numeric_limits<size_t>::max() / sizeof(float))
+        throw std::runtime_error(
+          std::string("CUDA allocation size overflow for ") + label);
+      if(pointer) check_cuda(cudaFree(pointer),
+        "cudaFree while growing FP32 buffer");
+      pointer = nullptr;
+      capacity = 0;
+      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
+        required_size * sizeof(float)), label);
+      capacity = required_size;
+    }
+
     int device_;
     cudaDeviceProp properties_;
     cublasHandle_t handle_;
     cusolverDnHandle_t solver_handle_;
+    CudaGramPrecision gram_precision_;
     double* d_genotypes_;
     double* d_resident_genotypes_;
+    float* d_fp32_genotypes_;
+    float* d_fp32_gram_;
     double* d_phenotypes_;
     double* d_gram_;
     double* d_crossproduct_;
@@ -2695,6 +2810,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     double* d_preprocess_multipliers_;
     size_t genotypes_capacity_;
     size_t resident_genotypes_capacity_;
+    size_t fp32_genotypes_capacity_;
+    size_t fp32_gram_capacity_;
     const double* resident_host_data_;
     Eigen::Index resident_rows_;
     Eigen::Index resident_columns_;

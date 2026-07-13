@@ -103,6 +103,15 @@ preprocessing, or raise it deliberately when a larger block fits comfortably
 in device memory. The validation harness exposes the same setting as
 `CUDA_RESIDENT_MB`.
 
+The CUDA backend uses FP64 throughout by default. On devices with weak FP64
+throughput, the opt-in setting `REGENIE_CUDA_GRAM_PRECISION=fp32` converts each
+bounded genotype chunk to FP32 for its Gram product and accumulates the chunk
+results into an FP64 matrix. Phenotype crossproducts, eigendecompositions,
+ridge solves, and predictions remain FP64. This mode trades numerical accuracy
+for speed and must be validated against the default FP64 output for each target
+workload; unset the variable or set it to `fp64` to retain the default path.
+The validation harness exposes the same setting as `CUDA_GRAM_PRECISION`.
+
 For development, the repository includes a hardware-parameterized GPU
 validation command. It builds both backends, checks matrix shapes and failure
 paths, benchmarks both the Level 0 eigensystem and nonlinear Level 1 workloads,
