@@ -31,7 +31,6 @@
 
 #include <array>
 #include <chrono>
-#include <cstring>
 #include <cstdlib>
 #include <numeric>
 #include <stdexcept>
@@ -59,61 +58,6 @@ class ScopedThreadWorkTimer {
   private:
     double* elapsed_ms_;
     std::chrono::steady_clock::time_point start_;
-};
-
-class ReusableZlibDecompressor {
-  public:
-    ReusableZlibDecompressor() {
-      std::memset(&stream_, 0, sizeof(stream_));
-      initialized_ = inflateInit(&stream_) == Z_OK;
-    }
-
-    ~ReusableZlibDecompressor() {
-      if(initialized_) inflateEnd(&stream_);
-    }
-
-    bool decompress(
-      uchar* destination,
-      uint32_t destination_size,
-      const uchar* source,
-      uint32_t source_size) {
-      if(!initialized_ || inflateReset(&stream_) != Z_OK) return false;
-      stream_.next_in = const_cast<Bytef*>(
-        reinterpret_cast<const Bytef*>(source));
-      stream_.avail_in = source_size;
-      stream_.next_out = reinterpret_cast<Bytef*>(destination);
-      stream_.avail_out = destination_size;
-      const int result = inflate(&stream_, Z_FINISH);
-      return result == Z_STREAM_END &&
-        stream_.total_out == destination_size;
-    }
-
-  private:
-    z_stream stream_;
-    bool initialized_ = false;
-};
-
-class ReusableZstdDecompressor {
-  public:
-    ReusableZstdDecompressor()
-      : context_(ZSTD_createDCtx()) {}
-
-    ~ReusableZstdDecompressor() {
-      if(context_) ZSTD_freeDCtx(context_);
-    }
-
-    size_t decompress(
-      uchar* destination,
-      size_t destination_size,
-      const uchar* source,
-      size_t source_size) {
-      if(!context_) return static_cast<size_t>(-1);
-      return ZSTD_decompressDCtx(
-        context_, destination, destination_size, source, source_size);
-    }
-
-  private:
-    ZSTD_DCtx* context_;
 };
 
 struct Bgen8DosageLookupEntry {
@@ -2301,20 +2245,20 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
 
 }
 
-void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, Step2BgenParseProfile* bgen_profile, bool const bgen_fast_path_eligible, bool const bgen_lookup_path_enabled, bool const bgen_reusable_decompression){
+void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, Step2BgenParseProfile* bgen_profile, bool const bgen_fast_path_eligible, bool const bgen_lookup_path_enabled){
 
   if( ((params->file_type == "bgen") && !params->streamBGEN) || params->file_type == "pgen")
     return;
 
   if(params->file_type == "bgen") // uncompress and extract the dosages
-    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_profile, bgen_fast_path_eligible, bgen_lookup_path_enabled, bgen_reusable_decompression);
+    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_profile, bgen_fast_path_eligible, bgen_lookup_path_enabled);
   else if(params->file_type == "bed") // extract hardcalls
     parseSnpfromBed(isnp, chrom, *geno_block, params, filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data);
 
 }
 
 
-void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, Step2BgenParseProfile* bgen_profile, bool const bgen_fast_path_eligible, bool const bgen_lookup_path_enabled, bool const bgen_reusable_decompression){
+void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, Step2BgenParseProfile* bgen_profile, bool const bgen_fast_path_eligible, bool const bgen_lookup_path_enabled){
 
   uint minploidy = 0, maxploidy = 0, phasing = 0, bits_prob = 0;
   uint16_t numberOfAlleles = 0 ;
@@ -2335,50 +2279,21 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   }
 
   // set genotype data block
-  vector<uchar> local_geno_block_uncompressed;
-  thread_local vector<uchar> reusable_geno_block_uncompressed;
-  vector<uchar>& geno_block_uncompressed = bgen_reusable_decompression ?
-    reusable_geno_block_uncompressed : local_geno_block_uncompressed;
-  if(bgen_profile && bgen_reusable_decompression)
-    bgen_profile->reusable_decompression_variants++;
+  vector < uchar > geno_block_uncompressed;
   {
     ScopedThreadWorkTimer decompress_timer(bgen_profile ?
       &bgen_profile->decompress_thread_ms : nullptr);
-    {
-      ScopedThreadWorkTimer buffer_timer(bgen_profile ?
-        &bgen_profile->decompress_buffer_thread_ms : nullptr);
-      geno_block_uncompressed.resize(outsize);
-    }
+    geno_block_uncompressed.resize(outsize);
 
     // uncompress the block
     bool compress_fail;
-    {
-      ScopedThreadWorkTimer codec_timer(bgen_profile ?
-        &bgen_profile->decompress_codec_thread_ms : nullptr);
-      if(params->zlib_compress){ // using zlib
-        if(bgen_reusable_decompression) {
-          thread_local ReusableZlibDecompressor decompressor;
-          compress_fail = !decompressor.decompress(
-            &(geno_block_uncompressed[0]), outsize,
-            &((*geno_block)[0]), insize - 4);
-        } else {
-          uLongf dest_size = outsize;
-          compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize - 4) != Z_OK) || (dest_size != outsize);
-        }
-      } else { // using zstd
-        size_t dest_size;
-        if(bgen_reusable_decompression) {
-          thread_local ReusableZstdDecompressor decompressor;
-          dest_size = decompressor.decompress(
-            &(geno_block_uncompressed[0]), outsize,
-            &((*geno_block)[0]), insize - 4);
-        } else {
-          dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize,
-            &((*geno_block)[0]), insize - 4);
-        }
-        //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
-        compress_fail = (dest_size != outsize);
-      }
+    if(params->zlib_compress){ // using zlib
+      uLongf dest_size = outsize;
+      compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize - 4) != Z_OK) || (dest_size != outsize);
+    } else { // using zstd
+      size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
+      //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
+      compress_fail = (dest_size != outsize);
     }
     // check it was successful
     if( compress_fail )
