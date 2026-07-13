@@ -2981,7 +2981,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
   const bool use_unscaled_dense_qt =
     step2_unscaled_dense_qt_enabled() &&
-    (params.file_type == "pgen") &&
+    ((params.file_type == "pgen") || (params.file_type == "bgen")) &&
     (params.trait_mode == 0) &&
     (params.test_type == 0) &&
     !params.skip_cov_res &&
