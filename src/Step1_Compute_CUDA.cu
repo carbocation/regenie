@@ -768,20 +768,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           chunk_rows, design.rows() - start);
         const int count = checked_int(
           count_index, "design product chunk row count");
-        const Eigen::MatrixXd design_chunk =
-          design.middleRows(start, count_index);
-        const Eigen::MatrixXd outcomes_chunk = outcome_count > 0 ?
-          Eigen::MatrixXd(outcomes.middleRows(start, count_index)) :
-          Eigen::MatrixXd();
 
         ComputeClock::time_point transfer_start;
         if(timings) transfer_start = ComputeClock::now();
-        check_cuda(cudaMemcpy(d_genotypes_, design_chunk.data(),
-          design_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
-          "copy design product chunk to CUDA device");
+        copy_matrix_row_chunk_to_device(design, start, count_index,
+          d_genotypes_, "copy design product chunk to CUDA device");
         if(outcome_count > 0)
-          check_cuda(cudaMemcpy(d_phenotypes_, outcomes_chunk.data(),
-            outcomes_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
+          copy_matrix_row_chunk_to_device(outcomes, start, count_index,
+            d_phenotypes_,
             "copy design product outcome chunk to CUDA device");
         if(timings) timings->upload_ms += elapsed_ms(transfer_start);
 
@@ -2437,37 +2431,34 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             prediction_matrix, start, count_index) : nullptr;
         Eigen::MatrixXd packed_prediction_chunk;
         const double* prediction_chunk_data = nullptr;
-        if(!device_prediction_chunk) {
-          if(samples_in_columns && prediction_has_contiguous_columns)
+        if(!device_prediction_chunk && samples_in_columns) {
+          if(prediction_has_contiguous_columns)
             prediction_chunk_data = prediction_matrix.data() +
               start * prediction_matrix.outerStride();
           else {
-            if(samples_in_columns)
-              packed_prediction_chunk =
-                prediction_matrix.middleCols(start, count_index);
-            else
-              packed_prediction_chunk =
-                prediction_matrix.middleRows(start, count_index);
+            packed_prediction_chunk =
+              prediction_matrix.middleCols(start, count_index);
             prediction_chunk_data = packed_prediction_chunk.data();
           }
         }
-        const Eigen::MatrixXd outcomes_chunk = leave_one_out ?
-          Eigen::MatrixXd(
-            leave_one_out_outcomes.middleRows(start, count_index)) :
-          Eigen::MatrixXd();
 
         if(timings) transfer_start = ComputeClock::now();
         if(!device_prediction_chunk) {
-          check_cuda(cudaMemcpy(d_genotypes_, prediction_chunk_data,
-            count_index * size * sizeof(double), cudaMemcpyHostToDevice),
-            "copy factorized ridge prediction chunk to CUDA device");
+          if(samples_in_columns)
+            check_cuda(cudaMemcpy(d_genotypes_, prediction_chunk_data,
+              count_index * size * sizeof(double), cudaMemcpyHostToDevice),
+              "copy factorized ridge prediction chunk to CUDA device");
+          else
+            copy_matrix_row_chunk_to_device(
+              prediction_matrix, start, count_index, d_genotypes_,
+              "copy factorized ridge prediction chunk to CUDA device");
           device_prediction_chunk = d_genotypes_;
         } else if(timings) {
           timings->resident_reuse_count++;
         }
         if(leave_one_out)
-          check_cuda(cudaMemcpy(d_outcomes_, outcomes_chunk.data(),
-            outcomes_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
+          copy_matrix_row_chunk_to_device(
+            leave_one_out_outcomes, start, count_index, d_outcomes_,
             "copy factorized ridge LOOCV outcome chunk to CUDA device");
         if(timings) timings->upload_ms += elapsed_ms(transfer_start);
 
@@ -2742,6 +2733,36 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(matrix.innerStride() == 1 && matrix.outerStride() == matrix.rows())
         return Eigen::MatrixXd();
       return Eigen::MatrixXd(matrix);
+    }
+
+    static void copy_matrix_row_chunk_to_device(
+      const Eigen::Ref<const Eigen::MatrixXd>& matrix,
+      Eigen::Index start_row, Eigen::Index row_count,
+      double* destination, const char* label) {
+
+      if(matrix.innerStride() == 1) {
+        const size_t row_bytes = static_cast<size_t>(row_count) *
+          sizeof(double);
+        if(start_row == 0 && row_count == matrix.rows() &&
+           matrix.outerStride() == matrix.rows()) {
+          check_cuda(cudaMemcpy(destination, matrix.data(),
+            static_cast<size_t>(matrix.size()) * sizeof(double),
+            cudaMemcpyHostToDevice), label);
+        } else {
+          check_cuda(cudaMemcpy2D(destination, row_bytes,
+            matrix.data() + start_row,
+            static_cast<size_t>(matrix.outerStride()) * sizeof(double),
+            row_bytes, static_cast<size_t>(matrix.cols()),
+            cudaMemcpyHostToDevice), label);
+        }
+        return;
+      }
+
+      const Eigen::MatrixXd packed =
+        matrix.middleRows(start_row, row_count);
+      check_cuda(cudaMemcpy(destination, packed.data(),
+        static_cast<size_t>(packed.size()) * sizeof(double),
+        cudaMemcpyHostToDevice), label);
     }
 
     static void validate_ridge_dimensions(
