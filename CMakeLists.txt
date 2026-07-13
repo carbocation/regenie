@@ -240,10 +240,15 @@ if(EXISTS ${HTSLIB_PATH})
   )
 endif()
 
+# Keep the selected accelerated linear-algebra dependencies available to every
+# target compiled with the corresponding global Eigen definitions.
+set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS "")
+set(REGENIE_LINEAR_ALGEBRA_LIBRARIES "")
+
 # Intel MKL
 if(EXISTS ${MKLROOT})
   add_definitions(-DWITH_MKL -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
-  target_include_directories(regenie PRIVATE ${MKLROOT}/include/)
+  set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS ${MKLROOT}/include/)
   if(${BUILD_STATIC}) # specify static libs
     find_library(MKL_LP64_LIB libmkl_intel_lp64.a 
       HINTS "${MKLROOT}/lib/intel64"
@@ -257,7 +262,9 @@ if(EXISTS ${MKLROOT})
       HINTS "${MKLROOT}/lib/intel64"
       "${MKLROOT}/lib" 
       REQUIRED)
-    target_link_libraries(regenie PRIVATE "-Wl,--start-group" ${MKL_LP64_LIB} ${MKL_THREAD_LIB} ${MKL_CORE_LIB} "-Wl,--end-group" -lgomp)
+    set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+      "-Wl,--start-group" ${MKL_LP64_LIB} ${MKL_THREAD_LIB}
+      ${MKL_CORE_LIB} "-Wl,--end-group" -lgomp)
   else() # use dynamic libs
     find_library(MKL_LP64_LIB mkl_intel_lp64 
       PATHS "${MKLROOT}/lib/intel64"
@@ -271,14 +278,26 @@ if(EXISTS ${MKLROOT})
       PATHS "${MKLROOT}/lib/intel64"
       "${MKLROOT}/lib" 
       REQUIRED)
-    target_link_libraries(regenie PRIVATE "-Wl,--no-as-needed" ${MKL_LP64_LIB} ${MKL_THREAD_LIB} ${MKL_CORE_LIB} -lgomp)
+    set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+      "-Wl,--no-as-needed" ${MKL_LP64_LIB} ${MKL_THREAD_LIB}
+      ${MKL_CORE_LIB} -lgomp)
   endif()
 elseif(EXISTS ${OPENBLAS_ROOT}) # OpenBLAS
   add_definitions(-DWITH_OPENBLAS -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
-  target_include_directories(regenie PRIVATE ${OPENBLAS_ROOT}/include/)
+  set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS ${OPENBLAS_ROOT}/include/)
   find_library(LAPACK_LIB lapack REQUIRED)
   find_library(BLAS_LIB openblas HINTS "${OPENBLAS_ROOT}/lib/" REQUIRED)
-  target_link_libraries(regenie PRIVATE ${LAPACK_LIB} -llapacke ${BLAS_LIB})
+  set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+    ${LAPACK_LIB} -llapacke ${BLAS_LIB})
+endif()
+
+if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+  target_include_directories(regenie PRIVATE
+    ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+endif()
+if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+  target_link_libraries(regenie PRIVATE
+    ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
 endif()
 
 # cxxopts (header-only)
@@ -297,6 +316,14 @@ if(BUILD_TESTING)
   target_include_directories(step1_compute_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(step1_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(step1_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
   configure_step1_cuda(step1_compute_test)
   add_test(NAME step1_compute_cpu
     COMMAND step1_compute_test --backend cpu)
