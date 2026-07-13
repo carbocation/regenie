@@ -33,6 +33,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -222,6 +223,91 @@ __global__ void mask_genotype_columns(double* genotypes,
     genotypes[index] *= sample_weights[index / rows];
 }
 
+__global__ void packed_hardcall_row_statistics(
+  const unsigned char* packed_hardcalls, size_t packed_stride_bytes,
+  const double* sample_weights, double* row_sums,
+  unsigned int* row_counts, int rows, int columns) {
+  const int row = blockIdx.x;
+  if(row >= rows) return;
+  double sum = 0.0;
+  unsigned int count = 0;
+  const unsigned char* packed_row = packed_hardcalls +
+    static_cast<size_t>(row) * packed_stride_bytes;
+  const int packed_columns = (columns + 3) / 4;
+  for(int packed_column = threadIdx.x; packed_column < packed_columns;
+      packed_column += blockDim.x) {
+    const unsigned char codes = packed_row[packed_column];
+    const int first_column = packed_column * 4;
+    for(int lane = 0; lane < 4; ++lane) {
+      const int column = first_column + lane;
+      if(column >= columns || sample_weights[column] <= 0) continue;
+      const unsigned int code = (codes >> (2 * lane)) & 3u;
+      if(code != 3u) {
+        sum += static_cast<double>(code);
+        count++;
+      }
+    }
+  }
+  __shared__ double partial_sums[256];
+  __shared__ unsigned int partial_counts[256];
+  partial_sums[threadIdx.x] = sum;
+  partial_counts[threadIdx.x] = count;
+  __syncthreads();
+  for(int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if(threadIdx.x < offset) {
+      partial_sums[threadIdx.x] += partial_sums[threadIdx.x + offset];
+      partial_counts[threadIdx.x] += partial_counts[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if(threadIdx.x == 0) {
+    row_sums[row] = partial_sums[0];
+    row_counts[row] = partial_counts[0];
+  }
+}
+
+__global__ void transpose_packed_hardcalls(
+  const unsigned char* input, unsigned char* output,
+  int rows, int packed_columns, size_t input_stride) {
+  __shared__ unsigned char tile[32][33];
+  int x = blockIdx.x * 32 + threadIdx.x;
+  int y = blockIdx.y * 32 + threadIdx.y;
+  for(int offset = 0; offset < 32; offset += 8)
+    if(x < packed_columns && y + offset < rows)
+      tile[threadIdx.y + offset][threadIdx.x] =
+        input[static_cast<size_t>(y + offset) * input_stride + x];
+  __syncthreads();
+  x = blockIdx.y * 32 + threadIdx.x;
+  y = blockIdx.x * 32 + threadIdx.y;
+  for(int offset = 0; offset < 32; offset += 8)
+    if(x < rows && y + offset < packed_columns)
+      output[static_cast<size_t>(y + offset) * rows + x] =
+        tile[threadIdx.x][threadIdx.y + offset];
+}
+
+__global__ void expand_packed_hardcalls(
+  const unsigned char* transposed_hardcalls,
+  const double* sample_weights, const double* row_sums,
+  const unsigned int* row_counts, double* genotypes,
+  int rows, int count) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index >= count) return;
+  const int row = index % rows;
+  const int column = index / rows;
+  if(sample_weights[column] <= 0) {
+    genotypes[index] = 0.0;
+    return;
+  }
+  const unsigned int code =
+    (transposed_hardcalls[
+       static_cast<size_t>(column >> 2) * rows + row] >>
+       (2 * (column & 3))) & 3u;
+  const double value = code == 3u ?
+    (row_counts[row] ? row_sums[row] / row_counts[row] : 0.0) :
+    static_cast<double>(code);
+  genotypes[index] = value * sample_weights[column];
+}
+
 __global__ void compute_genotype_row_scales(const double* genotypes,
   double* row_scales, int rows, int columns, double degrees_of_freedom) {
   const int row = blockIdx.x;
@@ -362,7 +448,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         d_squared_(nullptr), d_leverage_(nullptr),
         d_preprocess_covariates_(nullptr), d_preprocess_weights_(nullptr),
         d_preprocess_coefficients_(nullptr), d_preprocess_scales_(nullptr),
-        d_preprocess_multipliers_(nullptr),
+        d_preprocess_multipliers_(nullptr), d_packed_hardcalls_(nullptr),
+        d_transposed_hardcalls_(nullptr), d_packed_row_counts_(nullptr),
         genotypes_capacity_(0), resident_genotypes_capacity_(0),
         fp32_genotypes_capacity_(0), fp32_gram_capacity_(0),
         resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
@@ -402,6 +489,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(d_preprocess_coefficients_) cudaFree(d_preprocess_coefficients_);
       if(d_preprocess_weights_) cudaFree(d_preprocess_weights_);
       if(d_preprocess_covariates_) cudaFree(d_preprocess_covariates_);
+      if(d_packed_row_counts_) cudaFree(d_packed_row_counts_);
+      if(d_transposed_hardcalls_) cudaFree(d_transposed_hardcalls_);
+      if(d_packed_hardcalls_) cudaFree(d_packed_hardcalls_);
       if(d_leverage_) cudaFree(d_leverage_);
       if(d_squared_) cudaFree(d_squared_);
       if(d_projected_) cudaFree(d_projected_);
@@ -448,6 +538,220 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           (pinned_staging_chunk_bytes_ / 1000000.0) << " MB";
       result << ")";
       return result.str();
+    }
+
+    bool can_preprocess_packed_hardcalls(
+      Eigen::Index variants, Eigen::Index samples) const override {
+      if(variants < 0 || samples < 0) return false;
+      if(variants == 0) return true;
+      if(samples == 0) return false;
+      if(variants > INT_MAX || samples > INT_MAX) return false;
+      const long long element_count =
+        static_cast<long long>(variants) * samples;
+      return element_count <= INT_MAX &&
+        element_count <= cuda_resident_preprocess_max_elements();
+    }
+
+    bool preprocess_packed_hardcalls(
+      const unsigned char* packed_hardcalls,
+      size_t packed_bytes,
+      size_t packed_stride_bytes,
+      Eigen::Index variants,
+      Eigen::Index samples,
+      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale,
+      Eigen::VectorXd& row_scales,
+      Step1ComputeTimings* timings) override {
+
+      if(variants < 0 || samples < 0 || covariates.rows() != samples ||
+         sample_weights.size() != samples)
+        throw std::invalid_argument(
+          "Step 1 packed hardcall preprocessing received incompatible dimensions");
+      if(!std::isfinite(degrees_of_freedom) || degrees_of_freedom <= 0)
+        throw std::invalid_argument(
+          "Step 1 packed hardcall preprocessing requires positive degrees of freedom");
+      if(!std::isfinite(minimum_scale) || minimum_scale < 0)
+        throw std::invalid_argument(
+          "Step 1 packed hardcall preprocessing requires a non-negative minimum scale");
+      if((sample_weights.array() < 0).any() ||
+         !sample_weights.allFinite() || !covariates.allFinite())
+        throw std::invalid_argument(
+          "Step 1 packed hardcall preprocessing requires finite, non-negative weights");
+      const size_t minimum_stride =
+        (static_cast<size_t>(samples) + 3) / 4;
+      if(packed_stride_bytes < minimum_stride ||
+         (variants > 0 && packed_stride_bytes >
+           std::numeric_limits<size_t>::max() /
+             static_cast<size_t>(variants)) ||
+         packed_bytes < static_cast<size_t>(variants) *
+           packed_stride_bytes ||
+         (variants > 0 && !packed_hardcalls))
+        throw std::invalid_argument(
+          "Step 1 packed hardcall preprocessing received an invalid packed buffer");
+
+      invalidate_resident_genotypes();
+      if(!can_preprocess_packed_hardcalls(variants, samples)) return false;
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        variants, "packed hardcall preprocessing variant count");
+      const int columns = checked_int(
+        samples, "packed hardcall preprocessing sample count");
+      const int covariate_count = checked_int(covariates.cols(),
+        "packed hardcall preprocessing covariate count");
+      const int element_count = checked_element_count(
+        rows, columns, "packed hardcall preprocessing block");
+      const size_t required_packed_bytes =
+        static_cast<size_t>(rows) * packed_stride_bytes;
+      row_scales.resize(rows);
+      if(rows == 0) {
+        resident_rows_ = 0;
+        resident_columns_ = columns;
+        resident_valid_ = true;
+        return true;
+      }
+
+      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+        element_count,
+        "cudaMalloc(packed hardcall resident genotype block)");
+      ensure_capacity(d_packed_hardcalls_, packed_hardcalls_capacity_,
+        required_packed_bytes, "cudaMalloc(packed hardcall block)");
+      ensure_capacity(d_transposed_hardcalls_,
+        transposed_hardcalls_capacity_, required_packed_bytes,
+        "cudaMalloc(transposed packed hardcall block)");
+      ensure_capacity(d_packed_row_counts_, packed_row_counts_capacity_,
+        rows, "cudaMalloc(packed hardcall row counts)");
+      ensure_capacity(d_preprocess_weights_, preprocess_weights_capacity_,
+        columns, "cudaMalloc(packed hardcall sample weights)");
+      ensure_capacity(d_preprocess_scales_, preprocess_scales_capacity_,
+        rows, "cudaMalloc(packed hardcall row statistics)");
+      if(covariate_count > 0) {
+        ensure_capacity(d_preprocess_covariates_,
+          preprocess_covariates_capacity_, covariates.size(),
+          "cudaMalloc(packed hardcall covariates)");
+        ensure_capacity(d_preprocess_coefficients_,
+          preprocess_coefficients_capacity_,
+          static_cast<Eigen::Index>(rows) * covariate_count,
+          "cudaMalloc(packed hardcall projection coefficients)");
+      }
+
+      const Eigen::MatrixXd packed_covariates = covariate_count > 0 ?
+        contiguous_copy_if_needed(covariates) : Eigen::MatrixXd();
+      const double* covariate_data = packed_covariates.size() ?
+        packed_covariates.data() : covariates.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      copy_host_to_device_staged(d_packed_hardcalls_, packed_hardcalls,
+        required_packed_bytes,
+        "copy packed hardcalls to CUDA device", timings);
+      check_cuda(cudaMemcpy(d_preprocess_weights_, sample_weights.data(),
+        static_cast<size_t>(columns) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy packed hardcall sample weights to CUDA device");
+      if(covariate_count > 0)
+        check_cuda(cudaMemcpy(d_preprocess_covariates_, covariate_data,
+          covariates.size() * sizeof(double), cudaMemcpyHostToDevice),
+          "copy packed hardcall covariates to CUDA device");
+      if(timings) {
+        timings->upload_ms += elapsed_ms(transfer_start);
+        timings->packed_hardcall_upload_count++;
+        timings->packed_hardcall_upload_bytes += required_packed_bytes;
+      }
+
+      const int threads = 256;
+      std::unique_ptr<CudaEventPair> expand_events;
+      if(timings) {
+        expand_events.reset(new CudaEventPair());
+        expand_events->record_start();
+      }
+      packed_hardcall_row_statistics<<<rows, threads>>>(
+        d_packed_hardcalls_, packed_stride_bytes, d_preprocess_weights_,
+        d_preprocess_scales_, d_packed_row_counts_, rows, columns);
+      check_cuda(cudaGetLastError(),
+        "compute packed hardcall row statistics kernel");
+      const int packed_columns = (columns + 3) / 4;
+      const dim3 transpose_threads(32, 8);
+      const dim3 transpose_grid(
+        (packed_columns + 31) / 32, (rows + 31) / 32);
+      transpose_packed_hardcalls<<<transpose_grid, transpose_threads>>>(
+        d_packed_hardcalls_, d_transposed_hardcalls_, rows,
+        packed_columns, packed_stride_bytes);
+      check_cuda(cudaGetLastError(),
+        "transpose packed hardcalls kernel");
+      const int element_blocks = (element_count - 1) / threads + 1;
+      expand_packed_hardcalls<<<element_blocks, threads>>>(
+        d_transposed_hardcalls_, d_preprocess_weights_,
+        d_preprocess_scales_, d_packed_row_counts_,
+        d_resident_genotypes_, rows, element_count);
+      check_cuda(cudaGetLastError(), "expand packed hardcalls kernel");
+      if(timings) {
+        const double expand_ms =
+          expand_events->record_stop_and_elapsed_ms();
+        timings->packed_hardcall_expand_ms += expand_ms;
+        timings->preprocess_ms += expand_ms;
+      }
+
+      std::unique_ptr<CudaEventPair> projection_events;
+      if(timings) {
+        projection_events.reset(new CudaEventPair());
+        projection_events->record_start();
+      }
+      if(covariate_count > 0) {
+        const double one = 1.0;
+        const double zero = 0.0;
+        const double minus_one = -1.0;
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+          rows, covariate_count, columns, &one,
+          d_resident_genotypes_, rows,
+          d_preprocess_covariates_, columns, &zero,
+          d_preprocess_coefficients_, rows),
+          "cublasDgemm(packed hardcall projection coefficients)");
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
+          rows, columns, covariate_count, &minus_one,
+          d_preprocess_coefficients_, rows,
+          d_preprocess_covariates_, columns, &one,
+          d_resident_genotypes_, rows),
+          "cublasDgemm(packed hardcall residuals)");
+      }
+      compute_genotype_row_scales<<<rows, threads,
+        threads * sizeof(double)>>>(d_resident_genotypes_,
+        d_preprocess_scales_, rows, columns, degrees_of_freedom);
+      check_cuda(cudaGetLastError(),
+        "compute packed hardcall row scales kernel");
+      if(timings)
+        timings->preprocess_ms +=
+          projection_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(row_scales.data(), d_preprocess_scales_,
+        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyDeviceToHost),
+        "copy packed hardcall row scales from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      if(!row_scales.allFinite())
+        throw std::runtime_error(
+          "CUDA packed hardcall preprocessing produced non-finite row scales");
+      if(row_scales.minCoeff() < minimum_scale) return true;
+
+      std::unique_ptr<CudaEventPair> scale_events;
+      if(timings) {
+        scale_events.reset(new CudaEventPair());
+        scale_events->record_start();
+      }
+      scale_genotype_rows<<<element_blocks, threads>>>(
+        d_resident_genotypes_, d_preprocess_scales_, nullptr,
+        rows, element_count);
+      check_cuda(cudaGetLastError(),
+        "scale packed hardcall genotype rows kernel");
+      if(timings)
+        timings->preprocess_ms +=
+          scale_events->record_stop_and_elapsed_ms();
+
+      resident_host_data_ = nullptr;
+      resident_rows_ = variants;
+      resident_columns_ = samples;
+      resident_valid_ = true;
+      return true;
     }
 
     bool preprocess_genotypes(
@@ -611,6 +915,265 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
     void release_preprocessed_genotypes() override {
       invalidate_resident_genotypes();
+    }
+
+    void compute_preprocessed_products(
+      Eigen::Index start_column,
+      Eigen::Index column_count,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1GramMode mode,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_valid_ || start_column < 0 || column_count < 0 ||
+         start_column > resident_columns_ - column_count ||
+         phenotypes.rows() != column_count)
+        throw std::invalid_argument(
+          "Step 1 resident genotype products received incompatible dimensions");
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_rows_, "resident genotype product row count");
+      const int columns = checked_int(
+        column_count, "resident genotype product sample count");
+      const int phenotype_count = checked_int(
+        phenotypes.cols(), "resident genotype product phenotype count");
+      gram.resize(rows, rows);
+      crossproduct.resize(rows, phenotype_count);
+      if(rows == 0 || columns == 0) {
+        gram.setZero();
+        crossproduct.setZero();
+        return;
+      }
+
+      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+        "cudaMalloc(resident genotype Gram matrix)");
+      if(gram_precision_ ==
+         CudaGramPrecision::fp32_products_fp64_accumulation) {
+        ensure_capacity(d_fp32_genotypes_, fp32_genotypes_capacity_,
+          static_cast<Eigen::Index>(rows) *
+            std::min(columns, fp32_gram_chunk_samples_),
+          "cudaMalloc(FP32 resident genotype Gram chunk)");
+        ensure_capacity(d_fp32_gram_, fp32_gram_capacity_, gram.size(),
+          "cudaMalloc(FP32 resident genotype Gram product)");
+      }
+      if(phenotype_count > 0) {
+        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+          phenotypes.size(),
+          "cudaMalloc(resident genotype phenotype block)");
+        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+          crossproduct.size(),
+          "cudaMalloc(resident genotype crossproduct)");
+      }
+
+      const Eigen::MatrixXd packed_phenotypes = phenotype_count > 0 ?
+        contiguous_copy_if_needed(phenotypes) : Eigen::MatrixXd();
+      const double* phenotype_data = packed_phenotypes.size() ?
+        packed_phenotypes.data() : phenotypes.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      if(phenotype_count > 0)
+        check_cuda(cudaMemcpy(d_phenotypes_, phenotype_data,
+          phenotypes.size() * sizeof(double), cudaMemcpyHostToDevice),
+          "copy resident genotype phenotypes to CUDA device");
+      if(timings) {
+        timings->upload_ms += elapsed_ms(transfer_start);
+        timings->resident_reuse_count++;
+      }
+
+      const double* device_genotypes = d_resident_genotypes_ +
+        start_column * resident_rows_;
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      if(phenotype_count > 0) {
+        std::unique_ptr<CudaEventPair> crossproduct_events;
+        if(timings) {
+          crossproduct_events.reset(new CudaEventPair());
+          crossproduct_events->record_start();
+        }
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+          rows, phenotype_count, columns, &alpha,
+          device_genotypes, rows, d_phenotypes_, columns, &beta,
+          d_crossproduct_, rows),
+          "cublasDgemm(resident genotype product)");
+        if(timings)
+          timings->crossproduct_ms +=
+            crossproduct_events->record_stop_and_elapsed_ms();
+      }
+
+      std::unique_ptr<CudaEventPair> gram_events;
+      if(timings) {
+        gram_events.reset(new CudaEventPair());
+        gram_events->record_start();
+      }
+      accumulate_genotype_gram(device_genotypes, rows, columns,
+        mode, true, alpha, beta);
+      if(timings)
+        timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
+      if(mode == Step1GramMode::selfadjoint_rank_update) {
+        const dim3 threads(16, 16);
+        const dim3 grid((rows + threads.x - 1) / threads.x,
+          (rows + threads.y - 1) / threads.y);
+        mirror_lower_triangle<<<grid, threads>>>(d_gram_, rows);
+        check_cuda(cudaGetLastError(),
+          "mirror resident genotype Gram triangle kernel");
+      }
+
+      if(timings) transfer_start = ComputeClock::now();
+      if(phenotype_count > 0)
+        check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_,
+          crossproduct.size() * sizeof(double), cudaMemcpyDeviceToHost),
+          "copy resident genotype crossproduct from CUDA device");
+      check_cuda(cudaMemcpy(gram.data(), d_gram_,
+        gram.size() * sizeof(double), cudaMemcpyDeviceToHost),
+        "copy resident genotype Gram matrix from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+    }
+
+    void ridge_predict_preprocessed(
+      Eigen::Index start_column,
+      Eigen::Index column_count,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      Eigen::MatrixXd& predictions,
+      Eigen::MatrixXd& coefficients,
+      Step1ComputeTimings* timings) override {
+
+      if(ridge_factorized_size_ < 0)
+        throw std::runtime_error(
+          "Step 1 resident ridge prediction requested before factorization");
+      if(!resident_valid_ || resident_rows_ != ridge_factorized_size_ ||
+         start_column < 0 || column_count < 0 ||
+         start_column > resident_columns_ - column_count)
+        throw std::invalid_argument(
+          "Step 1 resident ridge prediction received incompatible dimensions");
+      if((ridge_parameters.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 resident ridge parameters must be non-negative");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int size = ridge_factorized_size_;
+      const int sample_count = checked_int(
+        column_count, "resident ridge sample count");
+      const int phenotype_count = ridge_factorized_rhs_count_;
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "resident ridge parameter count");
+      const long long combination_count_long =
+        static_cast<long long>(phenotype_count) * parameter_count;
+      if(combination_count_long > INT_MAX)
+        throw std::runtime_error(
+          "CUDA resident ridge phenotype/parameter count exceeds integer limits");
+      const int combination_count =
+        static_cast<int>(combination_count_long);
+      predictions.resize(sample_count, combination_count);
+      coefficients.resize(size, combination_count);
+      if(size == 0 || sample_count == 0 || combination_count == 0) {
+        predictions.setZero();
+        coefficients.setZero();
+        return;
+      }
+
+      const Eigen::Index streaming_columns = std::max<Eigen::Index>(
+        size, combination_count);
+      const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
+        column_count, streaming_columns);
+      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+        ridge_parameters.size(),
+        "cudaMalloc(resident ridge parameters)");
+      ensure_capacity(d_inverse_, inverse_capacity_,
+        static_cast<Eigen::Index>(size) * parameter_count,
+        "cudaMalloc(resident ridge inverse)");
+      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+        static_cast<Eigen::Index>(size) * combination_count,
+        "cudaMalloc(resident ridge scaled right-hand sides)");
+      ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        coefficients.size(), "cudaMalloc(resident ridge coefficients)");
+      ensure_capacity(d_predictions_, predictions_capacity_,
+        chunk_samples * combination_count,
+        "cudaMalloc(resident ridge prediction chunk)");
+
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, ridge_parameters.data(),
+        ridge_parameters.size() * sizeof(double), cudaMemcpyHostToDevice),
+        "copy resident ridge parameters to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> coefficient_events;
+      if(timings) {
+        coefficient_events.reset(new CudaEventPair());
+        coefficient_events->record_start();
+      }
+      const int threads = 256;
+      const int inverse_count = checked_element_count(
+        size, parameter_count, "resident ridge inverse");
+      build_ridge_inverse<<<
+        (inverse_count + threads - 1) / threads, threads>>>(
+        d_ridge_values_, d_ridge_parameters_, d_inverse_, size,
+        inverse_count);
+      check_cuda(cudaGetLastError(),
+        "build resident ridge inverse kernel");
+      const int scaled_count = checked_element_count(
+        size, combination_count,
+        "resident ridge scaled right-hand sides");
+      build_scaled_right_hand_sides<<<
+        (scaled_count + threads - 1) / threads, threads>>>(
+        d_inverse_, d_ridge_rhs_, d_scaled_rhs_, size,
+        phenotype_count, scaled_count);
+      check_cuda(cudaGetLastError(),
+        "build resident ridge scaled right-hand sides kernel");
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+        size, combination_count, size, &alpha,
+        d_ridge_vectors_, size, d_scaled_rhs_, size, &beta,
+        d_phenotypes_, size),
+        "cublasDgemm(resident ridge coefficients)");
+      if(timings)
+        timings->ridge_ms +=
+          coefficient_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(coefficients.data(), d_phenotypes_,
+        coefficients.size() * sizeof(double), cudaMemcpyDeviceToHost),
+        "copy resident ridge coefficients from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+
+      for(Eigen::Index start = 0; start < column_count;
+          start += chunk_samples) {
+        const Eigen::Index count_index = std::min(
+          chunk_samples, column_count - start);
+        const int count = checked_int(
+          count_index, "resident ridge prediction chunk sample count");
+        const double* device_prediction_chunk = d_resident_genotypes_ +
+          (start_column + start) * resident_rows_;
+        if(timings) timings->resident_reuse_count++;
+
+        std::unique_ptr<CudaEventPair> prediction_events;
+        if(timings) {
+          prediction_events.reset(new CudaEventPair());
+          prediction_events->record_start();
+        }
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+          count, combination_count, size, &alpha,
+          device_prediction_chunk, size,
+          d_phenotypes_, size, &beta,
+          d_predictions_, count),
+          "cublasDgemm(resident ridge prediction chunk)");
+        if(timings)
+          timings->ridge_ms +=
+            prediction_events->record_stop_and_elapsed_ms();
+
+        if(timings) transfer_start = ComputeClock::now();
+        for(int combination = 0; combination < combination_count;
+            ++combination)
+          check_cuda(cudaMemcpy(
+            predictions.col(combination).segment(start, count_index).data(),
+            d_predictions_ +
+              static_cast<Eigen::Index>(combination) * count,
+            count * sizeof(double), cudaMemcpyDeviceToHost),
+            "copy resident ridge prediction chunk from CUDA device");
+        if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      }
     }
 
     void compute_products(
@@ -2701,8 +3264,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       return true;
     }
 
-    void copy_host_to_device_staged(double* destination,
-      const double* source, size_t bytes, const char* label,
+    void copy_host_to_device_staged(void* destination,
+      const void* source, size_t bytes, const char* label,
       Step1ComputeTimings* timings) {
       if(!ensure_pinned_staging(bytes)) {
         check_cuda(cudaMemcpy(destination, source, bytes,
@@ -2933,6 +3496,38 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       capacity = required_size;
     }
 
+    static void ensure_capacity(unsigned char*& pointer, size_t& capacity,
+      size_t required, const char* label) {
+      if(required <= capacity) return;
+      if(pointer) check_cuda(cudaFree(pointer),
+        "cudaFree while growing byte buffer");
+      pointer = nullptr;
+      capacity = 0;
+      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer), required),
+        label);
+      capacity = required;
+    }
+
+    static void ensure_capacity(unsigned int*& pointer, size_t& capacity,
+      Eigen::Index required, const char* label) {
+      if(required < 0)
+        throw std::runtime_error(
+          std::string("negative CUDA allocation size for ") + label);
+      const size_t required_size = static_cast<size_t>(required);
+      if(required_size <= capacity) return;
+      if(required_size >
+         std::numeric_limits<size_t>::max() / sizeof(unsigned int))
+        throw std::runtime_error(
+          std::string("CUDA allocation size overflow for ") + label);
+      if(pointer) check_cuda(cudaFree(pointer),
+        "cudaFree while growing unsigned buffer");
+      pointer = nullptr;
+      capacity = 0;
+      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
+        required_size * sizeof(unsigned int)), label);
+      capacity = required_size;
+    }
+
     int device_;
     cudaDeviceProp properties_;
     cublasHandle_t handle_;
@@ -2969,6 +3564,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     double* d_preprocess_coefficients_;
     double* d_preprocess_scales_;
     double* d_preprocess_multipliers_;
+    unsigned char* d_packed_hardcalls_;
+    unsigned char* d_transposed_hardcalls_;
+    unsigned int* d_packed_row_counts_;
     size_t genotypes_capacity_;
     size_t resident_genotypes_capacity_;
     size_t fp32_genotypes_capacity_;
@@ -3002,6 +3600,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     size_t preprocess_coefficients_capacity_ = 0;
     size_t preprocess_scales_capacity_ = 0;
     size_t preprocess_multipliers_capacity_ = 0;
+    size_t packed_hardcalls_capacity_ = 0;
+    size_t transposed_hardcalls_capacity_ = 0;
+    size_t packed_row_counts_capacity_ = 0;
     int ridge_factorized_size_;
     int ridge_factorized_rhs_count_;
 };

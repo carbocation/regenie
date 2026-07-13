@@ -21,6 +21,7 @@ fp32_gram_chunk_samples="${CUDA_FP32_GRAM_CHUNK_SAMPLES:-${REGENIE_CUDA_FP32_GRA
 pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
 pgen_prefetch_mb="${STEP1_PGEN_PREFETCH_MB:-${REGENIE_STEP1_PGEN_PREFETCH_MB:-4096}}"
 pgen_tile_variants="${STEP1_PGEN_TILE_VARIANTS:-${REGENIE_STEP1_PGEN_TILE_VARIANTS:-8}}"
+pgen_packed="${STEP1_PGEN_PACKED:-${REGENIE_STEP1_PGEN_PACKED:-1}}"
 validation_dir="${VALIDATION_DIR:-${build_dir}/${validation_label}-validation}"
 run_synthetic_benchmark="${RUN_SYNTHETIC_BENCHMARK:-0}"
 synthetic_samples="${SYNTHETIC_SAMPLES:-20000}"
@@ -63,6 +64,10 @@ if [[ ! "${fp32_gram_chunk_samples}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${run_synthetic_benchmark}" =~ ^[01]$ ]]; then
   echo "RUN_SYNTHETIC_BENCHMARK must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "${pgen_packed}" =~ ^[01]$ ]]; then
+  echo "STEP1_PGEN_PACKED must be 0 or 1" >&2
   exit 2
 fi
 if [[ "${run_synthetic_benchmark}" == "1" ]]; then
@@ -144,7 +149,7 @@ stream_chunk_mb=${stream_chunk_mb} \
 resident_mb=${resident_mb} \
 gram_precision=${gram_precision} \
 fp32_gram_chunk_samples=${fp32_gram_chunk_samples} \
-pinned_staging_mb=${pinned_staging_mb} pgen_prefetch_mb=${pgen_prefetch_mb} pgen_tile_variants=${pgen_tile_variants} \
+pinned_staging_mb=${pinned_staging_mb} pgen_prefetch_mb=${pgen_prefetch_mb} pgen_tile_variants=${pgen_tile_variants} pgen_packed=${pgen_packed} \
 run_synthetic_benchmark=${run_synthetic_benchmark} \
 synthetic_samples=${synthetic_samples} synthetic_variants=${synthetic_variants} \
 synthetic_phenotypes=${synthetic_phenotypes} \
@@ -157,6 +162,7 @@ export REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES="${fp32_gram_chunk_samples}"
 export REGENIE_CUDA_PINNED_STAGING_MB="${pinned_staging_mb}"
 export REGENIE_STEP1_PGEN_PREFETCH_MB="${pgen_prefetch_mb}"
 export REGENIE_STEP1_PGEN_TILE_VARIANTS="${pgen_tile_variants}"
+export REGENIE_STEP1_PGEN_PACKED="${pgen_packed}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then
@@ -177,6 +183,8 @@ printf '%s\n' "${cuda_output}"
 grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${cuda_output}"
 if (( resident_mb > 0 )); then
   grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=1 .* status=PASS$' \
+    <<<"${cuda_output}"
+  grep -q '^STEP1_BACKEND_TEST case=packed_hardcall_preprocessing supported=1 .* status=PASS$' \
     <<<"${cuda_output}"
 else
   grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=0 .* status=PASS$' \
@@ -301,7 +309,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=4 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=5 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
 
   compare_loco_files "${label}" "${cpu_prefix}" "${cuda_prefix}"
@@ -409,7 +417,7 @@ run_synthetic_end_to_end_benchmark() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q '^STEP1_PROFILE version=4 backend=cuda mode=kfold ' "${cuda_prefix}.log"
+  grep -q '^STEP1_PROFILE version=5 backend=cuda mode=kfold ' "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
   compare_loco_files synthetic_kfold "${cpu_prefix}" "${cuda_prefix}"
 

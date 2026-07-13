@@ -326,6 +326,172 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.pinned_staging_upload_count;
   destination.pinned_staging_upload_bytes +=
     source.pinned_staging_upload_bytes;
+  destination.packed_hardcall_upload_count +=
+    source.packed_hardcall_upload_count;
+  destination.packed_hardcall_upload_bytes +=
+    source.packed_hardcall_upload_bytes;
+  destination.packed_hardcall_expand_ms +=
+    source.packed_hardcall_expand_ms;
+}
+
+void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
+  const int rows = 13;
+  // This crosses the 64 KiB staging threshold while remaining quick under
+  // compute-sanitizer.
+  const int samples = 20165;
+  if(!candidate.can_preprocess_packed_hardcalls(rows, samples)) {
+    std::cout << "STEP1_BACKEND_TEST case=packed_hardcall_preprocessing"
+              << " supported=0 status=PASS\n";
+    return;
+  }
+
+  const size_t stride = (static_cast<size_t>(samples) + 3) / 4;
+  std::vector<unsigned char> packed(static_cast<size_t>(rows) * stride, 0);
+  Eigen::MatrixXd imputed = Eigen::MatrixXd::Zero(rows, samples);
+  Eigen::VectorXd sample_weights = Eigen::VectorXd::Ones(samples);
+  for(int sample = 0; sample < samples; sample += 11)
+    sample_weights(sample) = 0;
+
+  for(int row = 0; row < rows; ++row) {
+    double observed_sum = 0;
+    int observed_count = 0;
+    for(int sample = 0; sample < samples; ++sample) {
+      unsigned int code = static_cast<unsigned int>(
+        (row * 17 + sample * 13 + sample / 19) & 3);
+      if(sample % 29 == 0) code = 3;
+      packed[static_cast<size_t>(row) * stride + (sample >> 2)] |=
+        static_cast<unsigned char>(code << (2 * (sample & 3)));
+      if(sample_weights(sample) > 0 && code != 3) {
+        observed_sum += code;
+        observed_count++;
+      }
+      imputed(row, sample) = code;
+    }
+    const double mean = observed_sum / observed_count;
+    for(int sample = 0; sample < samples; ++sample) {
+      if(sample_weights(sample) == 0)
+        imputed(row, sample) = 0;
+      else if(imputed(row, sample) == 3)
+        imputed(row, sample) = mean;
+    }
+  }
+
+  Eigen::MatrixXd raw_covariates =
+    deterministic_matrix(samples, 3, 0.37);
+  for(int sample = 0; sample < samples; ++sample)
+    if(sample_weights(sample) == 0)
+      raw_covariates.row(sample).setZero();
+  const Eigen::MatrixXd covariate_gram =
+    raw_covariates.transpose() * raw_covariates;
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> covariate_solver(
+    covariate_gram);
+  if(covariate_solver.info() != Eigen::Success)
+    throw std::runtime_error(
+      "packed hardcall covariate setup failed");
+  const Eigen::MatrixXd covariates = raw_covariates *
+    covariate_solver.eigenvectors() *
+    covariate_solver.eigenvalues().array().sqrt().inverse().matrix().asDiagonal() *
+    covariate_solver.eigenvectors().transpose();
+  const double degrees_of_freedom =
+    sample_weights.sum() - covariates.cols();
+  Eigen::VectorXd expected_scales;
+  const Eigen::VectorXd no_multipliers;
+  reference_preprocess_genotypes(imputed, covariates, sample_weights,
+    degrees_of_freedom, no_multipliers, expected_scales);
+
+  Eigen::VectorXd actual_scales;
+  Step1ComputeTimings preprocess_timings;
+  const bool processed = candidate.preprocess_packed_hardcalls(
+    packed.data(), packed.size(), stride, rows, samples,
+    covariates, sample_weights, degrees_of_freedom, 1e-12,
+    actual_scales, &preprocess_timings);
+  const double preprocessing_tolerance = 3e-11;
+  const double gram_tolerance = gram_conformance_tolerance(
+    candidate, preprocessing_tolerance);
+  const double scale_error =
+    (actual_scales - expected_scales).cwiseAbs().maxCoeff() /
+    std::max(1.0, expected_scales.cwiseAbs().maxCoeff());
+  if(!processed || scale_error > preprocessing_tolerance ||
+     preprocess_timings.packed_hardcall_upload_count != 1 ||
+     preprocess_timings.packed_hardcall_upload_bytes != packed.size() ||
+     !std::isfinite(preprocess_timings.packed_hardcall_expand_ms))
+    throw std::runtime_error(
+      "packed hardcall preprocessing conformance failed");
+
+  const Eigen::MatrixXd outcomes =
+    deterministic_matrix(samples, 2, -0.29);
+  const Eigen::MatrixXd expected_gram = imputed * imputed.transpose();
+  const Eigen::MatrixXd expected_crossproduct = imputed * outcomes;
+  Eigen::MatrixXd actual_gram, actual_crossproduct;
+  Step1ComputeTimings product_timings;
+  candidate.compute_preprocessed_products(0, samples, outcomes,
+    actual_gram, actual_crossproduct, Step1GramMode::full_product,
+    &product_timings);
+  const double gram_error = relative_error(actual_gram, expected_gram);
+  const double crossproduct_error =
+    relative_error(actual_crossproduct, expected_crossproduct);
+  if(gram_error > gram_tolerance ||
+     crossproduct_error > preprocessing_tolerance ||
+     product_timings.resident_reuse_count == 0)
+    throw std::runtime_error(
+      "packed hardcall resident product conformance failed");
+
+  const int slice_start = 7;
+  const int slice_size = 73;
+  const Eigen::MatrixXd slice_outcomes =
+    outcomes.middleRows(slice_start, slice_size);
+  const Eigen::MatrixXd expected_slice =
+    imputed.middleCols(slice_start, slice_size);
+  Step1ComputeTimings slice_timings;
+  candidate.compute_preprocessed_products(
+    slice_start, slice_size, slice_outcomes,
+    actual_gram, actual_crossproduct, Step1GramMode::full_product,
+    &slice_timings);
+  if(relative_error(actual_gram,
+       expected_slice * expected_slice.transpose()) > gram_tolerance ||
+     relative_error(actual_crossproduct,
+       expected_slice * slice_outcomes) > preprocessing_tolerance ||
+     slice_timings.resident_reuse_count == 0)
+    throw std::runtime_error(
+      "packed hardcall resident slice conformance failed");
+
+  std::unique_ptr<Step1ComputeBackend> oracle =
+    make_cpu_step1_compute_backend();
+  candidate.factorize_ridge_system(
+    expected_gram, expected_crossproduct);
+  oracle->factorize_ridge_system(expected_gram, expected_crossproduct);
+  const Eigen::VectorXd ridge_parameters =
+    Eigen::VectorXd::LinSpaced(4, 0.05, 1.25);
+  const Eigen::MatrixXd no_outcomes(0, 0);
+  Eigen::MatrixXd expected_predictions, expected_coefficients;
+  Eigen::MatrixXd actual_predictions, actual_coefficients;
+  oracle->ridge_predict_factorized(expected_slice, true,
+    ridge_parameters, no_outcomes, false,
+    expected_predictions, expected_coefficients);
+  Step1ComputeTimings ridge_timings;
+  candidate.ridge_predict_preprocessed(slice_start, slice_size,
+    ridge_parameters, actual_predictions, actual_coefficients,
+    &ridge_timings);
+  const double prediction_error =
+    relative_error(actual_predictions, expected_predictions);
+  const double coefficient_error =
+    relative_error(actual_coefficients, expected_coefficients);
+  if(prediction_error > preprocessing_tolerance ||
+     coefficient_error > preprocessing_tolerance ||
+     ridge_timings.resident_reuse_count == 0)
+    throw std::runtime_error(
+      "packed hardcall resident ridge conformance failed");
+  candidate.release_preprocessed_genotypes();
+
+  std::cout << "STEP1_BACKEND_TEST case=packed_hardcall_preprocessing"
+            << " supported=1"
+            << " packed_bytes=" << packed.size()
+            << " scale_relative_error=" << scale_error
+            << " gram_relative_error=" << gram_error
+            << " crossproduct_relative_error=" << crossproduct_error
+            << " prediction_relative_error=" << prediction_error
+            << " coefficient_relative_error=" << coefficient_error
+            << " status=PASS\n";
 }
 
 double total_timing_ms(const Step1ComputeTimings& timings) {
@@ -1212,6 +1378,7 @@ void run_conformance(Step1ComputeBackend& candidate) {
   std::cout << "STEP1_BACKEND_TEST case=reusable_state_validation status=PASS\n";
 
   check_genotype_preprocessing(candidate);
+  check_packed_hardcall_preprocessing(candidate);
 
   check_case(candidate, *oracle, genotypes, phenotypes,
     Step1GramMode::full_product, "contiguous_full_product");

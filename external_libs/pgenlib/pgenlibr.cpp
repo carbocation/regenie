@@ -31,6 +31,8 @@
 
 #include "pgenlibr.h"
 
+#include <cstring>
+
 PgenReader::PgenReader() : _info_ptr(nullptr),
                              //_allele_idx_offsetsp(nullptr),
                              _nonref_flagsp(nullptr)
@@ -320,6 +322,42 @@ void PgenReader::ReadHardcalls(double* buf, size_t const& n, int const& thr, int
   plink2::GenoarrLookup16x8bx2(_pgv[thr]->genovec, kGenoRDoublePairs, _subset_size[thr], buf);
 }
 
+void PgenReader::ReadHardcallsPacked(unsigned char* buf,
+  size_t const& byte_count, size_t const& n, int const& thr,
+  int variant_idx, int allele_idx) {
+  if (!_info_ptr) {
+    fprintf(stderr,"pgen is closed");
+    exit(-1);
+  }
+  if (static_cast<uint32_t>(variant_idx) >= _info_ptr->raw_variant_ct) {
+    char errstr_buf[256];
+    sprintf(errstr_buf, "variant_num out of range (%d; must be 1..%u)", variant_idx + 1, _info_ptr->raw_variant_ct);
+    fprintf(stderr,"%s\n", errstr_buf);
+    exit(-1);
+  }
+  if (n != _subset_size[thr]) {
+    char errstr_buf[256];
+    sprintf(errstr_buf, "buf has wrong length (%" PRIdPTR "; %u expected)", n, _subset_size[thr]);
+    fprintf(stderr,"%s\n", errstr_buf);
+    exit(-1);
+  }
+  const size_t required_bytes = (n + 3) / 4;
+  if (!buf || byte_count < required_bytes) {
+    fprintf(stderr,"packed hardcall buffer is too small\n");
+    exit(-1);
+  }
+  plink2::PglErr reterr = PgrGet1(_subset_include_vec[thr],
+    _subset_index[thr], _subset_size[thr], variant_idx, allele_idx,
+    _state_ptr[thr], _pgv[thr]->genovec);
+  if (reterr != plink2::kPglRetSuccess) {
+    char errstr_buf[256];
+    sprintf(errstr_buf, "PgrGet1() error %d", static_cast<int>(reterr));
+    fprintf(stderr,"%s\n", errstr_buf);
+    exit(-1);
+  }
+  std::memcpy(buf, _pgv[thr]->genovec, required_bytes);
+}
+
 void PgenReader::Read(double* buf, size_t const& n, int const& thr, int variant_idx, int allele_idx) {
   if (!_info_ptr) {
     fprintf(stderr,"pgen is closed");
@@ -418,4 +456,3 @@ void PgenReader::SetSampleSubsetInternal(std::vector<int>& sample_subset_1based,
   plink2::PgrSetSampleSubsetIndex(_subset_cumulative_popcounts[thr], _state_ptr[thr], &_subset_index[thr]);
   _subset_size[thr] = subset_size;
 }
-

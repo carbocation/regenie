@@ -80,6 +80,76 @@ bool Step1ComputeBackend::preprocess_genotypes(
   return false;
 }
 
+bool Step1ComputeBackend::can_preprocess_packed_hardcalls(
+  Eigen::Index variants,
+  Eigen::Index samples) const {
+  (void)variants;
+  (void)samples;
+  return false;
+}
+
+bool Step1ComputeBackend::preprocess_packed_hardcalls(
+  const unsigned char* packed_hardcalls,
+  size_t packed_bytes,
+  size_t packed_stride_bytes,
+  Eigen::Index variants,
+  Eigen::Index samples,
+  const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+  const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+  double degrees_of_freedom,
+  double minimum_scale,
+  Eigen::VectorXd& row_scales,
+  Step1ComputeTimings* timings) {
+  (void)packed_hardcalls;
+  (void)packed_bytes;
+  (void)packed_stride_bytes;
+  (void)variants;
+  (void)samples;
+  (void)covariates;
+  (void)sample_weights;
+  (void)degrees_of_freedom;
+  (void)minimum_scale;
+  (void)row_scales;
+  (void)timings;
+  return false;
+}
+
+void Step1ComputeBackend::compute_preprocessed_products(
+  Eigen::Index start_column,
+  Eigen::Index column_count,
+  const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+  Eigen::MatrixXd& gram,
+  Eigen::MatrixXd& crossproduct,
+  Step1GramMode mode,
+  Step1ComputeTimings* timings) {
+  (void)start_column;
+  (void)column_count;
+  (void)phenotypes;
+  (void)gram;
+  (void)crossproduct;
+  (void)mode;
+  (void)timings;
+  throw std::runtime_error(
+    "Step 1 backend has no resident preprocessed genotype block");
+}
+
+void Step1ComputeBackend::ridge_predict_preprocessed(
+  Eigen::Index start_column,
+  Eigen::Index column_count,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  Eigen::MatrixXd& predictions,
+  Eigen::MatrixXd& coefficients,
+  Step1ComputeTimings* timings) {
+  (void)start_column;
+  (void)column_count;
+  (void)ridge_parameters;
+  (void)predictions;
+  (void)coefficients;
+  (void)timings;
+  throw std::runtime_error(
+    "Step 1 backend has no resident preprocessed genotype block");
+}
+
 void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 

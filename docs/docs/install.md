@@ -103,6 +103,17 @@ preprocessing, or raise it deliberately when a larger block fits comfortably
 in device memory. The validation harness exposes the same setting as
 `CUDA_RESIDENT_MB`.
 
+Ordinary k-fold PGEN hardcall runs can avoid materializing and uploading the
+host FP64 genotype matrix entirely. When the resident block fits, the reader
+passes PGEN's native two-bit hardcalls to CUDA; the device then expands,
+masks, mean-imputes, residualizes, and scales the block directly into its
+resident FP64 buffer. A 1,000-variant by 500,000-sample block therefore crosses
+the host/device boundary as approximately 125 MB of hardcalls instead of 4 GB
+of doubles. Dosage mode, LOOCV, `--test-l0`, MAF-dependent priors, CPU runs,
+and blocks above the resident limit retain the general host-matrix path. Set
+`REGENIE_STEP1_PGEN_PACKED=0` to disable this specialization for matched A/B
+validation; the validation harness exposes it as `STEP1_PGEN_PACKED`.
+
 Large resident uploads use two reusable pinned host chunks so host packing can
 overlap transfer to the device. `REGENIE_CUDA_PINNED_STAGING_MB` controls the
 size of each chunk (64 MB by default); set it to `0` to restore direct pageable
@@ -110,8 +121,9 @@ uploads. Pinned staging adds only twice the configured chunk size to host
 memory, independent of the genotype block size.
 
 For CUDA Step 1 runs on PGEN input, the next genotype block is decoded into a
-reusable second host matrix while the current block is processed on the GPU.
-Prefetching is enabled when the additional matrix is no larger than
+reusable second host buffer while the current block is processed on the GPU.
+The buffer holds native packed hardcalls when the specialization above is
+active and an FP64 matrix otherwise. Prefetching is enabled when it is no larger than
 `REGENIE_STEP1_PGEN_PREFETCH_MB` (4,096 MB by default). Set the value to `0` to
 disable prefetching or lower it to cap the additional host-memory allowance.
 The PGEN decoder itself reuses one sample tile per worker and fuses
@@ -178,13 +190,17 @@ fitting, and output. The scope records separate backend compute, transfers, and
 host/orchestration time, making them useful for distinguishing accelerated
 linear algebra from data packing and result assembly. The preprocessing scope
 also records how many blocks used the CUDA path versus the bounded CPU
-fallback, along with pinned staging upload counts and bytes. PGEN-prefetched
+fallback, along with pinned staging upload counts and bytes. Packed-hardcall
+runs additionally report their block count, transfer bytes, and device
+expansion time. PGEN-prefetched
 runs add a `pgen_pipeline` scope containing decoder service, foreground wait,
 and estimated overlap time.
 
 For PGEN Step 1 input, a `pgen_ingest` scope additionally separates aggregate
 worker-thread time inside the pgenlib reader call from subsequent allocation,
-fused validation, copying, allele-frequency calculation, and imputation. These are
+fused validation, copying, allele-frequency calculation, and imputation. The
+scope reports packed variant and byte counts when host materialization is
+skipped. These are
 worker-thread totals and are not additive wall-time stages. On Linux, the same
 scope reports process I/O deltas sampled around each PGEN block:
 `logical_read_bytes` includes reads satisfied by the page cache, while

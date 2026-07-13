@@ -541,11 +541,17 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     }
 
     Step1ComputeTimings ridge_timings;
-    compute_backend->ridge_predict_factorized(
-      Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i)),
-      true, ridge_parameters, no_outcomes, false,
-      batched_predictions, batched_coefficients,
-      params->profile_step1 ? &ridge_timings : nullptr);
+    if(Gblock->step1_pgen_packed_block)
+      compute_backend->ridge_predict_preprocessed(
+        cum_size_folds, params->cv_sizes(i), ridge_parameters,
+        batched_predictions, batched_coefficients,
+        params->profile_step1 ? &ridge_timings : nullptr);
+    else
+      compute_backend->ridge_predict_factorized(
+        Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i)),
+        true, ridge_parameters, no_outcomes, false,
+        batched_predictions, batched_coefficients,
+        params->profile_step1 ? &ridge_timings : nullptr);
     if(params->profile_step1) {
       l0->profile_backend_upload_ms += ridge_timings.upload_ms;
       l0->profile_backend_download_ms += ridge_timings.download_ms;
