@@ -121,6 +121,15 @@ bool step2_bgen_dosage_lookup_enabled() {
     "REGENIE_BGEN_DOSAGE_LOOKUP must be '0' or '1'");
 }
 
+bool step2_bgen_reusable_decompression_enabled() {
+  const char* value =
+    std::getenv("REGENIE_BGEN_REUSABLE_DECOMPRESSION");
+  if(!value || !*value || std::string(value) == "0") return false;
+  if(std::string(value) == "1") return true;
+  throw std::invalid_argument(
+    "REGENIE_BGEN_REUSABLE_DECOMPRESSION must be '0' or '1'");
+}
+
 void build_step1_prediction_groups(
   const std::vector<int>& chromosomes,
   const std::map<int, std::vector<int>>& chromosome_map,
@@ -356,10 +365,16 @@ void Data::print_step2_profile() {
           step2_bgen_parse_profile.fast_path_variants
         << " lookup_path_variants=" <<
           step2_bgen_parse_profile.lookup_path_variants
+        << " reusable_decompression_variants=" <<
+          step2_bgen_parse_profile.reusable_decompression_variants
         << " thread_work_ms=" <<
           step2_variant_compute_profile.parse_thread_ms
         << " decompress_thread_ms=" <<
           step2_bgen_parse_profile.decompress_thread_ms
+        << " decompress_buffer_thread_ms=" <<
+          step2_bgen_parse_profile.decompress_buffer_thread_ms
+        << " decompress_codec_thread_ms=" <<
+          step2_bgen_parse_profile.decompress_codec_thread_ms
         << " header_thread_ms=" <<
           step2_bgen_parse_profile.header_thread_ms
         << " sample_decode_thread_ms=" <<
@@ -3053,6 +3068,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_bgen_lookup_path_enabled =
       step2_bgen_fast_path_eligible &&
       step2_bgen_dosage_lookup_enabled();
+    step2_bgen_reusable_decompression =
+      (params.file_type == "bgen") && params.streamBGEN &&
+      step2_bgen_reusable_decompression_enabled();
     step2_bgen_fast_path_initialized = true;
   }
   const bool qt_phenotypes_have_complete_masks =
@@ -3101,7 +3119,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
           outsize[isnp], &params, &in_filters, pheno_data.masked_indivs,
           pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock,
           block_info, sout, bgen_profile, step2_bgen_fast_path_eligible,
-          step2_bgen_lookup_path_enabled);
+          step2_bgen_lookup_path_enabled,
+          step2_bgen_reusable_decompression);
       }
 
       // to store variant information
@@ -3200,8 +3219,14 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         bgen_parse_profiles[thread].fast_path_variants;
       step2_bgen_parse_profile.lookup_path_variants +=
         bgen_parse_profiles[thread].lookup_path_variants;
+      step2_bgen_parse_profile.reusable_decompression_variants +=
+        bgen_parse_profiles[thread].reusable_decompression_variants;
       step2_bgen_parse_profile.decompress_thread_ms +=
         bgen_parse_profiles[thread].decompress_thread_ms;
+      step2_bgen_parse_profile.decompress_buffer_thread_ms +=
+        bgen_parse_profiles[thread].decompress_buffer_thread_ms;
+      step2_bgen_parse_profile.decompress_codec_thread_ms +=
+        bgen_parse_profiles[thread].decompress_codec_thread_ms;
       step2_bgen_parse_profile.header_thread_ms +=
         bgen_parse_profiles[thread].header_thread_ms;
       step2_bgen_parse_profile.sample_decode_thread_ms +=

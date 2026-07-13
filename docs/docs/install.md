@@ -199,6 +199,13 @@ diverse valid 8-bit genotype-probability pairs to a caller-selected prefix. It
 also writes a matching Oxford sample file and a small JSON manifest; generated
 genotype data remain outside the source tree and are not repository fixtures.
 
+The developer diagnostic `REGENIE_BGEN_REUSABLE_DECOMPRESSION=1` enables an
+experimental streamed-BGEN path that retains one decompression output buffer
+and zlib or zstd decoder context per worker across variants. It is disabled by
+default pending representative performance validation. The `bgen_parse`
+profile reports its coverage and separates output-buffer management from codec
+work so the experiment can be evaluated independently of dosage decoding.
+
 For standard additive autosomal PGEN hardcall association tests, REGENIE fuses
 validation, sample filtering, summary counts, and missingness discovery into a
 single post-decode scan. Specialized modes retain the general path. Set the

@@ -122,6 +122,7 @@ class Data {
     bool step2_bgen_fast_path_initialized = false;
     bool step2_bgen_fast_path_eligible = false;
     bool step2_bgen_lookup_path_enabled = false;
+    bool step2_bgen_reusable_decompression = false;
 
     std::vector < MatrixXb > masked_in_folds;
     std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> > predictions;
