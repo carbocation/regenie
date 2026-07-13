@@ -59,6 +59,11 @@ struct Step1Profile {
   double preprocess_upload_ms = 0;
   double preprocess_download_ms = 0;
   double preprocess_host_orchestration_ms = 0;
+  uint64_t preprocess_pinned_staging_upload_count = 0;
+  uint64_t preprocess_pinned_staging_upload_bytes = 0;
+  uint64_t pgen_prefetched_blocks = 0;
+  double pgen_prefetch_service_ms = 0;
+  double pgen_prefetch_wait_ms = 0;
   double initialization_ms = 0;
   double level0_wall_ms = 0;
   double level1_prepare_ms = 0;

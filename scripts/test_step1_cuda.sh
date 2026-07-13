@@ -18,6 +18,9 @@ stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
 gram_precision="${CUDA_GRAM_PRECISION:-${REGENIE_CUDA_GRAM_PRECISION:-fp64}}"
 fp32_gram_chunk_samples="${CUDA_FP32_GRAM_CHUNK_SAMPLES:-${REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES:-128}}"
+pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
+pgen_prefetch_mb="${STEP1_PGEN_PREFETCH_MB:-${REGENIE_STEP1_PGEN_PREFETCH_MB:-4096}}"
+pgen_tile_variants="${STEP1_PGEN_TILE_VARIANTS:-${REGENIE_STEP1_PGEN_TILE_VARIANTS:-8}}"
 validation_dir="${VALIDATION_DIR:-${build_dir}/${validation_label}-validation}"
 run_synthetic_benchmark="${RUN_SYNTHETIC_BENCHMARK:-0}"
 synthetic_samples="${SYNTHETIC_SAMPLES:-20000}"
@@ -141,6 +144,7 @@ stream_chunk_mb=${stream_chunk_mb} \
 resident_mb=${resident_mb} \
 gram_precision=${gram_precision} \
 fp32_gram_chunk_samples=${fp32_gram_chunk_samples} \
+pinned_staging_mb=${pinned_staging_mb} pgen_prefetch_mb=${pgen_prefetch_mb} pgen_tile_variants=${pgen_tile_variants} \
 run_synthetic_benchmark=${run_synthetic_benchmark} \
 synthetic_samples=${synthetic_samples} synthetic_variants=${synthetic_variants} \
 synthetic_phenotypes=${synthetic_phenotypes} \
@@ -150,6 +154,9 @@ synthetic_max_bed_gb=${synthetic_max_bed_gb}"
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 export REGENIE_CUDA_GRAM_PRECISION="${gram_precision}"
 export REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES="${fp32_gram_chunk_samples}"
+export REGENIE_CUDA_PINNED_STAGING_MB="${pinned_staging_mb}"
+export REGENIE_STEP1_PGEN_PREFETCH_MB="${pgen_prefetch_mb}"
+export REGENIE_STEP1_PGEN_TILE_VARIANTS="${pgen_tile_variants}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then

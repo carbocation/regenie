@@ -47,6 +47,8 @@ struct Step1ComputeTimings {
   double ridge_ms = 0;
   double download_ms = 0;
   uint64_t resident_reuse_count = 0;
+  uint64_t pinned_staging_upload_count = 0;
+  uint64_t pinned_staging_upload_bytes = 0;
 };
 
 class Step1ComputeBackend {

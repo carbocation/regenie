@@ -34,6 +34,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <climits>
 #include <limits>
@@ -137,6 +138,18 @@ Eigen::Index cuda_resident_preprocess_max_elements() {
         1000000 / sizeof(double);
   }
   return std::min<Eigen::Index>(max_elements, INT_MAX);
+}
+
+size_t cuda_pinned_staging_bytes() {
+  const char* value = std::getenv("REGENIE_CUDA_PINNED_STAGING_MB");
+  if(!value || !*value) return size_t(64) * 1000000;
+  char* end = nullptr;
+  const unsigned long long megabytes = std::strtoull(value, &end, 10);
+  if(end == value || *end != '\0' || megabytes >
+      std::numeric_limits<size_t>::max() / 1000000)
+    throw std::invalid_argument(
+      "REGENIE_CUDA_PINNED_STAGING_MB must be a non-negative integer");
+  return static_cast<size_t>(megabytes) * 1000000;
 }
 
 double elapsed_ms(const ComputeClock::time_point& start) {
@@ -336,6 +349,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       : device_(device), handle_(nullptr), solver_handle_(nullptr),
         gram_precision_(cuda_gram_precision()),
         fp32_gram_chunk_samples_(cuda_fp32_gram_chunk_samples()),
+        pinned_staging_chunk_bytes_(cuda_pinned_staging_bytes()),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_fp32_genotypes_(nullptr), d_fp32_gram_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
@@ -357,6 +371,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ridge_vectors_capacity_(0), ridge_values_capacity_(0),
         ridge_rhs_capacity_(0),
         crossproduct_capacity_(0), eigenvalues_capacity_(0), solver_workspace_capacity_(0),
+        pinned_staging_capacity_(0), pinned_staging_available_(true),
         ridge_factorized_size_(-1), ridge_factorized_rhs_count_(0) {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
@@ -375,6 +390,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
     ~CudaStep1ComputeBackend() override {
       cudaSetDevice(device_);
+      for(int index = 0; index < 2; ++index) {
+        if(upload_streams_[index])
+          cudaStreamSynchronize(upload_streams_[index]);
+        if(pinned_staging_[index]) cudaFreeHost(pinned_staging_[index]);
+        if(upload_streams_[index])
+          cudaStreamDestroy(upload_streams_[index]);
+      }
       if(d_preprocess_multipliers_) cudaFree(d_preprocess_multipliers_);
       if(d_preprocess_scales_) cudaFree(d_preprocess_scales_);
       if(d_preprocess_coefficients_) cudaFree(d_preprocess_coefficients_);
@@ -421,6 +443,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          CudaGramPrecision::fp32_products_fp64_accumulation)
         result << ", FP32 Gram chunk " << fp32_gram_chunk_samples_
                << " samples";
+      if(pinned_staging_chunk_bytes_ > 0)
+        result << ", pinned upload staging " <<
+          (pinned_staging_chunk_bytes_ / 1000000.0) << " MB";
       result << ")";
       return result.str();
     }
@@ -487,10 +512,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         packed_covariates.data() : covariates.data();
       ComputeClock::time_point transfer_start;
       if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(d_resident_genotypes_, genotypes.data(),
+      copy_host_to_device_staged(d_resident_genotypes_, genotypes.data(),
         static_cast<size_t>(element_count) * sizeof(double),
-        cudaMemcpyHostToDevice),
-        "copy resident genotype preprocessing block to CUDA device");
+        "copy resident genotype preprocessing block to CUDA device",
+        timings);
       check_cuda(cudaMemcpy(d_preprocess_weights_, sample_weights.data(),
         static_cast<size_t>(columns) * sizeof(double),
         cudaMemcpyHostToDevice),
@@ -2632,6 +2657,89 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    bool ensure_pinned_staging(size_t required_bytes) {
+      if(pinned_staging_chunk_bytes_ == 0 || required_bytes < 65536 ||
+         !pinned_staging_available_)
+        return false;
+      const size_t target_capacity = std::min(
+        pinned_staging_chunk_bytes_, required_bytes);
+      if(pinned_staging_capacity_ >= target_capacity) return true;
+
+      for(int index = 0; index < 2; ++index) {
+        if(upload_streams_[index])
+          check_cuda(cudaStreamSynchronize(upload_streams_[index]),
+            "synchronize pinned upload stream while growing staging");
+        if(pinned_staging_[index]) {
+          check_cuda(cudaFreeHost(pinned_staging_[index]),
+            "cudaFreeHost while growing pinned upload staging");
+          pinned_staging_[index] = nullptr;
+        }
+      }
+      pinned_staging_capacity_ = 0;
+
+      for(int index = 0; index < 2; ++index) {
+        if(!upload_streams_[index])
+          check_cuda(cudaStreamCreateWithFlags(&upload_streams_[index],
+            cudaStreamNonBlocking), "create pinned upload stream");
+        const cudaError_t allocation_status = cudaHostAlloc(
+          &pinned_staging_[index], target_capacity, cudaHostAllocPortable);
+        if(allocation_status == cudaErrorMemoryAllocation) {
+          cudaGetLastError();
+          for(int cleanup = 0; cleanup <= index; ++cleanup) {
+            if(pinned_staging_[cleanup]) {
+              cudaFreeHost(pinned_staging_[cleanup]);
+              pinned_staging_[cleanup] = nullptr;
+            }
+          }
+          pinned_staging_available_ = false;
+          return false;
+        }
+        check_cuda(allocation_status,
+          "allocate pinned upload staging buffer");
+      }
+      pinned_staging_capacity_ = target_capacity;
+      return true;
+    }
+
+    void copy_host_to_device_staged(double* destination,
+      const double* source, size_t bytes, const char* label,
+      Step1ComputeTimings* timings) {
+      if(!ensure_pinned_staging(bytes)) {
+        check_cuda(cudaMemcpy(destination, source, bytes,
+          cudaMemcpyHostToDevice), label);
+        return;
+      }
+
+      bool in_flight[2] = {false, false};
+      size_t offset = 0;
+      size_t chunk_index = 0;
+      while(offset < bytes) {
+        const int slot = static_cast<int>(chunk_index % 2);
+        if(in_flight[slot])
+          check_cuda(cudaStreamSynchronize(upload_streams_[slot]),
+            "synchronize reusable pinned upload staging slot");
+        const size_t chunk_bytes = std::min(
+          pinned_staging_capacity_, bytes - offset);
+        std::memcpy(pinned_staging_[slot],
+          reinterpret_cast<const char*>(source) + offset, chunk_bytes);
+        check_cuda(cudaMemcpyAsync(
+          reinterpret_cast<char*>(destination) + offset,
+          pinned_staging_[slot], chunk_bytes, cudaMemcpyHostToDevice,
+          upload_streams_[slot]), label);
+        in_flight[slot] = true;
+        offset += chunk_bytes;
+        chunk_index++;
+      }
+      for(int slot = 0; slot < 2; ++slot)
+        if(in_flight[slot])
+          check_cuda(cudaStreamSynchronize(upload_streams_[slot]),
+            "finish pinned staged upload");
+      if(timings) {
+        timings->pinned_staging_upload_count++;
+        timings->pinned_staging_upload_bytes += bytes;
+      }
+    }
+
     void accumulate_genotype_gram(const double* genotypes, int rows,
       int columns, Step1GramMode mode, bool first_chunk,
       double fp64_alpha, double fp64_beta) {
@@ -2831,6 +2939,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     cusolverDnHandle_t solver_handle_;
     CudaGramPrecision gram_precision_;
     int fp32_gram_chunk_samples_;
+    size_t pinned_staging_chunk_bytes_;
+    void* pinned_staging_[2] = {nullptr, nullptr};
+    cudaStream_t upload_streams_[2] = {nullptr, nullptr};
     double* d_genotypes_;
     double* d_resident_genotypes_;
     float* d_fp32_genotypes_;
@@ -2876,6 +2987,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     size_t crossproduct_capacity_;
     size_t eigenvalues_capacity_;
     size_t solver_workspace_capacity_;
+    size_t pinned_staging_capacity_;
+    bool pinned_staging_available_;
     size_t ridge_parameters_capacity_ = 0;
     size_t inverse_capacity_ = 0;
     size_t scaled_rhs_capacity_ = 0;

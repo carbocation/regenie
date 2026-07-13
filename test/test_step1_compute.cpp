@@ -124,7 +124,9 @@ void reference_preprocess_genotypes(Eigen::MatrixXd& genotypes,
 
 void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
   const int rows = 13;
-  const int samples = 37;
+  // Slightly larger than a 1 MB upload so validation can force the reusable
+  // two-slot staging path with REGENIE_CUDA_PINNED_STAGING_MB=1.
+  const int samples = 10001;
   Eigen::MatrixXd raw_covariates =
     deterministic_matrix(samples, 3, -0.19);
   Eigen::VectorXd sample_weights = Eigen::VectorXd::Ones(samples);
@@ -294,6 +296,12 @@ void check_genotype_preprocessing(Step1ComputeBackend& candidate) {
               (device_only_processed ? 1 : 0)
             << " device_only_reuses=" <<
               device_only_reuse_timings.resident_reuse_count
+            << " pinned_staging_uploads=" <<
+              (timings.pinned_staging_upload_count +
+                device_only_timings.pinned_staging_upload_count)
+            << " pinned_staging_bytes=" <<
+              (timings.pinned_staging_upload_bytes +
+                device_only_timings.pinned_staging_upload_bytes)
             << " genotype_relative_error=" << genotype_error
             << " scale_relative_error=" << scale_error
             << " gram_relative_error=" << reuse_gram_error
@@ -314,6 +322,10 @@ void accumulate_timings(Step1ComputeTimings& destination,
   destination.ridge_ms += source.ridge_ms;
   destination.download_ms += source.download_ms;
   destination.resident_reuse_count += source.resident_reuse_count;
+  destination.pinned_staging_upload_count +=
+    source.pinned_staging_upload_count;
+  destination.pinned_staging_upload_bytes +=
+    source.pinned_staging_upload_bytes;
 }
 
 double total_timing_ms(const Step1ComputeTimings& timings) {
