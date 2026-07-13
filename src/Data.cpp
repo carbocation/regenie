@@ -593,11 +593,13 @@ void Data::residualize_genotypes() {
       Gblock.snp_afs.col(0).array() *
         (1 - Gblock.snp_afs.col(0).array()),
       0.5 * (params.alpha_prior + 1)).matrix();
+  const double data_setup_ms = elapsed_ms(t1);
 
   Step1ComputeTimings timings;
   const bool copy_preprocessed_genotypes_to_host =
     params.use_loocv || params.test_l0;
   bool backend_processed = false;
+  const ProfileClock::time_point backend_call_start = ProfileClock::now();
   if(Gblock.step1_pgen_packed_block) {
     backend_processed =
       step1_compute_backend->preprocess_packed_hardcalls(
@@ -621,6 +623,7 @@ void Data::residualize_genotypes() {
         row_multipliers, copy_preprocessed_genotypes_to_host, scale_G,
         params.profile_step1 ? &timings : nullptr);
   }
+  const double backend_call_wall_ms = elapsed_ms(backend_call_start);
 
   if(!backend_processed) {
     // mask missing individuals
@@ -660,6 +663,10 @@ void Data::residualize_genotypes() {
     step1_profile.preprocess_backend_compute_ms += timings.preprocess_ms;
     step1_profile.preprocess_upload_ms += timings.upload_ms;
     step1_profile.preprocess_download_ms += timings.download_ms;
+    step1_profile.preprocess_data_setup_ms += data_setup_ms;
+    step1_profile.preprocess_backend_wall_ms += backend_call_wall_ms;
+    step1_profile.preprocess_data_finalize_ms += std::max(
+      0.0, wall_ms - data_setup_ms - backend_call_wall_ms);
     step1_profile.preprocess_pinned_staging_upload_count +=
       timings.pinned_staging_upload_count;
     step1_profile.preprocess_pinned_staging_upload_bytes +=
@@ -670,6 +677,14 @@ void Data::residualize_genotypes() {
       timings.packed_hardcall_upload_bytes;
     step1_profile.preprocess_packed_hardcall_expand_ms +=
       timings.packed_hardcall_expand_ms;
+    step1_profile.preprocess_packed_hardcall_validation_ms +=
+      timings.packed_hardcall_validation_ms;
+    step1_profile.preprocess_packed_hardcall_allocation_ms +=
+      timings.packed_hardcall_allocation_ms;
+    step1_profile.preprocess_packed_hardcall_host_prepare_ms +=
+      timings.packed_hardcall_host_prepare_ms;
+    step1_profile.preprocess_packed_hardcall_backend_wall_ms +=
+      timings.packed_hardcall_backend_wall_ms;
     if(backend_processed)
       step1_profile.preprocess_backend_blocks++;
     else
@@ -1526,7 +1541,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=5 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=6 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -1604,6 +1619,10 @@ void Data::print_step1_profile() {
         step1_profile.preprocess_backend_compute_ms
       << " upload_ms=" << step1_profile.preprocess_upload_ms
       << " download_ms=" << step1_profile.preprocess_download_ms
+      << " data_setup_ms=" << step1_profile.preprocess_data_setup_ms
+      << " backend_wall_ms=" << step1_profile.preprocess_backend_wall_ms
+      << " data_finalize_ms=" <<
+        step1_profile.preprocess_data_finalize_ms
       << " pinned_staging_uploads=" <<
         step1_profile.preprocess_pinned_staging_upload_count
       << " pinned_staging_bytes=" <<
@@ -1614,6 +1633,22 @@ void Data::print_step1_profile() {
         step1_profile.preprocess_packed_hardcall_upload_bytes
       << " packed_hardcall_expand_ms=" <<
         step1_profile.preprocess_packed_hardcall_expand_ms
+      << " packed_hardcall_validation_ms=" <<
+        step1_profile.preprocess_packed_hardcall_validation_ms
+      << " packed_hardcall_allocation_ms=" <<
+        step1_profile.preprocess_packed_hardcall_allocation_ms
+      << " packed_hardcall_host_prepare_ms=" <<
+        step1_profile.preprocess_packed_hardcall_host_prepare_ms
+      << " packed_hardcall_backend_wall_ms=" <<
+        step1_profile.preprocess_packed_hardcall_backend_wall_ms
+      << " packed_hardcall_backend_unaccounted_ms=" << std::max(
+        0.0, step1_profile.preprocess_packed_hardcall_backend_wall_ms -
+          step1_profile.preprocess_packed_hardcall_validation_ms -
+          step1_profile.preprocess_packed_hardcall_allocation_ms -
+          step1_profile.preprocess_packed_hardcall_host_prepare_ms -
+          step1_profile.preprocess_upload_ms -
+          step1_profile.preprocess_backend_compute_ms -
+          step1_profile.preprocess_download_ms)
       << " host_orchestration_ms=" <<
         step1_profile.preprocess_host_orchestration_ms
       << "\n";
