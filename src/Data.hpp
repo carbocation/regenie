@@ -134,6 +134,7 @@ class Data {
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
     MultiPhen mphen;
     Step1Profile step1_profile;
+    Step1PgenReadProfile step1_pgen_read_profile;
     Step2Profile step2_profile;
     Step2PgenReadProfile step2_pgen_read_profile;
     Step2BgenParseProfile step2_bgen_parse_profile;

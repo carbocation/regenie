@@ -27,6 +27,7 @@
 #include <limits.h> /* for PATH_MAX */
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 
@@ -96,6 +97,56 @@ class ScopedProfileTimer {
     double* elapsed_ms_;
     ProfileClock::time_point start_;
 };
+
+struct ProcessIoCounters {
+  bool available = false;
+  uint64_t logical_read_bytes = 0;
+  uint64_t physical_read_bytes = 0;
+  uint64_t read_syscalls = 0;
+};
+
+ProcessIoCounters read_process_io_counters() {
+  ProcessIoCounters counters;
+#if defined(__linux__)
+  std::ifstream input("/proc/self/io");
+  std::string key;
+  uint64_t value = 0;
+  bool found_logical_read_bytes = false;
+  bool found_physical_read_bytes = false;
+  bool found_read_syscalls = false;
+  while(input >> key >> value) {
+    if(key == "rchar:") {
+      counters.logical_read_bytes = value;
+      found_logical_read_bytes = true;
+    } else if(key == "read_bytes:") {
+      counters.physical_read_bytes = value;
+      found_physical_read_bytes = true;
+    } else if(key == "syscr:") {
+      counters.read_syscalls = value;
+      found_read_syscalls = true;
+    }
+  }
+  counters.available = found_logical_read_bytes &&
+    found_physical_read_bytes && found_read_syscalls;
+#endif
+  return counters;
+}
+
+void accumulate_process_io_delta(
+  const ProcessIoCounters& before,
+  const ProcessIoCounters& after,
+  Step1PgenReadProfile* profile) {
+  if(!profile || !before.available || !after.available) return;
+  if(after.logical_read_bytes < before.logical_read_bytes ||
+     after.physical_read_bytes < before.physical_read_bytes ||
+     after.read_syscalls < before.read_syscalls) return;
+  profile->io_samples++;
+  profile->logical_read_bytes +=
+    after.logical_read_bytes - before.logical_read_bytes;
+  profile->physical_read_bytes +=
+    after.physical_read_bytes - before.physical_read_bytes;
+  profile->read_syscalls += after.read_syscalls - before.read_syscalls;
+}
 
 bool step2_unscaled_dense_qt_enabled() {
   const char* value = std::getenv("REGENIE_STEP2_UNSCALED_DENSE_QT");
@@ -978,10 +1029,19 @@ void Data::level_0_calculations() {
       Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
       if(params.alpha_prior != -1) Gblock.snp_afs = MatrixXd::Zero(bs, 1);
 
+      Step1PgenReadProfile* pgen_profile =
+        params.profile_step1 && params.file_type == "pgen" ?
+        &step1_pgen_read_profile : nullptr;
+      const ProcessIoCounters io_before = pgen_profile ?
+        read_process_io_counters() : ProcessIoCounters();
       ProfileClock::time_point stage_start;
       if(params.profile_step1) stage_start = ProfileClock::now();
-      get_G(block, bs, chrom, in_filters.step1_snp_count, snpinfo, &params, &files, &Gblock, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, sout);
+      get_G(block, bs, chrom, in_filters.step1_snp_count, snpinfo, &params, &files, &Gblock, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, sout, pgen_profile);
       if(params.profile_step1) step1_profile.decode_ms += elapsed_ms(stage_start);
+      if(pgen_profile) {
+        accumulate_process_io_delta(
+          io_before, read_process_io_counters(), pgen_profile);
+      }
 
       // residualize and scale genotypes
       if(params.profile_step1) stage_start = ProfileClock::now();
@@ -1232,6 +1292,32 @@ void Data::print_step1_profile() {
   print_stage("ridge", step1_profile.ridge_ms);
   print_stage("other", other_ms);
   print_stage("block_total", step1_profile.total_ms);
+  if(step1_pgen_read_profile.variants > 0) {
+    const double post_reader_thread_ms = std::max(
+      0.0, step1_pgen_read_profile.thread_work_ms -
+        step1_pgen_read_profile.reader_call_thread_ms);
+    const double pgen_denominator =
+      step1_pgen_read_profile.thread_work_ms > 0 ?
+      step1_pgen_read_profile.thread_work_ms : 1;
+    out << "STEP1_PROFILE scope=pgen_ingest"
+        << " variants=" << step1_pgen_read_profile.variants
+        << " thread_work_ms=" << step1_pgen_read_profile.thread_work_ms
+        << " reader_call_thread_ms=" <<
+          step1_pgen_read_profile.reader_call_thread_ms
+        << " post_reader_thread_ms=" << post_reader_thread_ms
+        << " reader_call_percent=" <<
+          (100 * step1_pgen_read_profile.reader_call_thread_ms /
+            pgen_denominator)
+        << " post_reader_percent=" <<
+          (100 * post_reader_thread_ms / pgen_denominator)
+        << " io_samples=" << step1_pgen_read_profile.io_samples
+        << " logical_read_bytes=" <<
+          step1_pgen_read_profile.logical_read_bytes
+        << " physical_read_bytes=" <<
+          step1_pgen_read_profile.physical_read_bytes
+        << " read_syscalls=" << step1_pgen_read_profile.read_syscalls
+        << "\n";
+  }
   out << "STEP1_PROFILE scope=genotype_preprocess"
       << " backend_blocks=" << step1_profile.preprocess_backend_blocks
       << " fallback_blocks=" << step1_profile.preprocess_fallback_blocks

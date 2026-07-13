@@ -1570,7 +1570,7 @@ void check_ld_list(map <string, uint32_t>& map_ID, struct in_files* files, struc
 }
 
 // only used in step 1
-void get_G(const int& block, const int& bs, const int& chrom, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct in_files* files, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, mstream& sout){
+void get_G(const int& block, const int& bs, const int& chrom, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct in_files* files, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, mstream& sout, Step1PgenReadProfile* pgen_profile){
 
   auto t1 = std::chrono::high_resolution_clock::now();
   sout << " block [" << block + 1 << "] : " << flush;
@@ -1578,7 +1578,7 @@ void get_G(const int& block, const int& bs, const int& chrom, const uint32_t& sn
   if(params->file_type == "bed")
     readChunkFromBedFileToG(bs, chrom, snpcount, snpinfo, params, files, gblock, filters, masked_indivs, phenotypes_raw, sout);
   else if(params->file_type == "pgen")
-    readChunkFromPGENFileToG(bs, snpcount, snpinfo, params, gblock, filters, masked_indivs, sout);
+    readChunkFromPGENFileToG(bs, snpcount, snpinfo, params, gblock, filters, masked_indivs, sout, pgen_profile);
   else if(params->streamBGEN)
     readChunkFromBGENFileToG_fast(bs, chrom, snpcount, snpinfo, params, files, gblock, filters, masked_indivs, phenotypes_raw, sout);
   else
@@ -1845,9 +1845,13 @@ void readChunkFromBedFileToG(const int& bs, const int& chrom, const uint32_t& sn
 
 
 // only for step 1
-void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, mstream& sout) {
+void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, mstream& sout, Step1PgenReadProfile* profile) {
 
   ArrayXb oob_err = ArrayXb::Constant(bs, false);
+  vector<double> thread_work_ms(
+    profile ? params->neff_threads : 0, 0);
+  vector<double> reader_call_thread_ms(
+    profile ? params->neff_threads : 0, 0);
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -1859,7 +1863,8 @@ void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<sn
 #if defined(_OPENMP)
     thread_num = omp_get_thread_num();
 #endif
-    //cerr << "#" << thread_num << endl;
+    ScopedThreadWorkTimer thread_work_timer(
+      profile ? &thread_work_ms[thread_num] : nullptr);
 
     double total;
     ArrayXb keep_indices;
@@ -1867,10 +1872,14 @@ void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<sn
     ArrayXd g (params->n_samples, 1);
 
     // read genotype data
-    if( params->dosage_mode ){
-      gblock->pgr.Read(g.data(), params->n_samples, thread_num, snpinfo[snpcount+j].offset, 1);
-    } else
-      gblock->pgr.ReadHardcalls(g.data(), params->n_samples, thread_num, snpinfo[snpcount+j].offset, 1);
+    {
+      ScopedThreadWorkTimer reader_call_timer(
+        profile ? &reader_call_thread_ms[thread_num] : nullptr);
+      if( params->dosage_mode ){
+        gblock->pgr.Read(g.data(), params->n_samples, thread_num, snpinfo[snpcount+j].offset, 1);
+      } else
+        gblock->pgr.ReadHardcalls(g.data(), params->n_samples, thread_num, snpinfo[snpcount+j].offset, 1);
+    }
 
     oob_err(j) = ((g < -3) || (g > 2)).any();
     if(oob_err(j)) continue;
@@ -1890,6 +1899,14 @@ void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<sn
 #if defined(_OPENMP)
   setNbThreads(params->threads);
 #endif
+
+  if(profile) {
+    profile->variants += bs;
+    profile->thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    profile->reader_call_thread_ms += std::accumulate(
+      reader_call_thread_ms.begin(), reader_call_thread_ms.end(), 0.0);
+  }
 
   if(oob_err.any()) 
     throw "there is a variant in the block that has a value not in [0,2] or missing";

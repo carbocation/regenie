@@ -161,6 +161,15 @@ linear algebra from data packing and result assembly. The preprocessing scope
 also records how many blocks used the CUDA path versus the bounded CPU
 fallback.
 
+For PGEN Step 1 input, a `pgen_ingest` scope additionally separates aggregate
+worker-thread time inside the pgenlib reader call from subsequent allocation,
+validation, copying, allele-frequency calculation, and imputation. These are
+worker-thread totals and are not additive wall-time stages. On Linux, the same
+scope reports process I/O deltas sampled around each PGEN block:
+`logical_read_bytes` includes reads satisfied by the page cache, while
+`physical_read_bytes` counts storage-backed reads reported by `/proc/self/io`.
+The I/O fields remain zero on platforms without those counters.
+
 Application runs using `--step2-profile` report additive wall time for setup,
 LOCO prediction loading, per-chromosome null models, genotype I/O, variant
 computation, and result output. Records also include the input format, trait
