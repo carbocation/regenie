@@ -161,6 +161,7 @@ rgcmd="--step 2 \
   --bt \
   --firth --approx \
   --pThresh 0.01 \
+  --step2-profile \
   --pred ${mntpt}test/fit_bin_out_pred.list \
   $arg_gz \
   --out ${mntpt}test/test_bin_out_firth"
@@ -173,9 +174,14 @@ if [ -f ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie.gz ]; then
   ( zcat < ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie
 fi
 
-if [ "`cat ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie | wc -l`" != "1001" ]
-then
+if [ "`cat ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie | wc -l`" != "1001" ]; then
   print_err
+elif [ "`grep -c '^STEP2_PROFILE stage=' ${REGENIE_PATH}test/test_bin_out_firth.log`" != "8" ]; then
+  print_custom_err "Step 2 profiling output is incomplete."
+elif ! grep -q '^STEP2_PROFILE version=1 mode=single_variant file_type=bgen trait=bt ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
+  print_custom_err "Step 2 profiling header is missing."
+elif ! grep -q '^STEP2_PROFILE_FINAL version=1 mode=single_variant ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
+  print_custom_err "Step 2 final profiling output is missing."
 fi
 
 

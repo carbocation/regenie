@@ -161,6 +161,13 @@ linear algebra from data packing and result assembly. The preprocessing scope
 also records how many blocks used the CUDA path versus the bounded CPU
 fallback.
 
+Application runs using `--step2-profile` report additive wall time for setup,
+LOCO prediction loading, per-chromosome null models, genotype I/O, variant
+computation, and result output. Records also include the input format, trait
+mode, workload dimensions, and counts of corrected and failed tests. For
+streamed BGEN input, decompression and parsing performed by worker threads are
+included in `variant_compute`; `genotype_io` covers the preceding block read.
+
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy
 is installed, with a dependency-free Python fallback. Its default tolerances

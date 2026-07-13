@@ -233,7 +233,8 @@ struct param {
   bool t2e_l1_pi6 = false;
   bool cox_nofirth = false;
   bool coxscore_exact = false;
-  bool verbose = false, debug = false, profile_step1 = false;
+  bool verbose = false, debug = false, profile_step1 = false,
+    profile_step2 = false;
   std::string compute_backend = "cpu";
   int gpu_device = 0;
   bool early_exit = false, l1_full_samples = false, rint = false, rerint = false, rerintcov = false;

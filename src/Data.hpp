@@ -67,6 +67,21 @@ struct Step1Profile {
   double end_to_end_ms = 0;
 };
 
+struct Step2Profile {
+  uint64_t chromosomes = 0;
+  uint64_t blocks = 0;
+  uint64_t variants = 0;
+  uint64_t corrected_tests = 0;
+  uint64_t failed_tests = 0;
+  double setup_ms = 0;
+  double prediction_read_ms = 0;
+  double null_model_ms = 0;
+  double genotype_io_ms = 0;
+  double variant_compute_ms = 0;
+  double output_ms = 0;
+  double end_to_end_ms = 0;
+};
+
 class Data {
 
   public:
@@ -104,12 +119,14 @@ class Data {
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
     MultiPhen mphen;
     Step1Profile step1_profile;
+    Step2Profile step2_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions
     void run();
     void run_step1();
     void run_step2();
+    void print_step2_profile();
 
     void file_read_initialization();
     void residualize_genotypes();

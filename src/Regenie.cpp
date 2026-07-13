@@ -258,6 +258,7 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
   AllOptions.add_options("Additional")
     ("v,verbose", "verbose screen output")
     ("step1-profile", "output structured timing data for step 1 level 0")
+    ("step2-profile", "output structured timing data for step 2")
     ("compute-backend", "Step 1 compute backend: cpu, cuda, or auto", cxxopts::value<std::string>(params->compute_backend),"STRING(=cpu)")
     ("gpu-device", "CUDA device index for the Step 1 compute backend", cxxopts::value<int>(params->gpu_device),"INT(=0)")
     ("version", "print version number and exit")
@@ -462,6 +463,7 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
     if( vm.count("tpheno-file") ) params->transposedPheno = true;
     if( vm.count("v") ) params->verbose = true;
     if( vm.count("step1-profile") ) params->profile_step1 = true;
+    if( vm.count("step2-profile") ) params->profile_step2 = true;
     if( vm.count("debug") ) params->verbose = params->debug = true;
     if( vm.count("range") ) params->set_range = true;
     if( vm.count("print") ) params->print_block_betas = true;
@@ -907,6 +909,11 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
       sout << "WARNING: option --step1-profile is only available in step 1.\n";
       params->profile_step1 = false;
       valid_args[ "step1-profile" ] = false;
+    }
+    if(!params->test_mode && params->profile_step2) {
+      sout << "WARNING: option --step2-profile is only available in step 2.\n";
+      params->profile_step2 = false;
+      valid_args[ "step2-profile" ] = false;
     }
     if(params->compute_backend != "cpu" && params->compute_backend != "cuda" && params->compute_backend != "auto")
       throw "--compute-backend must be one of: cpu, cuda, auto";
