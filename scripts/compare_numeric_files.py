@@ -55,6 +55,14 @@ def parse_args():
         default="auto",
         help="comparison engine (default: NumPy when installed, otherwise Python)",
     )
+    parser.add_argument(
+        "--report-all",
+        action="store_true",
+        help=(
+            "scan the complete files and report aggregate numerical differences "
+            "before returning a failing status"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,6 +104,16 @@ def numpy_values(line):
     return values
 
 
+def numpy_significant_digit_quantum(values, digits):
+    quantums = np.zeros(values.shape, dtype=np.float64)
+    nonzero = np.isfinite(values) & (values != 0)
+    quantums[nonzero] = np.power(
+        10.0,
+        np.floor(np.log10(np.abs(values[nonzero]))) - digits + 1,
+    )
+    return quantums
+
+
 def compare_numpy_lines(expected_line, actual_line, line_number, args):
     expected_values = numpy_values(expected_line)
     actual_values = numpy_values(actual_line)
@@ -132,31 +150,77 @@ def compare_numpy_lines(expected_line, actual_line, line_number, args):
         ),
     )
 
-    candidates = np.flatnonzero(errors > tolerances)
-    for candidate in candidates:
-        tolerance = tolerances[candidate]
-        if args.output_significant_digits:
-            tolerance = max(
-                tolerance,
-                significant_digit_quantum(
-                    expected_values[candidate], args.output_significant_digits
-                )
-                * (1.0 + 1e-9),
-                significant_digit_quantum(
-                    actual_values[candidate], args.output_significant_digits
-                )
-                * (1.0 + 1e-9),
-            )
-        if errors[candidate] > tolerance:
-            column = int(candidate) + 1
-            raise SystemExit(
-                f"numeric difference at line {line_number}, column {column}: "
-                f"{expected_values[candidate]} != {actual_values[candidate]} "
-                f"(absolute error {errors[candidate]}, tolerance {tolerance})"
-            )
+    if args.output_significant_digits:
+        serialization_tolerances = np.maximum(
+            numpy_significant_digit_quantum(
+                expected_values, args.output_significant_digits
+            ),
+            numpy_significant_digit_quantum(
+                actual_values, args.output_significant_digits
+            ),
+        )
+        tolerances = np.maximum(
+            tolerances, serialization_tolerances * (1.0 + 1e-9)
+        )
+
+    failures = errors > tolerances
+    if np.any(failures) and not args.report_all:
+        candidate = int(np.flatnonzero(failures)[0])
+        column = candidate + 1
+        raise SystemExit(
+            f"numeric difference at line {line_number}, column {column}: "
+            f"{expected_values[candidate]} != {actual_values[candidate]} "
+            f"(absolute error {errors[candidate]}, "
+            f"tolerance {tolerances[candidate]})"
+        )
+
+    denominators = np.maximum(np.abs(expected_values), np.abs(actual_values))
+    relative_errors = np.zeros(expected_values.shape, dtype=np.float64)
+    np.divide(
+        errors,
+        denominators,
+        out=relative_errors,
+        where=finite & (denominators > 0),
+    )
+    tolerance_ratios = np.zeros(expected_values.shape, dtype=np.float64)
+    np.divide(
+        errors,
+        tolerances,
+        out=tolerance_ratios,
+        where=tolerances > 0,
+    )
+    tolerance_ratios[(tolerances == 0) & (errors > 0)] = np.inf
+
+    worst = None
+    if np.any(failures):
+        failure_indices = np.flatnonzero(failures)
+        candidate = int(
+            failure_indices[np.argmax(tolerance_ratios[failure_indices])]
+        )
+        worst = (
+            line_number,
+            candidate + 1,
+            float(expected_values[candidate]),
+            float(actual_values[candidate]),
+            float(errors[candidate]),
+            float(tolerances[candidate]),
+            float(relative_errors[candidate]),
+            float(tolerance_ratios[candidate]),
+        )
 
     maximum_error = float(errors.max()) if errors.size else 0.0
-    return int(expected_values.size), maximum_error
+    maximum_relative_error = (
+        float(relative_errors.max()) if relative_errors.size else 0.0
+    )
+    return {
+        "values": int(expected_values.size),
+        "maximum_error": maximum_error,
+        "maximum_relative_error": maximum_relative_error,
+        "differing_values": int(np.count_nonzero(errors)),
+        "tolerance_failures": int(np.count_nonzero(failures)),
+        "sum_squared_error": float(np.dot(errors, errors)),
+        "worst": worst,
+    }
 
 
 def main():
@@ -165,7 +229,12 @@ def main():
         raise SystemExit("NumPy comparison engine requested but NumPy is not installed")
     use_numpy = args.engine != "python" and np is not None
     maximum_error = 0.0
+    maximum_relative_error = 0.0
     numeric_values = 0
+    differing_values = 0
+    tolerance_failures = 0
+    sum_squared_error = 0.0
+    worst = None
     missing = object()
     with args.expected.open(encoding="utf-8") as expected_file, args.actual.open(
         encoding="utf-8"
@@ -209,9 +278,22 @@ def main():
                     expected_line, actual_line, line_number, args
                 )
                 if comparison is not None:
-                    line_values, line_error = comparison
-                    numeric_values += line_values
-                    maximum_error = max(maximum_error, line_error)
+                    numeric_values += comparison["values"]
+                    maximum_error = max(
+                        maximum_error, comparison["maximum_error"]
+                    )
+                    maximum_relative_error = max(
+                        maximum_relative_error,
+                        comparison["maximum_relative_error"],
+                    )
+                    differing_values += comparison["differing_values"]
+                    tolerance_failures += comparison["tolerance_failures"]
+                    sum_squared_error += comparison["sum_squared_error"]
+                    line_worst = comparison["worst"]
+                    if line_worst is not None and (
+                        worst is None or line_worst[7] > worst[7]
+                    ):
+                        worst = line_worst
                     continue
 
             expected_tokens = expected_line.split()
@@ -246,6 +328,14 @@ def main():
                     )
                 error = abs(expected_value - actual_value)
                 maximum_error = max(maximum_error, error)
+                if error > 0:
+                    differing_values += 1
+                sum_squared_error += error * error
+                denominator = max(abs(expected_value), abs(actual_value))
+                relative_error_value = error / denominator if denominator else 0.0
+                maximum_relative_error = max(
+                    maximum_relative_error, relative_error_value
+                )
                 tolerance = max(
                     args.atol,
                     args.rtol * max(abs(expected_value), abs(actual_value)),
@@ -263,22 +353,63 @@ def main():
                         * (1.0 + 1e-9),
                     )
                 if error > tolerance:
-                    raise SystemExit(
-                        f"numeric difference at line {line_number}, column {column}: "
-                        f"{expected_value} != {actual_value} "
-                        f"(absolute error {error}, tolerance {tolerance})"
+                    tolerance_failures += 1
+                    tolerance_ratio = error / tolerance if tolerance else math.inf
+                    difference = (
+                        line_number,
+                        column,
+                        expected_value,
+                        actual_value,
+                        error,
+                        tolerance,
+                        relative_error_value,
+                        tolerance_ratio,
                     )
+                    if worst is None or tolerance_ratio > worst[7]:
+                        worst = difference
+                    if not args.report_all:
+                        raise SystemExit(
+                            f"numeric difference at line {line_number}, "
+                            f"column {column}: {expected_value} != {actual_value} "
+                            f"(absolute error {error}, tolerance {tolerance})"
+                        )
 
     serialization = (
         f" output_significant_digits={args.output_significant_digits}"
         if args.output_significant_digits
         else ""
     )
-    print(
-        f"NUMERIC_FILE_COMPARE status=PASS values={numeric_values} "
-        f"maximum_absolute_error={maximum_error}{serialization} "
-        f"engine={'numpy' if use_numpy else 'python'}"
-    )
+    engine = "numpy" if use_numpy else "python"
+    if args.report_all:
+        rms_error = math.sqrt(sum_squared_error / numeric_values) if numeric_values else 0
+        status = "FAIL" if tolerance_failures else "PASS"
+        summary = (
+            f"NUMERIC_FILE_COMPARE status={status} values={numeric_values} "
+            f"differing_values={differing_values} "
+            f"tolerance_failures={tolerance_failures} "
+            f"maximum_absolute_error={maximum_error} "
+            f"maximum_relative_error={maximum_relative_error} "
+            f"root_mean_squared_error={rms_error}{serialization} "
+            f"engine={engine}"
+        )
+        if worst is not None:
+            summary += (
+                f" worst_line={worst[0]} worst_column={worst[1]} "
+                f"worst_expected={worst[2]} worst_actual={worst[3]} "
+                f"worst_absolute_error={worst[4]} "
+                f"worst_tolerance={worst[5]} "
+                f"worst_relative_error={worst[6]} "
+                f"worst_tolerance_ratio={worst[7]}"
+            )
+        print(summary)
+        if tolerance_failures:
+            raise SystemExit(1)
+    else:
+        print(
+            f"NUMERIC_FILE_COMPARE status=PASS values={numeric_values} "
+            f"maximum_absolute_error={maximum_error}{serialization} "
+            f"engine={engine}"
+        )
 
 
 if __name__ == "__main__":
