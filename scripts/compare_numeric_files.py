@@ -209,6 +209,17 @@ def compare_numpy_lines(expected_line, actual_line, line_number, args):
         )
 
     maximum_error = float(errors.max()) if errors.size else 0.0
+    maximum = None
+    if maximum_error > 0:
+        candidate = int(np.argmax(errors))
+        maximum = (
+            line_number,
+            candidate + 1,
+            float(expected_values[candidate]),
+            float(actual_values[candidate]),
+            float(errors[candidate]),
+            float(relative_errors[candidate]),
+        )
     maximum_relative_error = (
         float(relative_errors.max()) if relative_errors.size else 0.0
     )
@@ -219,6 +230,7 @@ def compare_numpy_lines(expected_line, actual_line, line_number, args):
         "differing_values": int(np.count_nonzero(errors)),
         "tolerance_failures": int(np.count_nonzero(failures)),
         "sum_squared_error": float(np.dot(errors, errors)),
+        "maximum": maximum,
         "worst": worst,
     }
 
@@ -234,6 +246,7 @@ def main():
     differing_values = 0
     tolerance_failures = 0
     sum_squared_error = 0.0
+    maximum = None
     worst = None
     missing = object()
     with args.expected.open(encoding="utf-8") as expected_file, args.actual.open(
@@ -279,9 +292,12 @@ def main():
                 )
                 if comparison is not None:
                     numeric_values += comparison["values"]
-                    maximum_error = max(
-                        maximum_error, comparison["maximum_error"]
-                    )
+                    line_maximum = comparison["maximum"]
+                    if line_maximum is not None and (
+                        maximum is None or line_maximum[4] > maximum[4]
+                    ):
+                        maximum = line_maximum
+                        maximum_error = line_maximum[4]
                     maximum_relative_error = max(
                         maximum_relative_error,
                         comparison["maximum_relative_error"],
@@ -327,7 +343,6 @@ def main():
                         f"column {column}: {expected_token!r} != {actual_token!r}"
                     )
                 error = abs(expected_value - actual_value)
-                maximum_error = max(maximum_error, error)
                 if error > 0:
                     differing_values += 1
                 sum_squared_error += error * error
@@ -336,6 +351,16 @@ def main():
                 maximum_relative_error = max(
                     maximum_relative_error, relative_error_value
                 )
+                if error > 0 and (maximum is None or error > maximum[4]):
+                    maximum = (
+                        line_number,
+                        column,
+                        expected_value,
+                        actual_value,
+                        error,
+                        relative_error_value,
+                    )
+                    maximum_error = error
                 tolerance = max(
                     args.atol,
                     args.rtol * max(abs(expected_value), abs(actual_value)),
@@ -392,6 +417,14 @@ def main():
             f"root_mean_squared_error={rms_error}{serialization} "
             f"engine={engine}"
         )
+        if maximum is not None:
+            summary += (
+                f" maximum_absolute_line={maximum[0]} "
+                f"maximum_absolute_column={maximum[1]} "
+                f"maximum_absolute_expected={maximum[2]} "
+                f"maximum_absolute_actual={maximum[3]} "
+                f"maximum_absolute_relative_error={maximum[5]}"
+            )
         if worst is not None:
             summary += (
                 f" worst_line={worst[0]} worst_column={worst[1]} "
