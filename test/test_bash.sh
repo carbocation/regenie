@@ -180,6 +180,8 @@ elif [ "`grep -c '^STEP2_PROFILE stage=' ${REGENIE_PATH}test/test_bin_out_firth.
   print_custom_err "Step 2 profiling output is incomplete."
 elif ! grep -q '^STEP2_PROFILE version=1 mode=single_variant file_type=bgen trait=bt ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
   print_custom_err "Step 2 profiling header is missing."
+elif ! grep -q '^STEP2_PROFILE scope=bgen_parse variants=1000 ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
+  print_custom_err "Step 2 BGEN parsing profile is missing."
 elif ! grep -q '^STEP2_PROFILE_FINAL version=1 mode=single_variant ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
   print_custom_err "Step 2 final profiling output is missing."
 fi

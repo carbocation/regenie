@@ -2206,20 +2206,20 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
 
 }
 
-void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
+void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, Step2BgenParseProfile* bgen_profile){
 
   if( ((params->file_type == "bgen") && !params->streamBGEN) || params->file_type == "pgen")
     return;
 
   if(params->file_type == "bgen") // uncompress and extract the dosages
-    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout);
+    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_profile);
   else if(params->file_type == "bed") // extract hardcalls
     parseSnpfromBed(isnp, chrom, *geno_block, params, filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data);
 
 }
 
 
-void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
+void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, Step2BgenParseProfile* bgen_profile){
 
   uint minploidy = 0, maxploidy = 0, phasing = 0, bits_prob = 0;
   uint16_t numberOfAlleles = 0 ;
@@ -2231,56 +2231,66 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   Geno = 0;
   // reset variant info
   prep_snp_stats(snp_data, params);
+  if(bgen_profile) bgen_profile->variants++;
 
   // set genotype data block
   vector < uchar > geno_block_uncompressed;
-  geno_block_uncompressed.resize(outsize);
+  {
+    ScopedThreadWorkTimer decompress_timer(bgen_profile ?
+      &bgen_profile->decompress_thread_ms : nullptr);
+    geno_block_uncompressed.resize(outsize);
 
-  // uncompress the block
-  bool compress_fail;
-  if(params->zlib_compress){ // using zlib
-    uLongf dest_size = outsize;
-    compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize - 4) != Z_OK) || (dest_size != outsize);
-  } else { // using zstd
-    size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
-    //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
-    compress_fail = (dest_size != outsize);
+    // uncompress the block
+    bool compress_fail;
+    if(params->zlib_compress){ // using zlib
+      uLongf dest_size = outsize;
+      compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize - 4) != Z_OK) || (dest_size != outsize);
+    } else { // using zstd
+      size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
+      //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
+      compress_fail = (dest_size != outsize);
+    }
+    // check it was successful
+    if( compress_fail )
+      throw "failed to decompress genotype data block for variant: " + infosnp->ID;
   }
-  // check it was successful
-  if( compress_fail )
-    throw "failed to decompress genotype data block for variant: " + infosnp->ID;
 
-  // stream to uncompressed block
-  uchar *buffer = &geno_block_uncompressed[0];
-  // sample size in file
-  std::memcpy(&nindivs, &(buffer[0]), 4);
-  assert( nindivs == filters->ind_ignore.size() );
-  buffer += 4;
-  // num alleles
-  std::memcpy(&numberOfAlleles, &(buffer[0]), 2);
-  assert( numberOfAlleles == 2 );
-  buffer += 2;
-  // ploidy
-  std::memcpy(&minploidy, &(buffer[0]), 1);
-  assert( minploidy == 2 );
-  buffer ++;
-  std::memcpy(&maxploidy, &(buffer[0]), 1);
-  assert( maxploidy == 2 );
-  buffer ++;
-
-  //to identify missing when getting dosages
+  uchar *buffer = nullptr;
   vector < uchar > ploidy_n;
-  ploidy_n.resize( nindivs );
-  std::memcpy(&(ploidy_n[0]), &(buffer[0]), nindivs);
-  buffer += nindivs;
+  {
+    ScopedThreadWorkTimer header_timer(bgen_profile ?
+      &bgen_profile->header_thread_ms : nullptr);
+    // stream to uncompressed block
+    buffer = &geno_block_uncompressed[0];
+    // sample size in file
+    std::memcpy(&nindivs, &(buffer[0]), 4);
+    assert( nindivs == filters->ind_ignore.size() );
+    buffer += 4;
+    // num alleles
+    std::memcpy(&numberOfAlleles, &(buffer[0]), 2);
+    assert( numberOfAlleles == 2 );
+    buffer += 2;
+    // ploidy
+    std::memcpy(&minploidy, &(buffer[0]), 1);
+    assert( minploidy == 2 );
+    buffer ++;
+    std::memcpy(&maxploidy, &(buffer[0]), 1);
+    assert( maxploidy == 2 );
+    buffer ++;
 
-  // phasing
-  std::memcpy(&phasing, &(buffer[0]), 1);
-  buffer++;
+    //to identify missing when getting dosages
+    ploidy_n.resize( nindivs );
+    std::memcpy(&(ploidy_n[0]), &(buffer[0]), nindivs);
+    buffer += nindivs;
 
-  // bits per probability
-  std::memcpy(&bits_prob, &(buffer[0]), 1);
-  buffer++;
+    // phasing
+    std::memcpy(&phasing, &(buffer[0]), 1);
+    buffer++;
+
+    // bits per probability
+    std::memcpy(&bits_prob, &(buffer[0]), 1);
+    buffer++;
+  }
 
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
@@ -2290,7 +2300,10 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
 
   // parse genotype probabilities block
   index = 0;
-  for(size_t i = 0; i < nindivs; i++) {
+  {
+    ScopedThreadWorkTimer sample_decode_timer(bgen_profile ?
+      &bgen_profile->sample_decode_thread_ms : nullptr);
+    for(size_t i = 0; i < nindivs; i++) {
 
     // skip samples that were ignored from the analysis
     if( filters->ind_ignore(i) ) {
@@ -2369,8 +2382,12 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
       }
 
     }
-    index++;
+      index++;
+    }
   }
+
+  ScopedThreadWorkTimer finalize_timer(bgen_profile ?
+    &bgen_profile->finalize_thread_ms : nullptr);
 
   // check MAC
   if( params->test_mode){

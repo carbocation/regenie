@@ -322,6 +322,46 @@ void Data::print_step2_profile() {
         << " postdecode_percent=" <<
           (100 * postdecode_thread_ms / thread_denominator) << "\n";
   }
+  if(params.file_type == "bgen") {
+    const double measured_thread_ms =
+      step2_bgen_parse_profile.decompress_thread_ms +
+      step2_bgen_parse_profile.header_thread_ms +
+      step2_bgen_parse_profile.sample_decode_thread_ms +
+      step2_bgen_parse_profile.finalize_thread_ms;
+    const double other_thread_ms = std::max(
+      0.0, step2_variant_compute_profile.parse_thread_ms -
+        measured_thread_ms);
+    const double thread_denominator =
+      step2_variant_compute_profile.parse_thread_ms > 0 ?
+        step2_variant_compute_profile.parse_thread_ms : 1;
+    out << "STEP2_PROFILE scope=bgen_parse"
+        << " variants=" << step2_bgen_parse_profile.variants
+        << " thread_work_ms=" <<
+          step2_variant_compute_profile.parse_thread_ms
+        << " decompress_thread_ms=" <<
+          step2_bgen_parse_profile.decompress_thread_ms
+        << " header_thread_ms=" <<
+          step2_bgen_parse_profile.header_thread_ms
+        << " sample_decode_thread_ms=" <<
+          step2_bgen_parse_profile.sample_decode_thread_ms
+        << " finalize_thread_ms=" <<
+          step2_bgen_parse_profile.finalize_thread_ms
+        << " other_thread_ms=" << other_thread_ms
+        << " decompress_percent=" <<
+          (100 * step2_bgen_parse_profile.decompress_thread_ms /
+            thread_denominator)
+        << " header_percent=" <<
+          (100 * step2_bgen_parse_profile.header_thread_ms /
+            thread_denominator)
+        << " sample_decode_percent=" <<
+          (100 * step2_bgen_parse_profile.sample_decode_thread_ms /
+            thread_denominator)
+        << " finalize_percent=" <<
+          (100 * step2_bgen_parse_profile.finalize_thread_ms /
+            thread_denominator)
+        << " other_percent=" <<
+          (100 * other_thread_ms / thread_denominator) << "\n";
+  }
   {
     const double measured_thread_ms =
       step2_variant_compute_profile.parse_thread_ms +
@@ -2977,6 +3017,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<uint64_t> sparse_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
+  vector<Step2BgenParseProfile> bgen_parse_profiles(profile_threads);
   const bool qt_phenotypes_have_complete_masks =
     (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
   const bool use_unscaled_dense_qt =
@@ -3016,7 +3057,13 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") ) {
         ScopedProfileTimer parse_timer(params.profile_step2 ?
           &parse_thread_ms[thread_num] : nullptr);
-        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout);
+        Step2BgenParseProfile* bgen_profile =
+          params.profile_step2 && (params.file_type == "bgen") ?
+            &bgen_parse_profiles[thread_num] : nullptr;
+        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp],
+          outsize[isnp], &params, &in_filters, pheno_data.masked_indivs,
+          pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock,
+          block_info, sout, bgen_profile);
       }
 
       // to store variant information
@@ -3108,6 +3155,18 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
 #endif
 
   if(params.profile_step2) {
+    for(size_t thread = 0; thread < bgen_parse_profiles.size(); ++thread) {
+      step2_bgen_parse_profile.variants +=
+        bgen_parse_profiles[thread].variants;
+      step2_bgen_parse_profile.decompress_thread_ms +=
+        bgen_parse_profiles[thread].decompress_thread_ms;
+      step2_bgen_parse_profile.header_thread_ms +=
+        bgen_parse_profiles[thread].header_thread_ms;
+      step2_bgen_parse_profile.sample_decode_thread_ms +=
+        bgen_parse_profiles[thread].sample_decode_thread_ms;
+      step2_bgen_parse_profile.finalize_thread_ms +=
+        bgen_parse_profiles[thread].finalize_thread_ms;
+    }
     step2_variant_compute_profile.variants += bs;
     step2_variant_compute_profile.sparse_variants += std::accumulate(
       sparse_variants.begin(), sparse_variants.end(), uint64_t(0));

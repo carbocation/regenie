@@ -172,6 +172,13 @@ time in pgenlib decoding versus post-decode sample scanning and transformation.
 These worker-thread times identify the distribution of parallel work and are
 not additive wall-time stages.
 
+For streamed BGEN input, a `bgen_parse` scope subdivides aggregate worker time
+into buffer allocation and block decompression, header and ploidy parsing, the
+fused per-sample
+probability-decode and summary-statistics loop, and final filtering,
+transformation, and imputation. The residual `other` time covers setup and
+instrumentation boundaries outside those regions.
+
 For standard additive autosomal PGEN hardcall association tests, REGENIE fuses
 validation, sample filtering, summary counts, and missingness discovery into a
 single post-decode scan. Specialized modes retain the general path. Set the
