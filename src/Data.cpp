@@ -105,6 +105,14 @@ bool step2_unscaled_dense_qt_enabled() {
     "REGENIE_STEP2_UNSCALED_DENSE_QT must be '0' or '1'");
 }
 
+bool step2_bgen_fast_dosage_enabled() {
+  const char* value = std::getenv("REGENIE_BGEN_FAST_DOSAGE");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_BGEN_FAST_DOSAGE must be '0' or '1'");
+}
+
 void build_step1_prediction_groups(
   const std::vector<int>& chromosomes,
   const std::map<int, std::vector<int>>& chromosome_map,
@@ -336,6 +344,8 @@ void Data::print_step2_profile() {
         step2_variant_compute_profile.parse_thread_ms : 1;
     out << "STEP2_PROFILE scope=bgen_parse"
         << " variants=" << step2_bgen_parse_profile.variants
+        << " fast_path_variants=" <<
+          step2_bgen_parse_profile.fast_path_variants
         << " thread_work_ms=" <<
           step2_variant_compute_profile.parse_thread_ms
         << " decompress_thread_ms=" <<
@@ -3018,6 +3028,20 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
   vector<Step2BgenParseProfile> bgen_parse_profiles(profile_threads);
+  if(!step2_bgen_fast_path_initialized) {
+    step2_bgen_fast_path_eligible =
+      (params.file_type == "bgen") && params.streamBGEN &&
+      step2_bgen_fast_dosage_enabled() &&
+      (params.trait_mode == 0) && params.dosage_mode &&
+      (params.test_type == 0) && !params.build_mask &&
+      !params.af_cc && params.split_by_pheno && !params.htp_out &&
+      !params.w_interaction && !params.snp_set && !params.trait_set &&
+      !params.multiphen && !params.mcc_test && !params.joint_test &&
+      !params.getCorMat && !params.with_flip &&
+      in_filters.ind_in_analysis.all() &&
+      !in_filters.has_missing.any();
+    step2_bgen_fast_path_initialized = true;
+  }
   const bool qt_phenotypes_have_complete_masks =
     (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
   const bool use_unscaled_dense_qt =
@@ -3063,7 +3087,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp],
           outsize[isnp], &params, &in_filters, pheno_data.masked_indivs,
           pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock,
-          block_info, sout, bgen_profile);
+          block_info, sout, bgen_profile, step2_bgen_fast_path_eligible);
       }
 
       // to store variant information
@@ -3158,6 +3182,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     for(size_t thread = 0; thread < bgen_parse_profiles.size(); ++thread) {
       step2_bgen_parse_profile.variants +=
         bgen_parse_profiles[thread].variants;
+      step2_bgen_parse_profile.fast_path_variants +=
+        bgen_parse_profiles[thread].fast_path_variants;
       step2_bgen_parse_profile.decompress_thread_ms +=
         bgen_parse_profiles[thread].decompress_thread_ms;
       step2_bgen_parse_profile.header_thread_ms +=

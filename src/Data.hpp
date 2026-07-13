@@ -119,6 +119,8 @@ class Data {
     uint32_t n_corrected = 0; // to keep track of how many SNPs require correction
     bool pval_converged = false; // keep track of whether SPA/Firth converged
     bool fastSPA; // use fast approx. for rare SNPs
+    bool step2_bgen_fast_path_initialized = false;
+    bool step2_bgen_fast_path_eligible = false;
 
     std::vector < MatrixXb > masked_in_folds;
     std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> > predictions;

@@ -179,6 +179,14 @@ probability-decode and summary-statistics loop, and final filtering,
 transformation, and imputation. The residual `other` time covers setup and
 instrumentation boundaries outside those regions.
 
+For complete-sample additive autosomal quantitative-trait BGEN analyses,
+REGENIE uses a guarded dosage-decoding path that removes invariant per-sample
+branches, the initial genotype clear, and identity mean imputation. The
+`bgen_parse` scope reports how many variants use this path. Specialized modes,
+sex-chromosome variants, sample filtering, and phenotype missingness retain the
+general decoder. Set `REGENIE_BGEN_FAST_DOSAGE=0` to disable the fast path for
+matched output and performance comparisons.
+
 For standard additive autosomal PGEN hardcall association tests, REGENIE fuses
 validation, sample filtering, summary counts, and missingness discovery into a
 single post-decode scan. Specialized modes retain the general path. Set the
