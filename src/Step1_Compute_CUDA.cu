@@ -60,6 +60,19 @@ CudaGramPrecision cuda_gram_precision() {
     "REGENIE_CUDA_GRAM_PRECISION must be 'fp64' or 'fp32'");
 }
 
+int cuda_fp32_gram_chunk_samples() {
+  const char* chunk_text =
+    std::getenv("REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES");
+  if(!chunk_text || !*chunk_text) return 128;
+  char* end = nullptr;
+  const long chunk_samples = std::strtol(chunk_text, &end, 10);
+  if(end == chunk_text || *end != '\0' || chunk_samples <= 0 ||
+     chunk_samples > INT_MAX)
+    throw std::invalid_argument(
+      "REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES must be a positive integer");
+  return static_cast<int>(chunk_samples);
+}
+
 void check_cuda(cudaError_t status, const char* operation) {
   if(status != cudaSuccess)
     throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
@@ -322,6 +335,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     explicit CudaStep1ComputeBackend(int device)
       : device_(device), handle_(nullptr), solver_handle_(nullptr),
         gram_precision_(cuda_gram_precision()),
+        fp32_gram_chunk_samples_(cuda_fp32_gram_chunk_samples()),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_fp32_genotypes_(nullptr), d_fp32_gram_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
@@ -402,7 +416,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
              << properties_.major << "." << properties_.minor
              << ", Gram precision " <<
                (gram_precision_ == CudaGramPrecision::fp64 ?
-                 "fp64" : "fp32-products/fp64-accumulation") << ")";
+                 "fp64" : "fp32-products/fp64-accumulation");
+      if(gram_precision_ ==
+         CudaGramPrecision::fp32_products_fp64_accumulation)
+        result << ", FP32 Gram chunk " << fp32_gram_chunk_samples_
+               << " samples";
+      result << ")";
       return result.str();
     }
 
@@ -605,7 +624,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(gram_precision_ ==
          CudaGramPrecision::fp32_products_fp64_accumulation) {
         ensure_capacity(d_fp32_genotypes_, fp32_genotypes_capacity_,
-          chunk_samples * genotypes.rows(),
+          std::min<Eigen::Index>(chunk_samples,
+            fp32_gram_chunk_samples_) * genotypes.rows(),
           "cudaMalloc(FP32 genotype Gram chunk)");
         ensure_capacity(d_fp32_gram_, fp32_gram_capacity_, gram.size(),
           "cudaMalloc(FP32 Gram product)");
@@ -2095,7 +2115,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          CudaGramPrecision::fp32_products_fp64_accumulation) {
         ensure_capacity(d_fp32_genotypes_, fp32_genotypes_capacity_,
           std::max<Eigen::Index>(1,
-            chunk_samples * genotypes.rows()),
+            std::min<Eigen::Index>(chunk_samples,
+              fp32_gram_chunk_samples_) * genotypes.rows()),
           "cudaMalloc(FP32 fused ridge genotype chunk)");
         ensure_capacity(d_fp32_gram_, fp32_gram_capacity_,
           static_cast<Eigen::Index>(blocks) * blocks,
@@ -2638,8 +2659,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      const int input_count = checked_element_count(rows, columns,
-        "mixed-precision genotype Gram input");
       const int output_count = checked_element_count(rows, rows,
         "mixed-precision genotype Gram output");
       const int threads = 256;
@@ -2647,28 +2666,39 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         check_cuda(cudaMemset(d_gram_, 0,
           static_cast<size_t>(output_count) * sizeof(double)),
           "clear mixed-precision FP64 Gram accumulator");
-      convert_double_to_float<<<(input_count - 1) / threads + 1, threads>>>(
-        genotypes, d_fp32_genotypes_, input_count);
-      check_cuda(cudaGetLastError(),
-        "convert genotype Gram chunk from FP64 to FP32");
-
       const float alpha = 1.0f;
       const float beta = 0.0f;
-      // Turing's FP32 SYRK path accumulates this tall product substantially
-      // less accurately than GEMM. Compute the full temporary product even
-      // when only its lower triangle is consumed; the FP64 accumulator below
-      // still stores and mirrors only the requested triangle.
-      check_cublas(cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
-        rows, rows, columns, &alpha,
-        d_fp32_genotypes_, rows, d_fp32_genotypes_, rows, &beta,
-        d_fp32_gram_, rows),
-        "cublasSgemm(mixed-precision genotype Gram chunk)");
+      for(int start = 0; start < columns;
+          start += fp32_gram_chunk_samples_) {
+        const int count = std::min(
+          fp32_gram_chunk_samples_, columns - start);
+        const int input_count = checked_element_count(rows, count,
+          "mixed-precision genotype Gram input");
+        const double* input = genotypes +
+          static_cast<size_t>(start) * rows;
+        convert_double_to_float<<<
+          (input_count - 1) / threads + 1, threads>>>(
+          input, d_fp32_genotypes_, input_count);
+        check_cuda(cudaGetLastError(),
+          "convert genotype Gram chunk from FP64 to FP32");
 
-      accumulate_float_gram<<<(output_count - 1) / threads + 1, threads>>>(
-        d_fp32_gram_, d_gram_, rows, output_count,
-        mode == Step1GramMode::selfadjoint_rank_update);
-      check_cuda(cudaGetLastError(),
-        "accumulate FP32 Gram product into FP64 matrix");
+        // Turing's FP32 SYRK path accumulates this tall product substantially
+        // less accurately than GEMM. Compute the full temporary product even
+        // when only its lower triangle is consumed; the FP64 accumulator below
+        // still stores and mirrors only the requested triangle.
+        check_cublas(cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
+          rows, rows, count, &alpha,
+          d_fp32_genotypes_, rows, d_fp32_genotypes_, rows, &beta,
+          d_fp32_gram_, rows),
+          "cublasSgemm(mixed-precision genotype Gram chunk)");
+
+        accumulate_float_gram<<<
+          (output_count - 1) / threads + 1, threads>>>(
+          d_fp32_gram_, d_gram_, rows, output_count,
+          mode == Step1GramMode::selfadjoint_rank_update);
+        check_cuda(cudaGetLastError(),
+          "accumulate FP32 Gram product into FP64 matrix");
+      }
     }
 
     void invalidate_resident_genotypes() {
@@ -2779,6 +2809,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     cublasHandle_t handle_;
     cusolverDnHandle_t solver_handle_;
     CudaGramPrecision gram_precision_;
+    int fp32_gram_chunk_samples_;
     double* d_genotypes_;
     double* d_resident_genotypes_;
     float* d_fp32_genotypes_;

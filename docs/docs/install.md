@@ -110,7 +110,12 @@ results into an FP64 matrix. Phenotype crossproducts, eigendecompositions,
 ridge solves, and predictions remain FP64. This mode trades numerical accuracy
 for speed and must be validated against the default FP64 output for each target
 workload; unset the variable or set it to `fp64` to retain the default path.
-The validation harness exposes the same setting as `CUDA_GRAM_PRECISION`.
+Each outer streaming chunk is subdivided into 128-sample Gram products by
+default to limit FP32 accumulation drift without shrinking transfers or other
+CUDA operations. Override this positive sample count with
+`REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES`; smaller values favor accuracy and
+larger values favor throughput. The validation harness exposes these settings
+as `CUDA_GRAM_PRECISION` and `CUDA_FP32_GRAM_CHUNK_SAMPLES`.
 
 For development, the repository includes a hardware-parameterized GPU
 validation command. It builds both backends, checks matrix shapes and failure
