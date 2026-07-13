@@ -182,7 +182,16 @@ The `variant_compute` profiling scope reports aggregate worker-thread time for
 format parsing, genotype preprocessing and sparsification, score testing
 (including SPA/Firth correction), and interaction testing. As with the PGEN
 scope, these worker-thread measurements describe the distribution of parallel
-work and are not additive wall-time stages.
+work and are not additive wall-time stages. For standard additive
+quantitative-trait PGEN tests, including analyses of multiple phenotypes, the
+scope also counts variants using the unscaled dense-genotype path. This path
+avoids writing a normalized residualized genotype while retaining the same
+score-test scaling. When all phenotype masks are complete, it also shares the
+known residual denominator across phenotypes and avoids the squared-genotype
+scan. Phenotypes with different missingness patterns retain their masked
+denominator calculation. Set the developer diagnostic
+`REGENIE_STEP2_UNSCALED_DENSE_QT=0` to disable it for matched output and
+performance comparisons.
 
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy

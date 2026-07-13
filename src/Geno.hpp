@@ -99,6 +99,9 @@ struct data_thread {
   // reset each time
   bool fastSPA = true;
   bool is_sparse = false;
+  // QT residual is retained on its raw scale for the fused dense score path.
+  bool qt_unscaled = false;
+  bool qt_complete_masks = false;
 };
 
 struct geno_block {
@@ -216,6 +219,7 @@ void mean_impute_g(double &,const double&,const bool&);
 void mean_impute_g(const double&,Eigen::Ref<Eigen::ArrayXd>,const Eigen::Ref<const ArrayXb>&);
 void residualize_geno(int const&,int const&,variant_block*,bool const&,const Eigen::Ref<const Eigen::MatrixXd>&,struct geno_block*,struct param const*);
 void residualize_geno(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
+void residualize_geno_unscaled(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
 void writeSnplist(std::string const&,int const&,int const&,std::vector<snp> const&,mstream&);
 
 bool in_chrList(const int&,struct filter const*);

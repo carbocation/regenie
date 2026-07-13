@@ -85,6 +85,8 @@ struct Step2Profile {
 struct Step2VariantComputeProfile {
   uint64_t variants = 0;
   uint64_t sparse_variants = 0;
+  uint64_t unscaled_dense_qt_variants = 0;
+  uint64_t shared_denom_dense_qt_variants = 0;
   double thread_work_ms = 0;
   double parse_thread_ms = 0;
   double preprocess_thread_ms = 0;

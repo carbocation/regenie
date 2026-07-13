@@ -376,7 +376,29 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
   }
 
   if( run_full_test ){
-    if( params.strict_mode ) {
+    if(dt_thr->qt_unscaled) {
+
+      const double genotype_scale = gsc / block_info->scale_fac;
+      num = (yres.transpose() * Geno.matrix()).array() *
+        genotype_scale;
+
+      if(dt_thr->qt_complete_masks) {
+        const double residual_dof =
+          params.n_analyzed - params.ncov_analyzed;
+        denum = gsc * gsc * residual_dof;
+        dt_thr->stats = num / sqrt(denum);
+        dt_thr->bhat = dt_thr->stats / sqrt(denum) *
+          pheno_data.scf_sv;
+      } else {
+        denum_arr = genotype_scale * genotype_scale *
+          (pheno_data.masked_indivs.transpose().cast<double>() *
+            Geno.square().matrix());
+        dt_thr->stats = num / denum_arr.sqrt();
+        dt_thr->bhat = dt_thr->stats * pheno_data.scf_sv /
+          denum_arr.sqrt();
+      }
+
+    } else if( params.strict_mode ) {
 
       if(dt_thr->is_sparse){
         ArrayXd XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse; // k x 1

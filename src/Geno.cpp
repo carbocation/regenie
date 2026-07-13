@@ -3038,6 +3038,8 @@ void reset_thread(data_thread* snp_data, struct param const& params){
     }
     snp_data->skat_var = params.missing_value_double;
     snp_data->is_sparse = false;
+    snp_data->qt_unscaled = false;
+    snp_data->qt_complete_masks = false;
     snp_data->fastSPA = params.use_SPA && (!params.build_mask || (params.mask_rule_max || params.mask_rule_comphet));
 }
 
@@ -3380,6 +3382,24 @@ void residualize_geno(const Ref<const MatrixXd>& X, Ref<VectorXd> Graw, variant_
     return;
   }
   Graw /= snp_data->scale_fac;
+
+}
+
+void residualize_geno_unscaled(const Ref<const MatrixXd>& X, Ref<VectorXd> Graw, variant_block* snp_data, struct param const& params){
+
+  if(snp_data->ignored) return;
+
+  // Retain the projected genotype on its raw scale. The score path uses the
+  // saved scale factor algebraically, avoiding a normalization write pass and
+  // a subsequent squared-genotype denominator pass.
+  VectorXd beta = X.transpose() * Graw;
+  Graw -= X * beta;
+
+  snp_data->scale_fac = Graw.norm();
+  snp_data->scale_fac /= sqrt(params.n_analyzed - X.cols());
+
+  if(snp_data->scale_fac < params.numtol)
+    snp_data->ignored = true;
 
 }
 

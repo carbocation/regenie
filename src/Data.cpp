@@ -26,7 +26,9 @@
 
 #include <limits.h> /* for PATH_MAX */
 #include <chrono>
+#include <cstdlib>
 #include <numeric>
+#include <stdexcept>
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -94,6 +96,14 @@ class ScopedProfileTimer {
     double* elapsed_ms_;
     ProfileClock::time_point start_;
 };
+
+bool step2_unscaled_dense_qt_enabled() {
+  const char* value = std::getenv("REGENIE_STEP2_UNSCALED_DENSE_QT");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_STEP2_UNSCALED_DENSE_QT must be '0' or '1'");
+}
 
 void build_step1_prediction_groups(
   const std::vector<int>& chromosomes,
@@ -328,6 +338,10 @@ void Data::print_step2_profile() {
         << " variants=" << step2_variant_compute_profile.variants
         << " sparse_variants=" <<
           step2_variant_compute_profile.sparse_variants
+        << " unscaled_dense_qt_variants=" <<
+          step2_variant_compute_profile.unscaled_dense_qt_variants
+        << " shared_denom_dense_qt_variants=" <<
+          step2_variant_compute_profile.shared_denom_dense_qt_variants
         << " thread_work_ms=" <<
           step2_variant_compute_profile.thread_work_ms
         << " parse_thread_ms=" <<
@@ -2961,6 +2975,27 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<double> score_thread_ms(profile_threads, 0);
   vector<double> interaction_thread_ms(profile_threads, 0);
   vector<uint64_t> sparse_variants(profile_threads, 0);
+  vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
+  vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
+  const bool qt_phenotypes_have_complete_masks =
+    (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
+  const bool use_unscaled_dense_qt =
+    step2_unscaled_dense_qt_enabled() &&
+    (params.file_type == "pgen") &&
+    (params.trait_mode == 0) &&
+    (params.test_type == 0) &&
+    !params.skip_cov_res &&
+    !params.skip_scaleG &&
+    !params.mcc_test &&
+    !params.w_interaction &&
+    !params.build_mask &&
+    !params.snp_set &&
+    !params.joint_test &&
+    !params.trait_set &&
+    !params.multiphen &&
+    !params.htp_out &&
+    !params.getCorMat &&
+    (pheno_data.new_cov.cols() == params.ncov_analyzed);
 
     // start openmp for loop
 #if defined(_OPENMP)
@@ -3011,9 +3046,23 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       {
         ScopedProfileTimer preprocess_timer(params.profile_step2 ?
           &preprocess_thread_ms[thread_num] : nullptr);
-        if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse)
-          residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp), block_info, params);
-        else block_info->scale_fac = 1;
+        if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse) {
+          if(use_unscaled_dense_qt) {
+            residualize_geno_unscaled(pheno_data.new_cov,
+              Gblock.Gmat.col(isnp), block_info, params);
+            Gblock.thread_data[thread_num].qt_unscaled = true;
+            Gblock.thread_data[thread_num].qt_complete_masks =
+              qt_phenotypes_have_complete_masks;
+            if(params.profile_step2) {
+              unscaled_dense_qt_variants[thread_num]++;
+              if(qt_phenotypes_have_complete_masks)
+                shared_denom_dense_qt_variants[thread_num]++;
+            }
+          } else {
+            residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp),
+              block_info, params);
+          }
+        } else block_info->scale_fac = 1;
       }
 
       // skip SNP if fails filters
@@ -3062,6 +3111,12 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.variants += bs;
     step2_variant_compute_profile.sparse_variants += std::accumulate(
       sparse_variants.begin(), sparse_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.unscaled_dense_qt_variants +=
+      std::accumulate(unscaled_dense_qt_variants.begin(),
+        unscaled_dense_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.shared_denom_dense_qt_variants +=
+      std::accumulate(shared_denom_dense_qt_variants.begin(),
+        shared_denom_dense_qt_variants.end(), uint64_t(0));
     step2_variant_compute_profile.thread_work_ms += std::accumulate(
       thread_work_ms.begin(), thread_work_ms.end(), 0.0);
     step2_variant_compute_profile.parse_thread_ms += std::accumulate(
