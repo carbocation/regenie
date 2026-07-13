@@ -120,6 +120,7 @@ class Data {
     MultiPhen mphen;
     Step1Profile step1_profile;
     Step2Profile step2_profile;
+    Step2PgenReadProfile step2_pgen_read_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions

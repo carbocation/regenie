@@ -29,9 +29,35 @@
 #include "Geno.hpp"
 #include "db/sqlite3.hpp"
 
+#include <chrono>
+#include <numeric>
+
 using namespace std;
 using namespace Eigen;
 using namespace boost;
+
+namespace {
+
+class ScopedThreadWorkTimer {
+  public:
+    explicit ScopedThreadWorkTimer(double* elapsed_ms)
+      : elapsed_ms_(elapsed_ms) {
+      if(elapsed_ms_) start_ = std::chrono::steady_clock::now();
+    }
+
+    ~ScopedThreadWorkTimer() {
+      if(!elapsed_ms_) return;
+      const std::chrono::duration<double, std::milli> elapsed =
+        std::chrono::steady_clock::now() - start_;
+      *elapsed_ms_ += elapsed.count();
+    }
+
+  private:
+    double* elapsed_ms_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+}
 
 
 
@@ -2535,10 +2561,14 @@ void parseSnpfromBed(const int& isnp, const int &chrom, const vector<uchar>& bed
 
 
 // step 2
-void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info){
+void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile){
 
   int const bs = indices.size();
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
+  vector<double> thread_work_ms(
+    profile ? params->neff_threads : 0, 0);
+  vector<double> decode_thread_ms(
+    profile ? params->neff_threads : 0, 0);
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -2550,6 +2580,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 #if defined(_OPENMP)
     thread_num = omp_get_thread_num();
 #endif
+    ScopedThreadWorkTimer thread_work_timer(
+      profile ? &thread_work_ms[thread_num] : nullptr);
 
     int hc, cur_index, lval, nmales, ncarriers = 0;
     double total, mac, mval, ival, eij2 = 0, sum_pos;
@@ -2568,10 +2600,14 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 
     // read genotype data
     cur_index = snp_info->offset;
-    if( params->dosage_mode )
-      pgr.Read(Geno.data(), Geno.size(), thread_num, cur_index, 1);
-    else
-      pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+    {
+      ScopedThreadWorkTimer decode_timer(
+        profile ? &decode_thread_ms[thread_num] : nullptr);
+      if( params->dosage_mode )
+        pgr.Read(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+      else
+        pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+    }
 
     oob_err(j) = ((Geno < -3) || (Geno > 2)).any();
     if(oob_err(j)) continue;
@@ -2699,6 +2735,14 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 #if defined(_OPENMP)
   setNbThreads(params->threads);
 #endif
+
+  if(profile) {
+    profile->variants += bs;
+    profile->thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    profile->decode_thread_ms += std::accumulate(
+      decode_thread_ms.begin(), decode_thread_ms.end(), 0.0);
+  }
 
   if(oob_err.any()) 
     throw "there is a variant in the block that has a value not in [0,2] or missing";

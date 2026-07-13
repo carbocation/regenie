@@ -167,6 +167,10 @@ computation, and result output. Records also include the input format, trait
 mode, workload dimensions, and counts of corrected and failed tests. For
 streamed BGEN input, decompression and parsing performed by worker threads are
 included in `variant_compute`; `genotype_io` covers the preceding block read.
+For PGEN input, an additional `pgen_ingest` scope reports aggregate worker-thread
+time in pgenlib decoding versus post-decode sample scanning and transformation.
+These worker-thread times identify the distribution of parallel work and are
+not additive wall-time stages.
 
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy

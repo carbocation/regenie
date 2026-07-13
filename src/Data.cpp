@@ -275,6 +275,24 @@ void Data::print_step2_profile() {
   print_stage("output", step2_profile.output_ms);
   print_stage("other", other_ms);
   print_stage("total", step2_profile.end_to_end_ms);
+  if(params.file_type == "pgen") {
+    const double postdecode_thread_ms = std::max(
+      0.0, step2_pgen_read_profile.thread_work_ms -
+        step2_pgen_read_profile.decode_thread_ms);
+    const double thread_denominator =
+      step2_pgen_read_profile.thread_work_ms > 0 ?
+        step2_pgen_read_profile.thread_work_ms : 1;
+    out << "STEP2_PROFILE scope=pgen_ingest"
+        << " variants=" << step2_pgen_read_profile.variants
+        << " thread_work_ms=" << step2_pgen_read_profile.thread_work_ms
+        << " decode_thread_ms=" << step2_pgen_read_profile.decode_thread_ms
+        << " postdecode_thread_ms=" << postdecode_thread_ms
+        << " decode_percent=" <<
+          (100 * step2_pgen_read_profile.decode_thread_ms /
+            thread_denominator)
+        << " postdecode_percent=" <<
+          (100 * postdecode_thread_ms / thread_denominator) << "\n";
+  }
   out << "STEP2_PROFILE_FINAL version=1 mode=" << mode
       << " setup_ms=" << step2_profile.setup_ms
       << " prediction_read_ms=" << step2_profile.prediction_read_ms
@@ -3362,7 +3380,7 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
   } else if((params.file_type == "bgen") && !params.streamBGEN) 
     readChunkFromBGENFileToG(indices, chrom, snpinfo, &params, Gblock.Gmat, Gblock.bgen, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, all_snps_info, sout);
   else if(params.file_type == "pgen") {
-    readChunkFromPGENFileToG(indices, chrom, &params, &in_filters, Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs, pheno_data.phenotypes_raw, snpinfo, all_snps_info);
+    readChunkFromPGENFileToG(indices, chrom, &params, &in_filters, Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs, pheno_data.phenotypes_raw, snpinfo, all_snps_info, params.profile_step2 ? &step2_pgen_read_profile : nullptr);
   } else {
 
     snp_data_blocks.resize( n_snps );

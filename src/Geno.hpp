@@ -68,6 +68,12 @@ struct tally {
   uint32_t n_ignored_tests = 0;
 };
 
+struct Step2PgenReadProfile {
+  uint64_t variants = 0;
+  double thread_work_ms = 0;
+  double decode_thread_ms = 0;
+};
+
 // for step 2 per thread
 struct data_thread {
   SpVec Gsparse;
@@ -186,7 +192,7 @@ void readChunkFromBGEN(std::istream*,std::vector<uint32_t>&,std::vector<uint32_t
 void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&);
 void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&);
 void parseSnpfromBed(const int&,const int&,const std::vector<uchar>&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*);
-void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&);
+void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&,Step2PgenReadProfile*);
 
 void skip_snps(uint64 const&,struct param const*,struct in_files*,struct geno_block*);
 void jumpto_bed(uint64 const&,uint64 const&,std::ifstream&);
