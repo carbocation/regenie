@@ -87,12 +87,12 @@ bool uses_mixed_gram_products(const Step1ComputeBackend& backend) {
 
 double gram_conformance_tolerance(const Step1ComputeBackend& backend,
   double fp64_tolerance) {
-  return uses_mixed_gram_products(backend) ? 2e-5 : fp64_tolerance;
+  return uses_mixed_gram_products(backend) ? 5e-7 : fp64_tolerance;
 }
 
 double factorized_conformance_tolerance(
   const Step1ComputeBackend& backend, double fp64_tolerance) {
-  return uses_mixed_gram_products(backend) ? 2e-4 : fp64_tolerance;
+  return uses_mixed_gram_products(backend) ? 1e-5 : fp64_tolerance;
 }
 
 void reference_preprocess_genotypes(Eigen::MatrixXd& genotypes,
@@ -1088,10 +1088,9 @@ void check_streamed_design_operations(Step1ComputeBackend& candidate) {
     actual_grouped_loo_predictions, expected_grouped_loo_predictions);
 
   const double tolerance = 5e-12;
-  const double l0_gram_tolerance = gram_conformance_tolerance(
-    candidate, tolerance);
-  const double fused_tolerance = factorized_conformance_tolerance(
-    candidate, 2e-11);
+  const bool mixed_gram_products = uses_mixed_gram_products(candidate);
+  const double l0_gram_tolerance = mixed_gram_products ? 5e-8 : tolerance;
+  const double fused_tolerance = mixed_gram_products ? 2e-7 : 2e-11;
   const bool passed = !(crossproduct_error > tolerance ||
      design_gram_error > tolerance ||
      design_product_crossproduct_error > tolerance ||
