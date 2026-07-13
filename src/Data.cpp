@@ -113,6 +113,14 @@ bool step2_bgen_fast_dosage_enabled() {
     "REGENIE_BGEN_FAST_DOSAGE must be '0' or '1'");
 }
 
+bool step2_bgen_dosage_lookup_enabled() {
+  const char* value = std::getenv("REGENIE_BGEN_DOSAGE_LOOKUP");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_BGEN_DOSAGE_LOOKUP must be '0' or '1'");
+}
+
 void build_step1_prediction_groups(
   const std::vector<int>& chromosomes,
   const std::map<int, std::vector<int>>& chromosome_map,
@@ -346,6 +354,8 @@ void Data::print_step2_profile() {
         << " variants=" << step2_bgen_parse_profile.variants
         << " fast_path_variants=" <<
           step2_bgen_parse_profile.fast_path_variants
+        << " lookup_path_variants=" <<
+          step2_bgen_parse_profile.lookup_path_variants
         << " thread_work_ms=" <<
           step2_variant_compute_profile.parse_thread_ms
         << " decompress_thread_ms=" <<
@@ -3040,6 +3050,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       !params.getCorMat && !params.with_flip &&
       in_filters.ind_in_analysis.all() &&
       !in_filters.has_missing.any();
+    step2_bgen_lookup_path_enabled =
+      step2_bgen_fast_path_eligible &&
+      step2_bgen_dosage_lookup_enabled();
     step2_bgen_fast_path_initialized = true;
   }
   const bool qt_phenotypes_have_complete_masks =
@@ -3087,7 +3100,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp],
           outsize[isnp], &params, &in_filters, pheno_data.masked_indivs,
           pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock,
-          block_info, sout, bgen_profile, step2_bgen_fast_path_eligible);
+          block_info, sout, bgen_profile, step2_bgen_fast_path_eligible,
+          step2_bgen_lookup_path_enabled);
       }
 
       // to store variant information
@@ -3184,6 +3198,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         bgen_parse_profiles[thread].variants;
       step2_bgen_parse_profile.fast_path_variants +=
         bgen_parse_profiles[thread].fast_path_variants;
+      step2_bgen_parse_profile.lookup_path_variants +=
+        bgen_parse_profiles[thread].lookup_path_variants;
       step2_bgen_parse_profile.decompress_thread_ms +=
         bgen_parse_profiles[thread].decompress_thread_ms;
       step2_bgen_parse_profile.header_thread_ms +=
