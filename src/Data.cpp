@@ -284,6 +284,8 @@ void Data::print_step2_profile() {
         step2_pgen_read_profile.thread_work_ms : 1;
     out << "STEP2_PROFILE scope=pgen_ingest"
         << " variants=" << step2_pgen_read_profile.variants
+        << " fast_path_variants=" <<
+          step2_pgen_read_profile.fast_path_variants
         << " thread_work_ms=" << step2_pgen_read_profile.thread_work_ms
         << " decode_thread_ms=" << step2_pgen_read_profile.decode_thread_ms
         << " postdecode_thread_ms=" << postdecode_thread_ms

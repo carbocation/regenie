@@ -172,6 +172,12 @@ time in pgenlib decoding versus post-decode sample scanning and transformation.
 These worker-thread times identify the distribution of parallel work and are
 not additive wall-time stages.
 
+For standard additive autosomal PGEN hardcall association tests, REGENIE fuses
+validation, sample filtering, summary counts, and missingness discovery into a
+single post-decode scan. Specialized modes retain the general path. Set the
+developer diagnostic `REGENIE_PGEN_FAST_HARDCALL=0` to disable this fast path
+for matched output and performance comparisons.
+
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy
 is installed, with a dependency-free Python fallback. Its default tolerances
