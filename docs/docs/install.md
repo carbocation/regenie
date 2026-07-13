@@ -187,12 +187,17 @@ sex-chromosome variants, sample filtering, and phenotype missingness retain the
 general decoder. Set `REGENIE_BGEN_FAST_DOSAGE=0` to disable the fast path for
 matched output and performance comparisons.
 
-For 8-bit unphased BGEN blocks on that fast path, REGENIE can replace repeated
+For 8-bit unphased BGEN blocks on that fast path, REGENIE replaces repeated
 probability-to-dosage arithmetic with a precomputed table covering every pair
 of encoded probability bytes. The table entries are constructed with the same
 floating-point formulas as the arithmetic decoder. The `bgen_parse` scope
 reports lookup-path coverage; set `REGENIE_BGEN_DOSAGE_LOOKUP=0` to retain the
-fast path while disabling only this lookup experiment.
+fast path while disabling only the lookup. For performance validation that is
+not biased toward hardcall-derived BGEN data,
+`scripts/generate_step2_bgen.py` streams a deterministic BGEN v1.2 dataset with
+diverse valid 8-bit genotype-probability pairs to a caller-selected prefix. It
+also writes a matching Oxford sample file and a small JSON manifest; generated
+genotype data remain outside the source tree and are not repository fixtures.
 
 For standard additive autosomal PGEN hardcall association tests, REGENIE fuses
 validation, sample filtering, summary counts, and missingness discovery into a
