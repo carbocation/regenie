@@ -178,6 +178,12 @@ single post-decode scan. Specialized modes retain the general path. Set the
 developer diagnostic `REGENIE_PGEN_FAST_HARDCALL=0` to disable this fast path
 for matched output and performance comparisons.
 
+The `variant_compute` profiling scope reports aggregate worker-thread time for
+format parsing, genotype preprocessing and sparsification, score testing
+(including SPA/Firth correction), and interaction testing. As with the PGEN
+scope, these worker-thread measurements describe the distribution of parallel
+work and are not additive wall-time stages.
+
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy
 is installed, with a dependency-free Python fallback. Its default tolerances

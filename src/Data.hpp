@@ -82,6 +82,16 @@ struct Step2Profile {
   double end_to_end_ms = 0;
 };
 
+struct Step2VariantComputeProfile {
+  uint64_t variants = 0;
+  uint64_t sparse_variants = 0;
+  double thread_work_ms = 0;
+  double parse_thread_ms = 0;
+  double preprocess_thread_ms = 0;
+  double score_thread_ms = 0;
+  double interaction_thread_ms = 0;
+};
+
 class Data {
 
   public:
@@ -121,6 +131,7 @@ class Data {
     Step1Profile step1_profile;
     Step2Profile step2_profile;
     Step2PgenReadProfile step2_pgen_read_profile;
+    Step2VariantComputeProfile step2_variant_compute_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions

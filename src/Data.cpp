@@ -26,6 +26,7 @@
 
 #include <limits.h> /* for PATH_MAX */
 #include <chrono>
+#include <numeric>
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -77,6 +78,22 @@ using ProfileClock = std::chrono::steady_clock;
 double elapsed_ms(const ProfileClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
 }
+
+class ScopedProfileTimer {
+  public:
+    explicit ScopedProfileTimer(double* elapsed_ms)
+      : elapsed_ms_(elapsed_ms) {
+      if(elapsed_ms_) start_ = ProfileClock::now();
+    }
+
+    ~ScopedProfileTimer() {
+      if(elapsed_ms_) *elapsed_ms_ += elapsed_ms(start_);
+    }
+
+  private:
+    double* elapsed_ms_;
+    ProfileClock::time_point start_;
+};
 
 void build_step1_prediction_groups(
   const std::vector<int>& chromosomes,
@@ -294,6 +311,40 @@ void Data::print_step2_profile() {
             thread_denominator)
         << " postdecode_percent=" <<
           (100 * postdecode_thread_ms / thread_denominator) << "\n";
+  }
+  {
+    const double measured_thread_ms =
+      step2_variant_compute_profile.parse_thread_ms +
+      step2_variant_compute_profile.preprocess_thread_ms +
+      step2_variant_compute_profile.score_thread_ms +
+      step2_variant_compute_profile.interaction_thread_ms;
+    const double other_thread_ms = std::max(
+      0.0, step2_variant_compute_profile.thread_work_ms -
+        measured_thread_ms);
+    const double thread_denominator =
+      step2_variant_compute_profile.thread_work_ms > 0 ?
+        step2_variant_compute_profile.thread_work_ms : 1;
+    out << "STEP2_PROFILE scope=variant_compute"
+        << " variants=" << step2_variant_compute_profile.variants
+        << " sparse_variants=" <<
+          step2_variant_compute_profile.sparse_variants
+        << " thread_work_ms=" <<
+          step2_variant_compute_profile.thread_work_ms
+        << " parse_thread_ms=" <<
+          step2_variant_compute_profile.parse_thread_ms
+        << " preprocess_thread_ms=" <<
+          step2_variant_compute_profile.preprocess_thread_ms
+        << " score_thread_ms=" <<
+          step2_variant_compute_profile.score_thread_ms
+        << " interaction_thread_ms=" <<
+          step2_variant_compute_profile.interaction_thread_ms
+        << " other_thread_ms=" << other_thread_ms
+        << " preprocess_percent=" <<
+          (100 * step2_variant_compute_profile.preprocess_thread_ms /
+            thread_denominator)
+        << " score_percent=" <<
+          (100 * step2_variant_compute_profile.score_thread_ms /
+            thread_denominator) << "\n";
   }
   out << "STEP2_PROFILE_FINAL version=1 mode=" << mode
       << " setup_ms=" << step2_profile.setup_ms
@@ -2902,6 +2953,14 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   
   size_t const bs = indices.size();
   ArrayXb err_caught = ArrayXb::Constant(bs, false);
+  const size_t profile_threads = params.profile_step2 ?
+    params.neff_threads : 0;
+  vector<double> thread_work_ms(profile_threads, 0);
+  vector<double> parse_thread_ms(profile_threads, 0);
+  vector<double> preprocess_thread_ms(profile_threads, 0);
+  vector<double> score_thread_ms(profile_threads, 0);
+  vector<double> interaction_thread_ms(profile_threads, 0);
+  vector<uint64_t> sparse_variants(profile_threads, 0);
 
     // start openmp for loop
 #if defined(_OPENMP)
@@ -2915,50 +2974,79 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       #if defined(_OPENMP)
       thread_num = omp_get_thread_num();
       #endif
+      ScopedProfileTimer thread_work_timer(params.profile_step2 ?
+        &thread_work_ms[thread_num] : nullptr);
 
       // to store variant information
-      if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") )
+      if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") ) {
+        ScopedProfileTimer parse_timer(params.profile_step2 ?
+          &parse_thread_ms[thread_num] : nullptr);
         parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout);
+      }
 
       // to store variant information
-      reset_thread(&(Gblock.thread_data[thread_num]), params);
+      {
+        ScopedProfileTimer preprocess_timer(params.profile_step2 ?
+          &preprocess_thread_ms[thread_num] : nullptr);
+        reset_thread(&(Gblock.thread_data[thread_num]), params);
 
-      // check if g is sparse
-      if (!params.w_interaction)
-        check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
+        // check if g is sparse
+        if (!params.w_interaction)
+          check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
+        if(params.profile_step2 &&
+           Gblock.thread_data[thread_num].is_sparse)
+          sparse_variants[thread_num]++;
+      }
 
       if (params.w_interaction)
       {
+        ScopedProfileTimer interaction_timer(params.profile_step2 ?
+          &interaction_thread_ms[thread_num] : nullptr);
         if (params.interaction_snp && (snpinfo[snp_index].ID == in_filters.interaction_cov))
           block_info->skip_int = true;
         get_interaction_terms(isnp, thread_num, &pheno_data, &Gblock, block_info, nullHLM, &params, sout);
       }
 
       // for QTs with non-sparse G: residualize and re-scale
-      if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse)
-        residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp), block_info, params);
-      else block_info->scale_fac = 1;
+      {
+        ScopedProfileTimer preprocess_timer(params.profile_step2 ?
+          &preprocess_thread_ms[thread_num] : nullptr);
+        if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse)
+          residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp), block_info, params);
+        else block_info->scale_fac = 1;
+      }
 
       // skip SNP if fails filters
       if (block_info->ignored || params.getCorMat)
         continue;
 
-      reset_stats(block_info, params);
+      {
+        ScopedProfileTimer preprocess_timer(params.profile_step2 ?
+          &preprocess_thread_ms[thread_num] : nullptr);
+        reset_stats(block_info, params);
+      }
 
       try
       {
-        // if ran vc tests, print out results before mask test
-        if ((block_info->sum_stats_vc.size() > 0) && !params.p_joint_only)
-          print_vc_sumstats(snp_index, "ADD", wgr_string, block_info, snpinfo, files, &params);
+        {
+          ScopedProfileTimer score_timer(params.profile_step2 ?
+            &score_thread_ms[thread_num] : nullptr);
+          // if ran vc tests, print out results before mask test
+          if ((block_info->sum_stats_vc.size() > 0) && !params.p_joint_only)
+            print_vc_sumstats(snp_index, "ADD", wgr_string, block_info, snpinfo, files, &params);
 
-        compute_score(isnp, snp_index, chrom, thread_num, test_string + params.condtl_suff, model_type + params.condtl_suff, res, p_sd_yres, params, pheno_data, Gblock, block_info, snpinfo, m_ests, firth_est, files, sout);
+          compute_score(isnp, snp_index, chrom, thread_num, test_string + params.condtl_suff, model_type + params.condtl_suff, res, p_sd_yres, params, pheno_data, Gblock, block_info, snpinfo, m_ests, firth_est, files, sout);
 
-        // for joint test, store logp
-        if (params.joint_test)
-          block_info->pval_log = Gblock.thread_data[thread_num].pval_log;
+          // for joint test, store logp
+          if (params.joint_test)
+            block_info->pval_log = Gblock.thread_data[thread_num].pval_log;
+        }
 
-        if (params.w_interaction)
+        if (params.w_interaction) {
+          ScopedProfileTimer interaction_timer(params.profile_step2 ?
+            &interaction_thread_ms[thread_num] : nullptr);
           apply_interaction_tests(snp_index, isnp, thread_num, res, p_sd_yres, model_type, test_string, &pheno_data, nullHLM, &in_filters, &files, &Gblock, block_info, snpinfo, &m_ests, &firth_est, &params, sout);
+        }
       } catch (...) {
         err_caught(isnp) = true;
         block_info->sum_stats[0] = boost::current_exception_diagnostic_information();
@@ -2969,6 +3057,22 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
 #if defined(_OPENMP)
   setNbThreads(params.threads);
 #endif
+
+  if(params.profile_step2) {
+    step2_variant_compute_profile.variants += bs;
+    step2_variant_compute_profile.sparse_variants += std::accumulate(
+      sparse_variants.begin(), sparse_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    step2_variant_compute_profile.parse_thread_ms += std::accumulate(
+      parse_thread_ms.begin(), parse_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.preprocess_thread_ms += std::accumulate(
+      preprocess_thread_ms.begin(), preprocess_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.score_thread_ms += std::accumulate(
+      score_thread_ms.begin(), score_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.interaction_thread_ms += std::accumulate(
+      interaction_thread_ms.begin(), interaction_thread_ms.end(), 0.0);
+  }
 
   // check no errors
   if(err_caught.any())
