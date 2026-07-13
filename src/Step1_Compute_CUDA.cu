@@ -2654,17 +2654,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const float alpha = 1.0f;
       const float beta = 0.0f;
-      if(mode == Step1GramMode::selfadjoint_rank_update)
-        check_cublas(cublasSsyrk(handle_, CUBLAS_FILL_MODE_LOWER,
-          CUBLAS_OP_N, rows, columns, &alpha,
-          d_fp32_genotypes_, rows, &beta, d_fp32_gram_, rows),
-          "cublasSsyrk(mixed-precision genotype Gram chunk)");
-      else
-        check_cublas(cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
-          rows, rows, columns, &alpha,
-          d_fp32_genotypes_, rows, d_fp32_genotypes_, rows, &beta,
-          d_fp32_gram_, rows),
-          "cublasSgemm(mixed-precision genotype Gram chunk)");
+      // Turing's FP32 SYRK path accumulates this tall product substantially
+      // less accurately than GEMM. Compute the full temporary product even
+      // when only its lower triangle is consumed; the FP64 accumulator below
+      // still stores and mirrors only the requested triangle.
+      check_cublas(cublasSgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_T,
+        rows, rows, columns, &alpha,
+        d_fp32_genotypes_, rows, d_fp32_genotypes_, rows, &beta,
+        d_fp32_gram_, rows),
+        "cublasSgemm(mixed-precision genotype Gram chunk)");
 
       accumulate_float_gram<<<(output_count - 1) / threads + 1, threads>>>(
         d_fp32_gram_, d_gram_, rows, output_count,
