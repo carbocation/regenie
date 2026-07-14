@@ -23,12 +23,6 @@ bool consistent_reduced_cox_firth_adjustment_enabled() {
     return value != nullptr && std::string(value) != "0";
 }
 
-bool legacy_cox_firth_line_search_enabled() {
-    const char* value =
-        std::getenv("REGENIE_COX_FIRTH_LEGACY_LINE_SEARCH");
-    return value != nullptr && std::string(value) != "0";
-}
-
 size_t third_moment_index(int first, int second, int third, int dimension) {
     if (first > second) std::swap(first, second);
     if (second > third) std::swap(second, third);
@@ -431,21 +425,12 @@ void cox_firth::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
                 // std::cout << "inner iteration: " << ii << "\n";
                 if (ii > _mxitnr) {
                     ++line_search_exhaustions;
-                    // Historical behavior discarded the final halved
-                    // candidate and retried the original rejected Newton
-                    // step with an epsilon added to every coefficient.  That
-                    // can recreate the same rejection cycle indefinitely.
-                    // Keep the smallest evaluated candidate by default,
-                    // matching the coxphf line-search behavior.  Retain an
-                    // environment switch for numerical A/B validation.
-                    if (legacy_cox_firth_line_search_enabled()) {
-                        steps.array() += 1e-6;
-                        betanew.head(_cols_incl) =
-                            beta.head(_cols_incl) + steps;
-                        update_eta_order(
-                            survivalData, Xmat, offset_val, betanew);
-                        cox_firth_likelihood(survivalData, Xmat);
-                    }
+                    steps.array() += 1e-6;
+                    betanew.head(_cols_incl) =
+                        beta.head(_cols_incl) + steps;
+                    update_eta_order(
+                        survivalData, Xmat, offset_val, betanew);
+                    cox_firth_likelihood(survivalData, Xmat);
                     break;
                     // throw std::runtime_error("inner loop: cannot correct step size");
                 }
@@ -633,13 +618,11 @@ void cox_firth::fit_1(const survival_data& survivalData, const Eigen::VectorXd& 
                 // std::cout << "inner iteration: " << ii << "\n";
                 if (ii > _mxitnr) {
                     ++line_search_exhaustions;
-                    if (legacy_cox_firth_line_search_enabled()) {
-                        steps += 1e-6;
-                        betanew = beta.array() + steps;
-                        update_eta_order(
-                            survivalData, g, offset_val, betanew);
-                        cox_firth_likelihood_1(survivalData, g);
-                    }
+                    steps += 1e-6;
+                    betanew = beta.array() + steps;
+                    update_eta_order(
+                        survivalData, g, offset_val, betanew);
+                    cox_firth_likelihood_1(survivalData, g);
                     break;
                     // throw std::runtime_error("inner loop: cannot correct step size");
                 }

@@ -605,10 +605,10 @@ void Data::print_step2_profile() {
       std::getenv("REGENIE_COX_FIRTH_SCORE_WARM_START");
     const bool score_warm_start = score_warm_start_value == nullptr ||
       std::string(score_warm_start_value) != "0";
-    const char* legacy_line_search_value =
-      std::getenv("REGENIE_COX_FIRTH_LEGACY_LINE_SEARCH");
-    const bool legacy_line_search = legacy_line_search_value != nullptr &&
-      std::string(legacy_line_search_value) != "0";
+    const char* direct_fallback_value =
+      std::getenv("REGENIE_COX_FIRTH_DIRECT_FALLBACK");
+    const bool direct_fallback = direct_fallback_value != nullptr &&
+      std::string(direct_fallback_value) != "0";
     const uint64_t correction_tests = correction_profile.spa_tests +
       correction_profile.logistic_firth_tests +
       correction_profile.cox_firth_tests;
@@ -671,8 +671,8 @@ void Data::print_step2_profile() {
           (consistent_reduced_cox_firth ? 1 : 0)
         << " cox_firth_score_warm_start=" <<
           (score_warm_start ? 1 : 0)
-        << " cox_firth_legacy_line_search=" <<
-          (legacy_line_search ? 1 : 0)
+        << " cox_firth_direct_fallback=" <<
+          (direct_fallback ? 1 : 0)
         << " cox_firth_likelihood_evaluations=" <<
           correction_profile.cox_firth_likelihood_evaluations
         << " cox_firth_step_halvings=" <<
