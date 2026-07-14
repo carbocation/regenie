@@ -90,6 +90,36 @@ ArrayXd compute_step1_linear_prediction(
   return prediction.col(0).array();
 }
 
+Eigen::Index kfold_level1_design_columns(
+  const struct ridgel1* l1, int phenotype, int fold_count) {
+
+  if(!l1 || phenotype < 0 ||
+     phenotype >= static_cast<int>(l1->test_mat.size()))
+    throw std::runtime_error(
+      "Step 1 k-fold level 1 design phenotype is unavailable");
+  const std::vector<MatrixXd>& fold_designs = l1->test_mat[phenotype];
+  if(fold_count <= 0 ||
+     fold_designs.size() != static_cast<size_t>(fold_count))
+    throw std::runtime_error(
+      "Step 1 k-fold level 1 design has an invalid fold layout");
+  const Eigen::Index columns = fold_designs.front().cols();
+  for(int fold = 1; fold < fold_count; ++fold)
+    if(fold_designs[fold].cols() != columns)
+      throw std::runtime_error(
+        "Step 1 k-fold level 1 designs have inconsistent columns");
+  return columns;
+}
+
+Eigen::Index concatenated_level1_design_columns(
+  const struct ridgel1* l1, int phenotype) {
+
+  if(!l1 || phenotype < 0 ||
+     phenotype >= static_cast<int>(l1->test_mat_conc.size()))
+    throw std::runtime_error(
+      "Step 1 concatenated level 1 design phenotype is unavailable");
+  return l1->test_mat_conc[phenotype].cols();
+}
+
 }
 
 
@@ -868,7 +898,8 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat[ph_eff][0].cols();
+    bs_l1 = kfold_level1_design_columns(
+      l1, ph_eff, params->cv_folds);
     bool use_simple_ridge = (l1->ridge_param_mult == 1).all();
 
     // compute XtX and Xty for each fold and cum. sum using test_mat's
@@ -975,7 +1006,7 @@ void ridge_level_1_loocv(struct in_files* files, struct param* params, struct ph
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat[ph_eff][0].cols();
+    bs_l1 = concatenated_level1_design_columns(l1, ph_eff);
     bool use_simple_ridge = (l1->ridge_param_mult == 1).all();
     if(params->test_l0)
       Yvec = pheno_data->phenotypes.col(ph) - l1->top_snp_pgs[0].col(ph);
@@ -1093,7 +1124,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat_conc[ph_eff].cols();
+    bs_l1 = kfold_level1_design_columns(
+      l1, ph_eff, params->cv_folds);
 
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( l1->pheno_l1_not_converged(ph) ) break;
@@ -1323,7 +1355,7 @@ void ridge_logistic_level_1_loocv(struct in_files* files, struct param* params, 
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat_conc[ph_eff].cols();
+    bs_l1 = concatenated_level1_design_columns(l1, ph_eff);
 
     MapArXd Y (pheno_data->phenotypes_raw.col(ph).data(), pheno_data->phenotypes_raw.rows());
     MapMatXd X (l1->test_mat_conc[ph_eff].data(), pheno_data->phenotypes_raw.rows(), bs_l1);
@@ -1611,7 +1643,8 @@ void ridge_poisson_level_1(struct in_files* files, struct param* params, struct 
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat[ph_eff][0].cols();
+    bs_l1 = kfold_level1_design_columns(
+      l1, ph_eff, params->cv_folds);
 
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( l1->pheno_l1_not_converged(ph) ) break;
@@ -1792,7 +1825,7 @@ void ridge_poisson_level_1_loocv(struct in_files* files, struct param* params, s
     if(params->write_l0_pred)
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = l1->test_mat_conc[ph_eff].cols();
+    bs_l1 = concatenated_level1_design_columns(l1, ph_eff);
 
     MapArXd Y (pheno_data->phenotypes_raw.col(ph).data(), pheno_data->phenotypes_raw.rows());
     MapMatXd X (l1->test_mat_conc[ph_eff].data(), pheno_data->phenotypes_raw.rows(), bs_l1);

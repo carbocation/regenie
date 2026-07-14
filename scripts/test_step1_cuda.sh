@@ -458,6 +458,7 @@ run_end_to_end_pair test_l0_loocv loocv \
   "${qt_common_args[@]}" --loocv --test-l0 --l0-pval-thr 0.05
 run_end_to_end_pair count_kfold kfold "${count_common_args[@]}"
 run_end_to_end_pair count_loocv loocv "${count_common_args[@]}" --loocv
+run_end_to_end_pair binary_kfold kfold "${binary_common_args[@]}"
 run_end_to_end_pair binary_loocv loocv "${binary_common_args[@]}"
 run_end_to_end_pair binary_full loocv \
   "${binary_common_args[@]}" --loocv --l1-full
