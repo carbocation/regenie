@@ -170,6 +170,18 @@ bool step1_pgen_packed_hardcalls_enabled() {
     "REGENIE_STEP1_PGEN_PACKED must be '0' or '1'");
 }
 
+uint64_t step1_prediction_output_threads(const int configured_threads) {
+  const char* value = std::getenv("REGENIE_STEP1_OUTPUT_THREADS");
+  if(!value || !*value)
+    return static_cast<uint64_t>(std::max(1, configured_threads));
+  char* end = nullptr;
+  const unsigned long long threads = std::strtoull(value, &end, 10);
+  if(end == value || *end != '\0' || threads == 0 || threads > 1024)
+    throw std::invalid_argument(
+      "REGENIE_STEP1_OUTPUT_THREADS must be an integer from 1 through 1024");
+  return static_cast<uint64_t>(threads);
+}
+
 void accumulate_step1_pgen_profile(
   Step1PgenReadProfile& destination,
   const Step1PgenReadProfile& source) {
@@ -1689,6 +1701,19 @@ void Data::print_step1_final_profile() {
       << " other_ms=" << other_ms
       << " total_ms=" << step1_profile.end_to_end_ms
       << "\n";
+  if(step1_profile.prediction_output_rows > 0) {
+    out << "STEP1_PROFILE scope=prediction_output"
+        << " rows=" << step1_profile.prediction_output_rows
+        << " values=" << step1_profile.prediction_output_values
+        << " threads=" << step1_profile.prediction_output_threads
+        << " format_ms=" << step1_profile.prediction_output_format_ms
+        << " write_ms=" << step1_profile.prediction_output_write_ms
+        << " other_ms=" << std::max(0.0,
+          step1_profile.output_ms -
+          step1_profile.prediction_output_format_ms -
+          step1_profile.prediction_output_write_ms)
+        << "\n";
+  }
   sout << out.str();
 }
 
@@ -2722,10 +2747,11 @@ void Data::write_predictions(int const& ph){
   string out, header;
   Files ofile;
   MatrixXd pred, prs;
+  vector<uint32_t> output_indices;
 
   // get header line once
   if(params.write_blups || params.make_loco || params.trait_mode || params.print_prs)
-    header = write_ID_header();
+    header = write_ID_header(output_indices);
 
   // for the per chromosome predictions (not used)
   if(params.write_blups) {
@@ -2754,8 +2780,14 @@ void Data::write_predictions(int const& ph){
     ofile << header;
 
     // for each row: print chromosome then blups
-    for(int chr = 0; chr < params.nChrom; chr++) 
-      ofile << write_chr_row(chr+1, ph, pred.col(chr));
+    for(int chr = 0; chr < params.nChrom; chr++) {
+      const string row = write_chr_row(
+        chr+1, ph, pred.col(chr), output_indices);
+      const auto write_start = ProfileClock::now();
+      ofile << row;
+      if(params.profile_step1)
+        step1_profile.prediction_output_write_ms += elapsed_ms(write_start);
+    }
 
     ofile.closeFile();
 
@@ -2788,8 +2820,14 @@ void Data::write_predictions(int const& ph){
     ofile << header;
 
     // print loco predictions for each chromosome
-    for(int chr = 0; chr < params.nChrom; chr++) 
-      ofile << write_chr_row(chr+1, ph, pred.col(chr));
+    for(int chr = 0; chr < params.nChrom; chr++) {
+      const string row = write_chr_row(
+        chr+1, ph, pred.col(chr), output_indices);
+      const auto write_start = ProfileClock::now();
+      ofile << row;
+      if(params.profile_step1)
+        step1_profile.prediction_output_write_ms += elapsed_ms(write_start);
+    }
 
     ofile.closeFile();
 
@@ -2840,7 +2878,11 @@ void Data::write_predictions(int const& ph){
     ofile << header;
 
     // print prs (set chr=0)
-    ofile << write_chr_row(0, ph, prs.col(0));
+    const string row = write_chr_row(0, ph, prs.col(0), output_indices);
+    const auto write_start = ProfileClock::now();
+    ofile << row;
+    if(params.profile_step1)
+      step1_profile.prediction_output_write_ms += elapsed_ms(write_start);
 
     ofile.closeFile();
 
@@ -2848,13 +2890,15 @@ void Data::write_predictions(int const& ph){
 
 }
 
-std::string Data::write_ID_header(){
+std::string Data::write_ID_header(vector<uint32_t>& output_indices){
 
   uint32_t index;
   string out, id_index;
   std::ostringstream buffer;
   map<string, uint32_t >::iterator itr_ind;
 
+  output_indices.clear();
+  output_indices.reserve(params.n_samples);
   buffer << "FID_IID ";
   for (itr_ind = params.FID_IID_to_ind.begin(); itr_ind != params.FID_IID_to_ind.end(); ++itr_ind) {
 
@@ -2862,6 +2906,7 @@ std::string Data::write_ID_header(){
     index = itr_ind->second;
     if( !in_filters.ind_in_analysis( index ) ) continue;
 
+    output_indices.push_back(index);
     id_index = itr_ind->first;
     buffer << id_index << " ";
 
@@ -2873,29 +2918,58 @@ std::string Data::write_ID_header(){
 }
 
 
-std::string Data::write_chr_row(int const& chr, int const& ph, const Ref<const VectorXd>& pred){
+std::string Data::write_chr_row(int const& chr, int const& ph,
+  const Ref<const VectorXd>& pred, const vector<uint32_t>& output_indices){
 
-  uint32_t index;
-  string out;
-  std::ostringstream buffer;
-  map<string, uint32_t >::iterator itr_ind;
+  const auto format_start = ProfileClock::now();
+  const uint64_t requested_threads =
+    step1_prediction_output_threads(params.threads);
+  const uint64_t thread_count = std::min<uint64_t>(requested_threads,
+    std::max<uint64_t>(1, output_indices.size()));
+  const size_t chunk_size = output_indices.empty() ? 0 :
+    (output_indices.size() + thread_count - 1) / thread_count;
+  vector<future<string> > chunks;
+  chunks.reserve(thread_count);
 
-  buffer << chr << " ";
-  for (itr_ind = params.FID_IID_to_ind.begin(); itr_ind != params.FID_IID_to_ind.end(); ++itr_ind) {
-
-    // check individual was included in analysis, if not then skip
-    index = itr_ind->second;
-    if( !in_filters.ind_in_analysis( index ) ) continue;
-
-    // print prs
-    if( pheno_data.masked_indivs(index, ph) )
-      buffer << pred(index) << " ";
-    else
-      buffer << "NA ";
+  for(size_t begin = 0; begin < output_indices.size(); begin += chunk_size) {
+    const size_t end = std::min(output_indices.size(), begin + chunk_size);
+    chunks.emplace_back(std::async(std::launch::async,
+      [this, &pred, &output_indices, ph, begin, end]() {
+        std::ostringstream chunk;
+        for(size_t position = begin; position < end; ++position) {
+          const uint32_t index = output_indices[position];
+          if(pheno_data.masked_indivs(index, ph))
+            chunk << pred(index) << " ";
+          else
+            chunk << "NA ";
+        }
+        return chunk.str();
+      }));
   }
 
-  buffer << endl;
-  return buffer.str();
+  std::ostringstream prefix;
+  prefix << chr << " ";
+  string buffer = prefix.str();
+  vector<string> formatted_chunks;
+  formatted_chunks.reserve(chunks.size());
+  size_t output_size = buffer.size() + 1;
+  for(size_t chunk = 0; chunk < chunks.size(); ++chunk) {
+    formatted_chunks.push_back(chunks[chunk].get());
+    output_size += formatted_chunks.back().size();
+  }
+  buffer.reserve(output_size);
+  for(size_t chunk = 0; chunk < formatted_chunks.size(); ++chunk)
+    buffer.append(formatted_chunks[chunk]);
+  buffer.push_back('\n');
+
+  if(params.profile_step1) {
+    step1_profile.prediction_output_rows++;
+    step1_profile.prediction_output_values += output_indices.size();
+    step1_profile.prediction_output_threads = std::max<uint64_t>(
+      step1_profile.prediction_output_threads, chunks.size());
+    step1_profile.prediction_output_format_ms += elapsed_ms(format_start);
+  }
+  return buffer;
 
 }
 
