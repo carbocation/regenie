@@ -19,7 +19,6 @@ resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
 level1_resident_mb="${CUDA_LEVEL1_RESIDENT_MB:-${REGENIE_CUDA_LEVEL1_RESIDENT_MB:-}}"
 level0_cholesky="${CUDA_LEVEL0_CHOLESKY:-${REGENIE_CUDA_LEVEL0_CHOLESKY:-1}}"
 level0_fold_batch="${CUDA_LEVEL0_FOLD_BATCH:-${REGENIE_CUDA_LEVEL0_FOLD_BATCH:-1}}"
-block_pipeline_depth="${CUDA_BLOCK_PIPELINE_DEPTH:-${REGENIE_CUDA_BLOCK_PIPELINE_DEPTH:-1}}"
 gram_precision="${CUDA_GRAM_PRECISION:-${REGENIE_CUDA_GRAM_PRECISION:-fp64}}"
 fp32_gram_chunk_samples="${CUDA_FP32_GRAM_CHUNK_SAMPLES:-${REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES:-128}}"
 pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
@@ -162,7 +161,6 @@ resident_mb=${resident_mb} \
 level1_resident_mb=${level1_resident_mb:-auto} \
 level0_cholesky=${level0_cholesky} \
 level0_fold_batch=${level0_fold_batch} \
-block_pipeline_depth=${block_pipeline_depth} \
 gram_precision=${gram_precision} \
 fp32_gram_chunk_samples=${fp32_gram_chunk_samples} \
 pinned_staging_mb=${pinned_staging_mb} pgen_prefetch_mb=${pgen_prefetch_mb} pgen_tile_variants=${pgen_tile_variants} pgen_packed=${pgen_packed} \
@@ -175,7 +173,6 @@ synthetic_max_bed_gb=${synthetic_max_bed_gb}"
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 export REGENIE_CUDA_LEVEL0_CHOLESKY="${level0_cholesky}"
 export REGENIE_CUDA_LEVEL0_FOLD_BATCH="${level0_fold_batch}"
-export REGENIE_CUDA_BLOCK_PIPELINE_DEPTH="${block_pipeline_depth}"
 if [[ -n "${level1_resident_mb}" ]]; then
   export REGENIE_CUDA_LEVEL1_RESIDENT_MB="${level1_resident_mb}"
 else
@@ -361,7 +358,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=10 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=9 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
 
   compare_loco_files "${label}" "${cpu_prefix}" "${cuda_prefix}"
@@ -469,7 +466,7 @@ run_synthetic_end_to_end_benchmark() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q '^STEP1_PROFILE version=10 backend=cuda mode=kfold ' "${cuda_prefix}.log"
+  grep -q '^STEP1_PROFILE version=9 backend=cuda mode=kfold ' "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
   compare_loco_files synthetic_kfold "${cpu_prefix}" "${cuda_prefix}"
 

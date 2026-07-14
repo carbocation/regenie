@@ -163,22 +163,6 @@ time by default so each sample-major destination write is contiguous; set
 memory-bandwidth tradeoff. Each worker retains one tile buffer, so its host
 memory cost is `tile variants * samples * 8` bytes per worker.
 
-Packed-hardcall k-fold runs can additionally form a three-stage pipeline:
-PGEN decoding for block `i+2`, CUDA preprocessing for block `i+1`, and the
-working-matrix/Level 0 calculations for block `i`. The host reader starts the
-following decode as soon as the intervening packed block has been submitted
-to CUDA. Device preprocessing itself waits until the current block's working
-matrices are complete because preprocessing and Gram construction compete for
-the same device bandwidth.
-Set `REGENIE_CUDA_BLOCK_PIPELINE_DEPTH=2` to preallocate two independent CUDA
-preprocessing/resident-genotype slots and enable this pipeline. REGENIE keeps
-block consumption and output in their original order, falls back to depth one
-when the two slots plus a 1 GB device reserve do not fit, and releases both
-slots before Level 1 so they do not reduce the resident Level 1 budget. The
-default is depth one while this optimization is being validated. Dosage,
-LOOCV, `--test-l0`, MAF-prior, non-PGEN, and CPU paths are unchanged. The
-validation harness exposes the setting as `CUDA_BLOCK_PIPELINE_DEPTH`.
-
 The CUDA backend uses FP64 throughout by default. On devices with weak FP64
 throughput, the opt-in setting `REGENIE_CUDA_GRAM_PRECISION=fp32` converts each
 bounded genotype chunk to FP32 for its Gram product and accumulates the chunk

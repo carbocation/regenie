@@ -221,14 +221,6 @@ bool cuda_level0_fold_batch_enabled() {
     "REGENIE_CUDA_LEVEL0_FOLD_BATCH must be '0' or '1'");
 }
 
-int cuda_block_pipeline_depth() {
-  const char* value = std::getenv("REGENIE_CUDA_BLOCK_PIPELINE_DEPTH");
-  if(!value || !*value || std::string(value) == "1") return 1;
-  if(std::string(value) == "2") return 2;
-  throw std::invalid_argument(
-    "REGENIE_CUDA_BLOCK_PIPELINE_DEPTH must be '1' or '2'");
-}
-
 double elapsed_ms(const ComputeClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ComputeClock::now() - start).count();
 }
@@ -534,37 +526,6 @@ struct CudaLevel0CholeskyLane {
   size_t info_capacity = 0;
 };
 
-struct CudaPackedPreprocessSlot {
-  cudaStream_t stream = nullptr;
-  cublasHandle_t blas = nullptr;
-  cudaEvent_t compute_start = nullptr;
-  cudaEvent_t expand_start = nullptr;
-  cudaEvent_t expand_stop = nullptr;
-  cudaEvent_t compute_stop = nullptr;
-  double* genotypes = nullptr;
-  unsigned char* packed_hardcalls = nullptr;
-  unsigned char* transposed_hardcalls = nullptr;
-  unsigned int* row_counts = nullptr;
-  double* weights = nullptr;
-  double* scales = nullptr;
-  double* covariates = nullptr;
-  double* coefficients = nullptr;
-  double* host_scales = nullptr;
-  size_t genotypes_capacity = 0;
-  size_t packed_hardcalls_capacity = 0;
-  size_t transposed_hardcalls_capacity = 0;
-  size_t row_counts_capacity = 0;
-  size_t weights_capacity = 0;
-  size_t scales_capacity = 0;
-  size_t covariates_capacity = 0;
-  size_t coefficients_capacity = 0;
-  size_t host_scales_capacity = 0;
-  int rows = 0;
-  int columns = 0;
-  int state = 0; // 0=free, 1=pending, 2=active
-  Step1ComputeTimings timings;
-};
-
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
@@ -575,9 +536,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         level0_cholesky_enabled_(cuda_level0_cholesky_enabled()),
         level0_fold_batch_enabled_(cuda_level0_fold_batch_enabled()),
-        block_pipeline_depth_(cuda_block_pipeline_depth()),
-        active_packed_pipeline_slot_(-1),
-        packed_pipeline_prepared_(false),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
@@ -629,8 +587,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       cudaSetDevice(device_);
       for(auto& lane : level0_cholesky_lanes_)
         release_level0_cholesky_lane(lane);
-      for(int index = 0; index < 2; ++index)
-        release_packed_preprocess_slot(packed_preprocess_slots_[index]);
       for(int index = 0; index < 2; ++index) {
         if(upload_streams_[index])
           cudaStreamSynchronize(upload_streams_[index]);
@@ -703,9 +659,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(level0_cholesky_enabled_)
         result << ", level0 folds " <<
           (level0_fold_batch_enabled_ ? "batched" : "sequential");
-      if(block_pipeline_depth_ > 1)
-        result << ", block pipeline requested depth " <<
-          block_pipeline_depth_;
       result << ")";
       return result.str();
     }
@@ -720,246 +673,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         static_cast<long long>(variants) * samples;
       return element_count <= INT_MAX &&
         element_count <= resident_preprocess_max_elements_;
-    }
-
-    int configure_packed_hardcall_pipeline(
-      Eigen::Index maximum_variants,
-      Eigen::Index samples,
-      Eigen::Index covariate_count) override {
-
-      finish_packed_hardcall_pipeline();
-      if(block_pipeline_depth_ < 2 || maximum_variants <= 0 ||
-         samples <= 0 || covariate_count < 0 ||
-         !can_preprocess_packed_hardcalls(maximum_variants, samples))
-        return 1;
-
-      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
-      const size_t rows = static_cast<size_t>(maximum_variants);
-      const size_t columns = static_cast<size_t>(samples);
-      const size_t covariates = static_cast<size_t>(covariate_count);
-      const size_t elements = rows * columns;
-      const size_t packed_stride = (columns + 3) / 4;
-      const size_t packed_bytes = rows * packed_stride;
-      const size_t per_slot_bytes =
-        elements * sizeof(double) + 2 * packed_bytes +
-        columns * sizeof(double) + rows * sizeof(double) +
-        rows * sizeof(unsigned int) +
-        columns * covariates * sizeof(double) +
-        rows * covariates * sizeof(double);
-      size_t free_bytes = 0;
-      size_t total_bytes = 0;
-      check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes),
-        "cudaMemGetInfo(block pipeline)");
-      free_bytes = std::min(free_bytes, total_bytes);
-      const size_t reserve_bytes = size_t(1000) * 1000000;
-      if(per_slot_bytes > (std::numeric_limits<size_t>::max() -
-           reserve_bytes) / 2 ||
-         2 * per_slot_bytes + reserve_bytes > free_bytes)
-        return 1;
-
-      for(int index = 0; index < 2; ++index)
-        ensure_packed_preprocess_slot_capacity(
-          packed_preprocess_slots_[index], maximum_variants, samples,
-          covariate_count);
-      packed_pipeline_prepared_ = true;
-      return 2;
-    }
-
-    bool submit_packed_hardcall_preprocessing(
-      const unsigned char* packed_hardcalls,
-      size_t packed_bytes,
-      size_t packed_stride_bytes,
-      Eigen::Index variants,
-      Eigen::Index samples,
-      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
-      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
-      double degrees_of_freedom,
-      double minimum_scale,
-      int& pipeline_slot) override {
-
-      pipeline_slot = -1;
-      if(!packed_pipeline_prepared_) return false;
-      const ComputeClock::time_point validation_start = ComputeClock::now();
-      validate_packed_hardcall_preprocessing_inputs(
-        packed_hardcalls, packed_bytes, packed_stride_bytes,
-        variants, samples, covariates, sample_weights,
-        degrees_of_freedom, minimum_scale);
-
-      int slot_index = -1;
-      for(int index = 0; index < 2; ++index)
-        if(packed_preprocess_slots_[index].state == 0) {
-          slot_index = index;
-          break;
-        }
-      if(slot_index < 0) return false;
-
-      CudaPackedPreprocessSlot& slot =
-        packed_preprocess_slots_[slot_index];
-      slot.timings = Step1ComputeTimings();
-      slot.timings.packed_hardcall_validation_ms =
-        elapsed_ms(validation_start);
-      slot.rows = checked_int(variants,
-        "pipelined packed hardcall variant count");
-      slot.columns = checked_int(samples,
-        "pipelined packed hardcall sample count");
-      const int covariate_count = checked_int(covariates.cols(),
-        "pipelined packed hardcall covariate count");
-      const int element_count = checked_element_count(
-        slot.rows, slot.columns, "pipelined packed hardcall block");
-      const size_t required_packed_bytes =
-        static_cast<size_t>(slot.rows) * packed_stride_bytes;
-
-      const ComputeClock::time_point host_prepare_start =
-        ComputeClock::now();
-      const Eigen::MatrixXd packed_covariates = covariate_count > 0 ?
-        contiguous_copy_if_needed(covariates) : Eigen::MatrixXd();
-      const double* covariate_data = packed_covariates.size() ?
-        packed_covariates.data() : covariates.data();
-      slot.timings.packed_hardcall_host_prepare_ms =
-        elapsed_ms(host_prepare_start);
-
-      const ComputeClock::time_point transfer_start = ComputeClock::now();
-      copy_host_to_device_staged(slot.packed_hardcalls, packed_hardcalls,
-        required_packed_bytes,
-        "copy pipelined packed hardcalls to CUDA device", &slot.timings);
-      check_cuda(cudaMemcpy(slot.weights, sample_weights.data(),
-        static_cast<size_t>(slot.columns) * sizeof(double),
-        cudaMemcpyHostToDevice),
-        "copy pipelined packed hardcall weights to CUDA device");
-      if(covariate_count > 0)
-        check_cuda(cudaMemcpy(slot.covariates, covariate_data,
-          covariates.size() * sizeof(double), cudaMemcpyHostToDevice),
-          "copy pipelined packed hardcall covariates to CUDA device");
-      slot.timings.upload_ms += elapsed_ms(transfer_start);
-      slot.timings.packed_hardcall_upload_count = 1;
-      slot.timings.packed_hardcall_upload_bytes = required_packed_bytes;
-      slot.timings.packed_pipeline_submission_count = 1;
-
-      const int threads = 256;
-      check_cuda(cudaEventRecord(slot.compute_start, slot.stream),
-        "record pipelined packed preprocessing start");
-      check_cuda(cudaEventRecord(slot.expand_start, slot.stream),
-        "record pipelined packed expansion start");
-      packed_hardcall_row_statistics<<<slot.rows, threads, 0, slot.stream>>>(
-        slot.packed_hardcalls, packed_stride_bytes, slot.weights,
-        slot.scales, slot.row_counts, slot.rows, slot.columns);
-      check_cuda(cudaGetLastError(),
-        "compute pipelined packed hardcall row statistics kernel");
-      const int packed_columns = (slot.columns + 3) / 4;
-      const dim3 transpose_threads(32, 8);
-      const dim3 transpose_grid(
-        (packed_columns + 31) / 32, (slot.rows + 31) / 32);
-      transpose_packed_hardcalls<<<transpose_grid, transpose_threads, 0,
-        slot.stream>>>(slot.packed_hardcalls, slot.transposed_hardcalls,
-          slot.rows, packed_columns, packed_stride_bytes);
-      check_cuda(cudaGetLastError(),
-        "transpose pipelined packed hardcalls kernel");
-      const int element_blocks = (element_count + threads - 1) / threads;
-      expand_packed_hardcalls<<<element_blocks, threads, 0, slot.stream>>>(
-        slot.transposed_hardcalls, slot.weights, slot.scales,
-        slot.row_counts, slot.genotypes, slot.rows, element_count);
-      check_cuda(cudaGetLastError(),
-        "expand pipelined packed hardcalls kernel");
-      check_cuda(cudaEventRecord(slot.expand_stop, slot.stream),
-        "record pipelined packed expansion stop");
-
-      if(covariate_count > 0) {
-        const double one = 1.0;
-        const double zero = 0.0;
-        const double minus_one = -1.0;
-        check_cublas(cublasDgemm(slot.blas, CUBLAS_OP_N, CUBLAS_OP_N,
-          slot.rows, covariate_count, slot.columns, &one,
-          slot.genotypes, slot.rows, slot.covariates, slot.columns, &zero,
-          slot.coefficients, slot.rows),
-          "cublasDgemm(pipelined projection coefficients)");
-        check_cublas(cublasDgemm(slot.blas, CUBLAS_OP_N, CUBLAS_OP_T,
-          slot.rows, slot.columns, covariate_count, &minus_one,
-          slot.coefficients, slot.rows, slot.covariates, slot.columns,
-          &one, slot.genotypes, slot.rows),
-          "cublasDgemm(pipelined packed hardcall residuals)");
-      }
-      compute_genotype_row_scales<<<slot.rows, threads,
-        threads * sizeof(double), slot.stream>>>(slot.genotypes,
-          slot.scales, slot.rows, slot.columns, degrees_of_freedom);
-      check_cuda(cudaGetLastError(),
-        "compute pipelined packed hardcall row scales kernel");
-      check_cuda(cudaMemcpyAsync(slot.host_scales, slot.scales,
-        static_cast<size_t>(slot.rows) * sizeof(double),
-        cudaMemcpyDeviceToHost, slot.stream),
-        "copy pipelined packed hardcall scales to host");
-      scale_genotype_rows<<<element_blocks, threads, 0, slot.stream>>>(
-        slot.genotypes, slot.scales, nullptr, slot.rows, element_count);
-      check_cuda(cudaGetLastError(),
-        "scale pipelined packed hardcall rows kernel");
-      check_cuda(cudaEventRecord(slot.compute_stop, slot.stream),
-        "record pipelined packed preprocessing stop");
-      slot.state = 1;
-      pipeline_slot = slot_index;
-      return true;
-    }
-
-    bool activate_packed_hardcall_preprocessing(
-      int pipeline_slot,
-      Eigen::VectorXd& row_scales,
-      Step1ComputeTimings* timings) override {
-
-      if(pipeline_slot < 0 || pipeline_slot >= 2 ||
-         packed_preprocess_slots_[pipeline_slot].state != 1 ||
-         active_packed_pipeline_slot_ >= 0)
-        return false;
-      CudaPackedPreprocessSlot& slot =
-        packed_preprocess_slots_[pipeline_slot];
-      const ComputeClock::time_point wait_start = ComputeClock::now();
-      check_cuda(cudaEventSynchronize(slot.compute_stop),
-        "wait for pipelined packed preprocessing");
-      const double wait_ms = elapsed_ms(wait_start);
-      float preprocess_ms = 0;
-      float expand_ms = 0;
-      check_cuda(cudaEventElapsedTime(&preprocess_ms,
-        slot.compute_start, slot.compute_stop),
-        "time pipelined packed preprocessing");
-      check_cuda(cudaEventElapsedTime(&expand_ms,
-        slot.expand_start, slot.expand_stop),
-        "time pipelined packed expansion");
-
-      row_scales.resize(slot.rows);
-      if(slot.rows > 0)
-        std::memcpy(row_scales.data(), slot.host_scales,
-          static_cast<size_t>(slot.rows) * sizeof(double));
-      if(!row_scales.allFinite())
-        throw std::runtime_error(
-          "CUDA pipelined packed preprocessing produced non-finite row scales");
-
-      slot.timings.preprocess_ms += preprocess_ms;
-      slot.timings.packed_hardcall_expand_ms += expand_ms;
-      slot.timings.packed_pipeline_wait_ms += wait_ms;
-      slot.timings.packed_pipeline_service_ms +=
-        slot.timings.upload_ms + preprocess_ms;
-      slot.timings.packed_hardcall_backend_wall_ms +=
-        slot.timings.packed_hardcall_validation_ms +
-        slot.timings.packed_hardcall_allocation_ms +
-        slot.timings.packed_hardcall_host_prepare_ms +
-        slot.timings.upload_ms + preprocess_ms;
-      if(timings) *timings = slot.timings;
-
-      active_packed_pipeline_slot_ = pipeline_slot;
-      slot.state = 2;
-      resident_host_data_ = nullptr;
-      resident_rows_ = slot.rows;
-      resident_columns_ = slot.columns;
-      resident_valid_ = true;
-      return true;
-    }
-
-    void finish_packed_hardcall_pipeline() override {
-      if(active_packed_pipeline_slot_ >= 0) {
-        packed_preprocess_slots_[active_packed_pipeline_slot_].state = 0;
-        active_packed_pipeline_slot_ = -1;
-      }
-      for(int index = 0; index < 2; ++index)
-        release_packed_preprocess_slot(packed_preprocess_slots_[index]);
-      packed_pipeline_prepared_ = false;
-      invalidate_resident_genotypes();
     }
 
     bool preprocess_packed_hardcalls(
@@ -1342,10 +1055,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
     void release_preprocessed_genotypes() override {
-      if(active_packed_pipeline_slot_ >= 0) {
-        packed_preprocess_slots_[active_packed_pipeline_slot_].state = 0;
-        active_packed_pipeline_slot_ = -1;
-      }
       invalidate_resident_genotypes();
     }
 
@@ -1764,7 +1473,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->resident_reuse_count++;
       }
 
-      const double* device_genotypes = active_resident_genotypes() +
+      const double* device_genotypes = d_resident_genotypes_ +
         start_column * resident_rows_;
       const double alpha = 1.0;
       const double beta = 0.0;
@@ -1925,7 +1634,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           chunk_samples, column_count - start);
         const int count = checked_int(
           count_index, "resident ridge prediction chunk sample count");
-        const double* device_prediction_chunk = active_resident_genotypes() +
+        const double* device_prediction_chunk = d_resident_genotypes_ +
           (start_column + start) * resident_rows_;
         if(timings) timings->resident_reuse_count++;
 
@@ -1999,7 +1708,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       ensure_capacity(d_inverse_, inverse_capacity_, predictions.size(),
         "cudaMalloc(resident Cholesky ridge predictions)");
-      const double* device_prediction_matrix = active_resident_genotypes() +
+      const double* device_prediction_matrix = d_resident_genotypes_ +
         start_column * resident_rows_;
       const double alpha = 1.0;
       const double beta = 0.0;
@@ -2197,7 +1906,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           column_counts(static_cast<Eigen::Index>(system)),
           "resident batched Cholesky ridge sample count");
         if(sample_count > 0) {
-          const double* prediction_matrix = active_resident_genotypes() +
+          const double* prediction_matrix = d_resident_genotypes_ +
             static_cast<Eigen::Index>(
               start_columns(static_cast<Eigen::Index>(system))) *
               resident_rows_;
@@ -4317,99 +4026,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
-    static void release_packed_preprocess_slot(
-      CudaPackedPreprocessSlot& slot) {
-      if(slot.stream) cudaStreamSynchronize(slot.stream);
-      if(slot.host_scales) cudaFreeHost(slot.host_scales);
-      if(slot.coefficients) cudaFree(slot.coefficients);
-      if(slot.covariates) cudaFree(slot.covariates);
-      if(slot.scales) cudaFree(slot.scales);
-      if(slot.weights) cudaFree(slot.weights);
-      if(slot.row_counts) cudaFree(slot.row_counts);
-      if(slot.transposed_hardcalls) cudaFree(slot.transposed_hardcalls);
-      if(slot.packed_hardcalls) cudaFree(slot.packed_hardcalls);
-      if(slot.genotypes) cudaFree(slot.genotypes);
-      if(slot.compute_stop) cudaEventDestroy(slot.compute_stop);
-      if(slot.expand_stop) cudaEventDestroy(slot.expand_stop);
-      if(slot.expand_start) cudaEventDestroy(slot.expand_start);
-      if(slot.compute_start) cudaEventDestroy(slot.compute_start);
-      if(slot.blas) cublasDestroy(slot.blas);
-      if(slot.stream) cudaStreamDestroy(slot.stream);
-      slot = CudaPackedPreprocessSlot();
-    }
-
-    void ensure_packed_preprocess_slot_capacity(
-      CudaPackedPreprocessSlot& slot,
-      Eigen::Index variants,
-      Eigen::Index samples,
-      Eigen::Index covariate_count) {
-
-      if(!slot.stream) {
-        try {
-          check_cuda(cudaStreamCreateWithFlags(
-            &slot.stream, cudaStreamNonBlocking),
-            "create packed preprocessing pipeline stream");
-          check_cublas(cublasCreate(&slot.blas),
-            "create packed preprocessing pipeline cuBLAS handle");
-          check_cublas(cublasSetStream(slot.blas, slot.stream),
-            "set packed preprocessing pipeline cuBLAS stream");
-          check_cuda(cudaEventCreate(&slot.compute_start),
-            "create packed preprocessing start event");
-          check_cuda(cudaEventCreate(&slot.expand_start),
-            "create packed expansion start event");
-          check_cuda(cudaEventCreate(&slot.expand_stop),
-            "create packed expansion stop event");
-          check_cuda(cudaEventCreate(&slot.compute_stop),
-            "create packed preprocessing stop event");
-        } catch(...) {
-          release_packed_preprocess_slot(slot);
-          throw;
-        }
-      }
-
-      const Eigen::Index elements = variants * samples;
-      const size_t packed_stride =
-        (static_cast<size_t>(samples) + 3) / 4;
-      const Eigen::Index packed_bytes = static_cast<Eigen::Index>(
-        static_cast<size_t>(variants) * packed_stride);
-      ensure_capacity(slot.genotypes, slot.genotypes_capacity, elements,
-        "cudaMalloc(pipelined resident genotype block)");
-      ensure_capacity(slot.packed_hardcalls,
-        slot.packed_hardcalls_capacity, packed_bytes,
-        "cudaMalloc(pipelined packed hardcall block)");
-      ensure_capacity(slot.transposed_hardcalls,
-        slot.transposed_hardcalls_capacity, packed_bytes,
-        "cudaMalloc(pipelined transposed hardcall block)");
-      ensure_capacity(slot.row_counts, slot.row_counts_capacity, variants,
-        "cudaMalloc(pipelined packed row counts)");
-      ensure_capacity(slot.weights, slot.weights_capacity, samples,
-        "cudaMalloc(pipelined sample weights)");
-      ensure_capacity(slot.scales, slot.scales_capacity, variants,
-        "cudaMalloc(pipelined row scales)");
-      if(covariate_count > 0) {
-        ensure_capacity(slot.covariates, slot.covariates_capacity,
-          samples * covariate_count,
-          "cudaMalloc(pipelined covariates)");
-        ensure_capacity(slot.coefficients, slot.coefficients_capacity,
-          variants * covariate_count,
-          "cudaMalloc(pipelined projection coefficients)");
-      }
-      if(static_cast<size_t>(variants) > slot.host_scales_capacity) {
-        if(slot.host_scales) {
-          check_cuda(cudaFreeHost(slot.host_scales),
-            "free pipelined host row scales");
-          slot.host_scales = nullptr;
-          slot.host_scales_capacity = 0;
-        }
-        check_cuda(cudaHostAlloc(
-          reinterpret_cast<void**>(&slot.host_scales),
-          static_cast<size_t>(variants) * sizeof(double),
-          cudaHostAllocPortable),
-          "allocate pipelined host row scales");
-        slot.host_scales_capacity = static_cast<size_t>(variants);
-      }
-    }
-
     static void release_level0_cholesky_lane(
       CudaLevel0CholeskyLane& lane) {
       if(lane.stream) cudaStreamSynchronize(lane.stream);
@@ -4615,12 +4231,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       resident_design_valid_ = false;
     }
 
-    double* active_resident_genotypes() const {
-      if(active_packed_pipeline_slot_ >= 0)
-        return packed_preprocess_slots_[active_packed_pipeline_slot_].genotypes;
-      return d_resident_genotypes_;
-    }
-
     const double* resident_genotype_columns(
       const Eigen::Ref<const Eigen::MatrixXd>& matrix,
       Eigen::Index start_column, Eigen::Index column_count) const {
@@ -4646,7 +4256,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(first_column < 0 ||
          first_column > resident_columns_ - matrix.cols())
         return nullptr;
-      return active_resident_genotypes() +
+      return d_resident_genotypes_ +
         (first_column + start_column) * resident_rows_;
     }
 
@@ -4809,10 +4419,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     bool direct_grouped_upload_;
     bool level0_cholesky_enabled_;
     bool level0_fold_batch_enabled_;
-    int block_pipeline_depth_;
-    int active_packed_pipeline_slot_;
-    bool packed_pipeline_prepared_;
-    CudaPackedPreprocessSlot packed_preprocess_slots_[2];
     Eigen::Index resident_preprocess_max_elements_;
     Eigen::Index level1_resident_max_elements_;
     void* pinned_staging_[2] = {nullptr, nullptr};

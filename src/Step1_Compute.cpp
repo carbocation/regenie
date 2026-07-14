@@ -153,53 +153,6 @@ bool Step1ComputeBackend::preprocess_packed_hardcalls(
   return false;
 }
 
-int Step1ComputeBackend::configure_packed_hardcall_pipeline(
-  Eigen::Index maximum_variants,
-  Eigen::Index samples,
-  Eigen::Index covariate_count) {
-  (void)maximum_variants;
-  (void)samples;
-  (void)covariate_count;
-  return 1;
-}
-
-bool Step1ComputeBackend::submit_packed_hardcall_preprocessing(
-  const unsigned char* packed_hardcalls,
-  size_t packed_bytes,
-  size_t packed_stride_bytes,
-  Eigen::Index variants,
-  Eigen::Index samples,
-  const Eigen::Ref<const Eigen::MatrixXd>& covariates,
-  const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
-  double degrees_of_freedom,
-  double minimum_scale,
-  int& pipeline_slot) {
-  (void)packed_hardcalls;
-  (void)packed_bytes;
-  (void)packed_stride_bytes;
-  (void)variants;
-  (void)samples;
-  (void)covariates;
-  (void)sample_weights;
-  (void)degrees_of_freedom;
-  (void)minimum_scale;
-  pipeline_slot = -1;
-  return false;
-}
-
-bool Step1ComputeBackend::activate_packed_hardcall_preprocessing(
-  int pipeline_slot,
-  Eigen::VectorXd& row_scales,
-  Step1ComputeTimings* timings) {
-  (void)pipeline_slot;
-  (void)row_scales;
-  (void)timings;
-  return false;
-}
-
-void Step1ComputeBackend::finish_packed_hardcall_pipeline() {
-}
-
 void Step1ComputeBackend::compute_preprocessed_products(
   Eigen::Index start_column,
   Eigen::Index column_count,
