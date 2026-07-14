@@ -29,6 +29,17 @@
 
 class Step1ComputeBackend;
 
+struct Step1GroupedPredictionProfile {
+  uint64_t calls = 0;
+  uint64_t design_uploads = 0;
+  uint64_t design_upload_bytes = 0;
+  double wall_ms = 0;
+  double upload_ms = 0;
+  double compute_ms = 0;
+  double download_ms = 0;
+  double host_materialization_ms = 0;
+};
+
 struct Step1Profile {
   uint64_t blocks = 0;
   uint64_t variants = 0;
@@ -84,6 +95,7 @@ struct Step1Profile {
   uint64_t prediction_output_threads = 0;
   double prediction_output_format_ms = 0;
   double prediction_output_write_ms = 0;
+  Step1GroupedPredictionProfile grouped_prediction;
   double end_to_end_ms = 0;
 };
 
@@ -197,6 +209,12 @@ class Data {
     void make_predictions_count(int const&,int const&);
     void make_predictions_count_loocv(int const&,int const&);
     void make_predictions_cox(int const&, int const&);
+    void step1_grouped_predict(
+      const Eigen::Ref<const Eigen::MatrixXd>&,
+      const Eigen::Ref<const Eigen::VectorXd>&,
+      const Eigen::Ref<const Eigen::VectorXi>&,
+      const Eigen::Ref<const Eigen::VectorXi>&,
+      Eigen::MatrixXd&);
     void print_snp_betas(const Eigen::Ref<const Eigen::VectorXd>&);
     void write_predictions(int const&);
     std::string write_ID_header(std::vector<uint32_t>&);

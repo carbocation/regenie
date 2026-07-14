@@ -340,6 +340,9 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.packed_hardcall_host_prepare_ms;
   destination.packed_hardcall_backend_wall_ms +=
     source.packed_hardcall_backend_wall_ms;
+  destination.design_upload_count += source.design_upload_count;
+  destination.design_upload_bytes += source.design_upload_bytes;
+  destination.host_materialization_ms += source.host_materialization_ms;
 }
 
 void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
@@ -1784,7 +1787,11 @@ void run_nonlinear_benchmark(Step1ComputeBackend& backend,
             << " crossproduct_ms=" << totals.crossproduct_ms / divisor
             << " gram_ms=" << totals.gram_ms / divisor
             << " ridge_ms=" << totals.ridge_ms / divisor
-            << " download_ms=" << totals.download_ms / divisor << "\n";
+            << " download_ms=" << totals.download_ms / divisor
+            << " design_uploads=" << totals.design_upload_count / divisor
+            << " design_upload_bytes=" << totals.design_upload_bytes / divisor
+            << " host_materialization_ms=" <<
+              totals.host_materialization_ms / divisor << "\n";
 }
 
 void run_level1_benchmark(Step1ComputeBackend& backend,
@@ -1883,7 +1890,11 @@ void run_level1_benchmark(Step1ComputeBackend& backend,
             << " eigensolve_ms=" << totals.eigensolve_ms / divisor
             << " transform_ms=" << totals.transform_ms / divisor
             << " ridge_ms=" << totals.ridge_ms / divisor
-            << " download_ms=" << totals.download_ms / divisor << "\n";
+            << " download_ms=" << totals.download_ms / divisor
+            << " design_uploads=" << totals.design_upload_count / divisor
+            << " design_upload_bytes=" << totals.design_upload_bytes / divisor
+            << " host_materialization_ms=" <<
+              totals.host_materialization_ms / divisor << "\n";
 }
 
 }

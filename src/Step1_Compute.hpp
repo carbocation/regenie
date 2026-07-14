@@ -57,6 +57,9 @@ struct Step1ComputeTimings {
   double packed_hardcall_allocation_ms = 0;
   double packed_hardcall_host_prepare_ms = 0;
   double packed_hardcall_backend_wall_ms = 0;
+  uint64_t design_upload_count = 0;
+  uint64_t design_upload_bytes = 0;
+  double host_materialization_ms = 0;
 };
 
 class Step1ComputeBackend {

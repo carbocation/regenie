@@ -153,6 +153,14 @@ size_t cuda_pinned_staging_bytes() {
   return static_cast<size_t>(megabytes) * 1000000;
 }
 
+bool cuda_direct_grouped_upload_enabled() {
+  const char* value = std::getenv("REGENIE_CUDA_DIRECT_GROUPED_UPLOAD");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_CUDA_DIRECT_GROUPED_UPLOAD must be '0' or '1'");
+}
+
 double elapsed_ms(const ComputeClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ComputeClock::now() - start).count();
 }
@@ -436,6 +444,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         gram_precision_(cuda_gram_precision()),
         fp32_gram_chunk_samples_(cuda_fp32_gram_chunk_samples()),
         pinned_staging_chunk_bytes_(cuda_pinned_staging_bytes()),
+        direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_fp32_genotypes_(nullptr), d_fp32_gram_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
@@ -536,6 +545,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(pinned_staging_chunk_bytes_ > 0)
         result << ", pinned upload staging " <<
           (pinned_staging_chunk_bytes_ / 1000000.0) << " MB";
+      result << ", grouped upload " <<
+        (direct_grouped_upload_ ? "direct" : "materialized");
       result << ")";
       return result.str();
     }
@@ -2392,14 +2403,34 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           chunk_rows, design.rows() - start);
         const int count = checked_int(
           count_index, "grouped prediction chunk row count");
-        const Eigen::MatrixXd design_chunk = design.middleRows(start, count_index);
-
-        if(timings) transfer_start = ComputeClock::now();
-        if(design_chunk.size() > 0)
-          check_cuda(cudaMemcpy(d_genotypes_, design_chunk.data(),
-            design_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
-            "copy grouped prediction chunk to CUDA device");
-        if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+        if(direct_grouped_upload_) {
+          if(timings) transfer_start = ComputeClock::now();
+          copy_matrix_row_chunk_to_device(design, start, count_index,
+            d_genotypes_,
+            "copy grouped prediction chunk directly to CUDA device");
+          if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+        } else {
+          ComputeClock::time_point materialization_start;
+          if(timings) materialization_start = ComputeClock::now();
+          const Eigen::MatrixXd design_chunk =
+            design.middleRows(start, count_index);
+          if(timings)
+            timings->host_materialization_ms +=
+              elapsed_ms(materialization_start);
+          if(timings) transfer_start = ComputeClock::now();
+          if(design_chunk.size() > 0) {
+            check_cuda(cudaMemcpy(d_genotypes_, design_chunk.data(),
+              design_chunk.size() * sizeof(double), cudaMemcpyHostToDevice),
+              "copy materialized grouped prediction chunk to CUDA device");
+          }
+          if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+        }
+        if(timings) {
+          timings->design_upload_count++;
+          timings->design_upload_bytes +=
+            static_cast<uint64_t>(count_index) *
+            static_cast<uint64_t>(design.cols()) * sizeof(double);
+        }
 
         std::unique_ptr<CudaEventPair> prediction_events;
         if(timings) {
@@ -3550,6 +3581,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaGramPrecision gram_precision_;
     int fp32_gram_chunk_samples_;
     size_t pinned_staging_chunk_bytes_;
+    bool direct_grouped_upload_;
     void* pinned_staging_[2] = {nullptr, nullptr};
     cudaStream_t upload_streams_[2] = {nullptr, nullptr};
     double* d_genotypes_;
