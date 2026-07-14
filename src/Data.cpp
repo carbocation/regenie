@@ -632,7 +632,7 @@ void Data::print_step2_profile() {
       std::string(direct_reduced_fallback_value) != "0";
     const char* direct_null_fallback_value =
       std::getenv("REGENIE_COX_FIRTH_DIRECT_NULL_FALLBACK");
-    const bool direct_null_fallback = direct_null_fallback_value != nullptr &&
+    const bool direct_null_fallback = direct_null_fallback_value == nullptr ||
       std::string(direct_null_fallback_value) != "0";
     const uint64_t correction_tests = correction_profile.spa_tests +
       correction_profile.logistic_firth_tests +

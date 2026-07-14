@@ -64,9 +64,12 @@ bool cox_firth_direct_reduced_fallback_enabled() {
 }
 
 bool cox_firth_direct_null_fallback_enabled() {
+  // The historical null fit repeats the same expensive optimizer with
+  // increasingly conservative settings. Start with its robust configuration
+  // and the Cox MLE warm start, while retaining a matched-validation escape.
   const char* value =
     std::getenv("REGENIE_COX_FIRTH_DIRECT_NULL_FALLBACK");
-  return value != nullptr && std::string(value) != "0";
+  return value == nullptr || std::string(value) != "0";
 }
 
 enum class CoxFirthProfilePhase {
