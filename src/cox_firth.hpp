@@ -30,10 +30,29 @@ class cox_firth {
         void fit_1(const survival_data& survivalData, const Eigen::VectorXd& g, const Eigen::VectorXd& offset_val);
 
     private:
+        void cox_firth_likelihood_legacy(const survival_data& survivalData, const Eigen::MatrixXd& Xmat);
+        void cox_firth_likelihood_compact(const survival_data& survivalData);
+        void cox_firth_likelihood_1_legacy(const survival_data& survivalData, const Eigen::VectorXd& g);
+        void cox_firth_likelihood_1_compact(const survival_data& survivalData);
+        void update_eta_order(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const Eigen::VectorXd& coefficients);
+        void update_mu(const survival_data& survivalData);
+
         int _niter, _mxitnr, _cols_incl;
         double _tol, _stephalf_tol, _betatol;
 		double _maxstep;
-        bool _usefirth, _verbose;
+        bool _usefirth, _verbose, _compact_likelihood;
+
+        Eigen::MatrixXd _X_order;
+        Eigen::VectorXd _offset_order;
+        Eigen::VectorXd _w_exp_eta;
+        Eigen::VectorXd _S0;
+        Eigen::VectorXd _cumulative_hazard;
+        Eigen::VectorXd _first_moment;
+        Eigen::MatrixXd _second_moment;
+        std::vector<Eigen::MatrixXd> _firth_der;
+        Eigen::MatrixXd _XtW;
+        Eigen::MatrixXd _solved_XtW;
+        Eigen::VectorXd _leverage;
 };
 
 #endif

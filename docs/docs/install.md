@@ -308,6 +308,14 @@ are components of `variant_compute` worker time rather than additive wall-time
 stages. The counters cover corrections invoked by the main single-variant
 path; internal SPA evaluations used by aggregate tests are not included.
 
+Cox Firth fitting uses a compact event-boundary traversal by default. It keeps
+the ordered design and likelihood workspace for the lifetime of a fit and
+updates the Breslow risk-set moments in one reverse scan, avoiding repeated
+sparse risk-set products and temporary matrices. Set the developer diagnostic
+`REGENIE_COX_FIRTH_COMPACT=0` to retain the previous sparse implementation for
+matched numerical and performance comparisons. The `corrections` scope records
+the selected path as `cox_firth_compact=1` or `0`.
+
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy
 is installed, with a dependency-free Python fallback. Its default tolerances

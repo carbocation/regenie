@@ -577,6 +577,10 @@ void Data::print_step2_profile() {
             thread_denominator) << "\n";
   }
   {
+    const char* compact_cox_firth_value =
+      std::getenv("REGENIE_COX_FIRTH_COMPACT");
+    const bool compact_cox_firth = compact_cox_firth_value == nullptr ||
+      std::string(compact_cox_firth_value) != "0";
     const uint64_t correction_tests = correction_profile.spa_tests +
       correction_profile.logistic_firth_tests +
       correction_profile.cox_firth_tests;
@@ -632,6 +636,7 @@ void Data::print_step2_profile() {
           correction_profile.cox_firth_fallbacks
         << " cox_firth_iterations=" <<
           correction_profile.cox_firth_iterations
+        << " cox_firth_compact=" << (compact_cox_firth ? 1 : 0)
         << " cox_firth_thread_ms=" <<
           correction_profile.cox_firth_thread_ms
         << " cox_firth_average_ms=" << cox_firth_average_ms

@@ -310,6 +310,23 @@ target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/LBFGSpp/include/)
 target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
 
 if(BUILD_TESTING)
+  add_executable(cox_firth_test
+    ${CMAKE_SOURCE_DIR}/test/test_cox_firth.cpp
+    ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
+    ${CMAKE_SOURCE_DIR}/src/survival_data.cpp)
+  target_include_directories(cox_firth_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(cox_firth_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(cox_firth_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  add_test(NAME cox_firth_compact COMMAND cox_firth_test)
+
   add_executable(step1_compute_test
     ${CMAKE_SOURCE_DIR}/test/test_step1_compute.cpp
     ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp)

@@ -5,6 +5,15 @@
 using namespace Eigen;
 using namespace std;
 
+namespace {
+
+bool compact_cox_firth_likelihood_enabled() {
+    const char* value = std::getenv("REGENIE_COX_FIRTH_COMPACT");
+    return value == nullptr || std::string(value) != "0";
+}
+
+}
+
 cox_firth::cox_firth(){}
 
 void cox_firth::setup(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const int& cols_incl, const int& max_iter, const int& max_inner_iter, const double& tolerance, const double& stephalf_tol, const double& beta_tol, const double& max_step, const bool& use_firth, const bool& verbose_obj, const Eigen::VectorXd& beta_init) {
@@ -20,10 +29,25 @@ void cox_firth::setup(const survival_data& survivalData, const Eigen::MatrixXd& 
 	_usefirth = use_firth;
     _verbose = verbose_obj;
     _cols_incl = cols_incl;
+    _compact_likelihood = compact_cox_firth_likelihood_enabled();
     loglike.resize(_niter + 1);
     first_der.resize(p);
     mu.resize(survivalData.n);
     residual.resize(survivalData.n);
+
+    _X_order = survivalData.permute_mtx * Xmat;
+    _offset_order = survivalData.keep_sample_order.select(
+        survivalData.permute_mtx * offset_val, 0).matrix();
+    _w_exp_eta.resize(survivalData.n);
+    _S0.resize(survivalData.n_unique_time);
+    _cumulative_hazard.resize(survivalData.n_unique_time);
+    _first_moment.resize(p);
+    _second_moment.resize(p, p);
+    _firth_der.resize(_usefirth ? p : 0);
+    for (int i = 0; i < static_cast<int>(_firth_der.size()); ++i) {
+        _firth_der[i].resize(p, p);
+    }
+    _leverage.resize(survivalData.n);
 
     beta = Eigen::VectorXd::Zero(p);
     if (beta_init.size() > 0) {
@@ -32,13 +56,168 @@ void cox_firth::setup(const survival_data& survivalData, const Eigen::MatrixXd& 
     } else {
         eta = offset_val;
     }
-    eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0).matrix();
+    eta_order = _X_order * beta + _offset_order;
+    eta_order = survivalData.keep_sample_order.select(eta_order, 0).matrix();
     if (p == 0) {
         _usefirth = false;
     }
 }
 
 void cox_firth::cox_firth_likelihood(const survival_data& survivalData, const Eigen::MatrixXd& Xmat) {
+    if (_compact_likelihood) {
+        cox_firth_likelihood_compact(survivalData);
+    } else {
+        cox_firth_likelihood_legacy(survivalData, Xmat);
+    }
+}
+
+void cox_firth::update_eta_order(
+    const survival_data& survivalData,
+    const Eigen::MatrixXd& Xmat,
+    const Eigen::VectorXd& offset_val,
+    const Eigen::VectorXd& coefficients) {
+    if (_compact_likelihood) {
+        eta_order.noalias() = _X_order * coefficients;
+        eta_order += _offset_order;
+        eta_order = survivalData.keep_sample_order.select(
+            eta_order, 0).matrix();
+    } else {
+        eta = Xmat * coefficients + offset_val;
+        eta_order = survivalData.keep_sample_order.select(
+            survivalData.permute_mtx * eta, 0).matrix();
+    }
+}
+
+void cox_firth::update_mu(const survival_data& survivalData) {
+    double cumulative_hazard = 0;
+    for (unsigned int k = 0; k < survivalData.n_unique_time; ++k) {
+        cumulative_hazard += survivalData.ww_k(k) / _S0(k);
+        _cumulative_hazard(k) = cumulative_hazard;
+    }
+
+    for (unsigned int i = 0; i < survivalData.n; ++i) {
+        const int risk_count = static_cast<int>(survivalData.rskcount(i));
+        const double lambda0 = risk_count == 0 ?
+            0 : _cumulative_hazard(risk_count - 1);
+        mu(i) = lambda0 * _w_exp_eta(i);
+    }
+}
+
+void cox_firth::cox_firth_likelihood_compact(
+    const survival_data& survivalData) {
+    exp_eta = eta_order.array().exp();
+    _w_exp_eta = survivalData.w.array() * exp_eta.array();
+    _S0.setZero();
+    _first_moment.setZero();
+    _second_moment.setZero();
+    second_der.setZero(p, p);
+    for (int t = 0; t < static_cast<int>(_firth_der.size()); ++t) {
+        _firth_der[t].setZero();
+    }
+
+    loglik_val = (survivalData.w.array() * eta_order.array() *
+        (survivalData.status_order.array() == 1).cast<double>()).sum();
+
+    double risk_sum = 0;
+    int event_index = static_cast<int>(survivalData.n_unique_time) - 1;
+    const int first_risk_row = survivalData.risk_set_start(0);
+    for (int row = static_cast<int>(survivalData.n) - 1;
+         row >= first_risk_row; --row) {
+        const double row_risk = _w_exp_eta(row);
+        risk_sum += row_risk;
+        for (int j = 0; j < p; ++j) {
+            const double weighted_x = row_risk * _X_order(row, j);
+            _first_moment(j) += weighted_x;
+            for (int k = 0; k < p; ++k) {
+                _second_moment(j, k) += weighted_x * _X_order(row, k);
+            }
+        }
+
+        if (row != survivalData.risk_set_start(event_index)) {
+            continue;
+        }
+
+        _S0(event_index) = risk_sum;
+        const double event_weight = survivalData.ww_k(event_index);
+        const double inverse_risk = 1.0 / risk_sum;
+        const double inverse_risk2 = inverse_risk * inverse_risk;
+        const double inverse_risk3 = inverse_risk2 * inverse_risk;
+        loglik_val -= event_weight * std::log(risk_sum);
+
+        for (int j = 0; j < p; ++j) {
+            for (int k = 0; k < p; ++k) {
+                second_der(j, k) += event_weight *
+                    (_second_moment(j, k) * inverse_risk -
+                     _first_moment(j) * _first_moment(k) * inverse_risk2);
+            }
+        }
+
+        if (_usefirth) {
+            for (int t = 0; t < p; ++t) {
+                for (int j = 0; j < p; ++j) {
+                    for (int k = 0; k < p; ++k) {
+                        _firth_der[t](j, k) += event_weight *
+                            ((-_second_moment(j, k) * _first_moment(t) -
+                              _second_moment(j, t) * _first_moment(k) -
+                              _second_moment(t, j) * _first_moment(k)) *
+                                 inverse_risk2 +
+                             2 * _first_moment(j) * _first_moment(k) *
+                                 _first_moment(t) * inverse_risk3);
+                    }
+                }
+            }
+        }
+
+        --event_index;
+    }
+
+    update_mu(survivalData);
+    if (p > 0) qrsd.compute(second_der);
+    residual = survivalData.w.array() *
+        (survivalData.status_order - mu).array();
+
+    if (_cols_incl < p) {
+        qrsd_incl.compute(second_der.block(0, 0, _cols_incl, _cols_incl));
+        if (_usefirth) {
+            loglik_val += 0.5 * qrsd.logAbsDeterminant();
+            _XtW = (_X_order.leftCols(_cols_incl).array().colwise() *
+                mu.array().sqrt()).transpose();
+            _solved_XtW = qrsd_incl.solve(_XtW);
+            _leverage = (_solved_XtW.array() * _XtW.array())
+                .colwise().sum().matrix().transpose();
+            first_der = _X_order.leftCols(_cols_incl).transpose() *
+                survivalData.keep_sample_order.select(
+                    residual + 0.5 * _leverage, 0);
+            for (int t = 0; t < _cols_incl; ++t) {
+                first_der(t) += 0.5 * qrsd_incl.solve(
+                    _firth_der[t].block(
+                        0, 0, _cols_incl, _cols_incl)).trace();
+            }
+        } else {
+            first_der = _X_order.leftCols(_cols_incl).transpose() * residual;
+        }
+    } else {
+        if (_usefirth) {
+            loglik_val += 0.5 * qrsd.logAbsDeterminant();
+            _XtW = (_X_order.array().colwise() *
+                mu.array().sqrt()).transpose();
+            _solved_XtW = qrsd.solve(_XtW);
+            _leverage = (_solved_XtW.array() * _XtW.array())
+                .colwise().sum().matrix().transpose();
+            first_der = _X_order.transpose() *
+                survivalData.keep_sample_order.select(
+                    residual + 0.5 * _leverage, 0);
+            for (int t = 0; t < p; ++t) {
+                first_der(t) +=
+                    0.5 * qrsd.solve(_firth_der[t]).trace();
+            }
+        } else {
+            first_der = _X_order.transpose() * residual;
+        }
+    }
+}
+
+void cox_firth::cox_firth_likelihood_legacy(const survival_data& survivalData, const Eigen::MatrixXd& Xmat) {
     Eigen::VectorXd w_exp_eta, ww_rsk, S0;
     Eigen::VectorXd lambda0(survivalData.n);
     Eigen::MatrixXd S1, GammaX, XtW;
@@ -169,8 +348,7 @@ void cox_firth::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
         // std::cout << "adjusted steps: " << steps << "\n";
         betanew.head(_cols_incl) = beta.head(_cols_incl) + steps;
         // std::cout << "beta: " << betanew << "\n";
-        eta = Xmat * betanew + offset_val;
-        eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0);
+        update_eta_order(survivalData, Xmat, offset_val, betanew);
         cox_firth_likelihood(survivalData, Xmat);
         // std::cout << "loglik_val: " << loglik_val << "\n";
         // std::cout << "diff loglik_val: " << loglik_val - loglike(iter - 1) << "\n";
@@ -184,15 +362,14 @@ void cox_firth::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
                     // std::cout << "Convergence issue, inner loop: cannot correct step size, add eps\n";
                     steps.array() += 1e-6;
                     betanew.head(_cols_incl) = beta.head(_cols_incl) + steps;
-                    eta = Xmat * betanew + offset_val;
-                    eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0);
+                    update_eta_order(
+                        survivalData, Xmat, offset_val, betanew);
                     cox_firth_likelihood(survivalData, Xmat);
                     break;
                     // throw std::runtime_error("inner loop: cannot correct step size");
                 }
                 betanew = (beta + betanew)/2;
-                eta = Xmat * betanew + offset_val;
-                eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0);
+                update_eta_order(survivalData, Xmat, offset_val, betanew);
                 cox_firth_likelihood(survivalData, Xmat);
                 if (_verbose) {
                     std::cout << "beta: " << betanew << "\n";
@@ -213,13 +390,85 @@ void cox_firth::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
         }
         beta = betanew;
     }
+    if (_compact_likelihood) eta = Xmat * beta + offset_val;
     residual = survivalData.permute_mtx.transpose() * residual;
     loglike.conservativeResize(iter+1);
     // std::cout << "finish fitting\n";
 }
 
 
-void cox_firth::cox_firth_likelihood_1(const survival_data& survivalData, const Eigen::VectorXd& g) {
+void cox_firth::cox_firth_likelihood_1(
+    const survival_data& survivalData,
+    const Eigen::VectorXd& g) {
+    if (_compact_likelihood) {
+        cox_firth_likelihood_1_compact(survivalData);
+    } else {
+        cox_firth_likelihood_1_legacy(survivalData, g);
+    }
+}
+
+void cox_firth::cox_firth_likelihood_1_compact(
+    const survival_data& survivalData) {
+    exp_eta = eta_order.array().exp();
+    _w_exp_eta = survivalData.w.array() * exp_eta.array();
+    _S0.setZero();
+
+    loglik_val = (survivalData.w.array() * eta_order.array() *
+        (survivalData.status_order.array() == 1).cast<double>()).sum();
+    second_der_1 = 0;
+    double firth_information_derivative = 0;
+    double risk_sum = 0;
+    double first_moment = 0;
+    double second_moment = 0;
+    double third_moment = 0;
+    int event_index = static_cast<int>(survivalData.n_unique_time) - 1;
+    const int first_risk_row = survivalData.risk_set_start(0);
+    for (int row = static_cast<int>(survivalData.n) - 1;
+         row >= first_risk_row; --row) {
+        const double row_risk = _w_exp_eta(row);
+        const double genotype = _X_order(row, 0);
+        const double genotype2 = genotype * genotype;
+        risk_sum += row_risk;
+        first_moment += row_risk * genotype;
+        second_moment += row_risk * genotype2;
+        if (_usefirth) {
+            third_moment += row_risk * genotype2 * genotype;
+        }
+
+        if (row != survivalData.risk_set_start(event_index)) {
+            continue;
+        }
+
+        _S0(event_index) = risk_sum;
+        const double event_weight = survivalData.ww_k(event_index);
+        const double inverse_risk = 1.0 / risk_sum;
+        const double mean = first_moment * inverse_risk;
+        loglik_val -= event_weight * std::log(risk_sum);
+        second_der_1 += event_weight *
+            (second_moment * inverse_risk - mean * mean);
+        if (_usefirth) {
+            firth_information_derivative += event_weight *
+                (third_moment * inverse_risk -
+                 3 * second_moment * first_moment *
+                     inverse_risk * inverse_risk +
+                 2 * first_moment * first_moment * first_moment *
+                     inverse_risk * inverse_risk * inverse_risk);
+        }
+        --event_index;
+    }
+
+    update_mu(survivalData);
+    residual = survivalData.w.array() *
+        (survivalData.status_order - mu).array();
+    first_der_1 = _X_order.col(0).dot(residual);
+    if (_usefirth) {
+        loglik_val += 0.5 * std::log(std::fabs(second_der_1));
+        first_der_1 +=
+            0.5 * firth_information_derivative / second_der_1;
+    }
+}
+
+void cox_firth::cox_firth_likelihood_1_legacy(const survival_data& survivalData, const Eigen::VectorXd& g) {
     Eigen::VectorXd w_exp_eta, ww_rsk;
     Eigen::VectorXd lambda0(survivalData.n);
     Eigen::VectorXd S0, S1, S2, S3;
@@ -285,8 +534,7 @@ void cox_firth::fit_1(const survival_data& survivalData, const Eigen::VectorXd& 
         }
         // std::cout << "adjusted steps: " << steps << "\n";
         betanew = beta.array() + steps;
-        eta = g * betanew + offset_val;
-        eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0);
+        update_eta_order(survivalData, g, offset_val, betanew);
         cox_firth_likelihood_1(survivalData, g);
         // std::cout << "beta: " << betanew << "\n";
         // std::cout << "loglik_val: " << loglik_val << "\n";
@@ -302,15 +550,14 @@ void cox_firth::fit_1(const survival_data& survivalData, const Eigen::VectorXd& 
                     // std::cout << "Convergence issue, inner loop: cannot correct step size, add eps\n";
                     steps += 1e-6;
                     betanew = beta.array() + steps;
-                    eta = g * betanew + offset_val;
-                    eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0);
+                    update_eta_order(
+                        survivalData, g, offset_val, betanew);
                     cox_firth_likelihood_1(survivalData, g);
                     break;
                     // throw std::runtime_error("inner loop: cannot correct step size");
                 }
                 betanew = (beta + betanew)/2;
-                eta = g * betanew + offset_val;
-                eta_order = survivalData.keep_sample_order.select(survivalData.permute_mtx * eta, 0);
+                update_eta_order(survivalData, g, offset_val, betanew);
                 cox_firth_likelihood_1(survivalData, g);
                 if (_verbose) {
                     std::cout << "beta: " << betanew << "\n";
@@ -332,6 +579,7 @@ void cox_firth::fit_1(const survival_data& survivalData, const Eigen::VectorXd& 
         }
         beta = betanew;
     }
+    if (_compact_likelihood) eta = g * beta + offset_val;
     residual = survivalData.permute_mtx.transpose() * residual;
     loglike.conservativeResize(iter+1);
     // std::cout << "finish fitting\n";
