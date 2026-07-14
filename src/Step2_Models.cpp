@@ -836,17 +836,19 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   Xmat = MatrixXd::Zero(params->n_samples, pheno_data->new_cov.cols() + 1); // covariates + tested SNP
   Xmat << pheno_data->new_cov, Gvec;
   col_incl = Xmat.cols();
+  beta0 = VectorXd::Zero(col_incl);
+  beta0.head(col_incl - 1) = fest->beta_null_firth.col(ph);
 
   // null model
   cox_firth cox_firth_null;
-  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false);
+  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, beta0);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_null);
 
   if (!cox_firth_null.converge) {
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
-    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
+    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_null);
   }

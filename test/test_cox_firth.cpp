@@ -213,6 +213,46 @@ int main() {
                 1e-5);
         }
 
+        setenv("REGENIE_COX_FIRTH_COMPACT", "1", 1);
+        setenv("REGENIE_COX_FIRTH_DIRECT_ADJUSTMENT", "1", 1);
+        setenv("REGENIE_COX_FIRTH_CONSISTENT_REDUCED", "0", 1);
+        const Eigen::MatrixXd nuisance_design = design.leftCols(3);
+        cox_firth shared_null;
+        shared_null.setup(
+            data, nuisance_design, offset, 3, 40, 30, 1e-8, 2.5e-4,
+            1e-8, 1, true, false);
+        shared_null.fit(data, nuisance_design, offset);
+        if (!shared_null.converge) {
+            throw std::runtime_error("shared null did not converge");
+        }
+        Eigen::VectorXd warm_beta = Eigen::VectorXd::Zero(4);
+        warm_beta.head(3) = shared_null.beta;
+        cox_firth cold_reduced;
+        cold_reduced.setup(
+            data, design, offset, 3, 40, 30, 1e-8, 2.5e-4,
+            1e-8, 1, true, false);
+        cold_reduced.fit(data, design, offset);
+        cox_firth warm_reduced;
+        warm_reduced.setup(
+            data, design, offset, 3, 40, 30, 1e-8, 2.5e-4,
+            1e-8, 1, true, false, warm_beta);
+        warm_reduced.fit(data, design, offset);
+        if (!cold_reduced.converge || !warm_reduced.converge) {
+            throw std::runtime_error("reduced warm-start convergence mismatch");
+        }
+        require_close(
+            "reduced warm-start beta", cold_reduced.beta,
+            warm_reduced.beta, 1e-7);
+        require_close(
+            "reduced warm-start likelihood",
+            cold_reduced.loglike.tail(1)(0),
+            warm_reduced.loglike.tail(1)(0), 1e-8);
+        if (warm_reduced.likelihood_evaluations >=
+            cold_reduced.likelihood_evaluations) {
+            throw std::runtime_error(
+                "reduced warm start did not reduce likelihood evaluations");
+        }
+
         const cox_firth unpenalized_legacy =
             evaluate_general(data, design, offset, false, 4, false);
         const cox_firth unpenalized_compact =
