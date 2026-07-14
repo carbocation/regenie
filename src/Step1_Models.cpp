@@ -565,44 +565,95 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
         params->beta_print_out[ph] = MatrixXd::Zero(params->n_ridge_l0, bs);
   }
 
+  const bool prepare_batched_systems = Gblock->step1_pgen_packed_block;
+  vector<MatrixXd> fold_grams(
+    prepare_batched_systems ? params->cv_folds : 0);
+  vector<MatrixXd> fold_right_hand_sides(
+    prepare_batched_systems ? params->cv_folds : 0);
+  VectorXi fold_starts(params->cv_folds);
+  VectorXi fold_counts(params->cv_folds);
   uint32_t cum_size_folds = 0;
-  for(int i = 0; i < params->cv_folds; ++i ) {
-    // assign masking within folds
-    masked_in_folds[i] = pheno_data->masked_indivs.block(cum_size_folds, 0, params->cv_sizes(i), pheno_data->masked_indivs.cols());
-
-    ww1 = l0->GGt - l0->G_folds[i];
-    Step1ComputeTimings timings;
-    const MatrixXd fold_rhs = l0->GTY - l0->GtY[i];
-    const bool used_cholesky = Gblock->step1_pgen_packed_block &&
-      compute_backend->ridge_predict_preprocessed_system(
-        ww1, fold_rhs, cum_size_folds, params->cv_sizes(i),
-        ridge_parameters, batched_predictions, batched_coefficients,
-        params->profile_step1 ? &timings : nullptr);
-    if(!used_cholesky) {
-      compute_backend->factorize_ridge_system(
-        ww1, fold_rhs,
-        params->profile_step1 ? &timings : nullptr);
-      if(Gblock->step1_pgen_packed_block)
-        compute_backend->ridge_predict_preprocessed(
-          cum_size_folds, params->cv_sizes(i), ridge_parameters,
-          batched_predictions, batched_coefficients,
-          params->profile_step1 ? &timings : nullptr);
-      else
-        compute_backend->ridge_predict_factorized(
-          Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i)),
-          true, ridge_parameters, no_outcomes, false,
-          batched_predictions, batched_coefficients,
-          params->profile_step1 ? &timings : nullptr);
+  for(int i = 0; i < params->cv_folds; ++i) {
+    masked_in_folds[i] = pheno_data->masked_indivs.block(
+      cum_size_folds, 0, params->cv_sizes(i),
+      pheno_data->masked_indivs.cols());
+    if(prepare_batched_systems) {
+      fold_grams[i] = l0->GGt - l0->G_folds[i];
+      fold_right_hand_sides[i] = l0->GTY - l0->GtY[i];
     }
-    if(params->profile_step1) {
-      l0->profile_eigensolve_ms += timings.eigensolve_ms + timings.transform_ms;
-      l0->profile_backend_upload_ms += timings.upload_ms;
-      l0->profile_backend_download_ms += timings.download_ms;
-      l0->profile_backend_ridge_compute_ms += timings.ridge_ms;
-      if(used_cholesky)
-        l0->profile_cholesky_ridge_folds++;
-      else
-        l0->profile_eigendecomposition_ridge_folds++;
+    fold_starts(i) = cum_size_folds;
+    fold_counts(i) = params->cv_sizes(i);
+    cum_size_folds += params->cv_sizes(i);
+  }
+
+  vector<MatrixXd> fold_predictions;
+  vector<MatrixXd> fold_coefficients;
+  Step1ComputeTimings batched_timings;
+  const bool used_batched_cholesky =
+    prepare_batched_systems &&
+    compute_backend->ridge_predict_preprocessed_systems(
+      fold_grams, fold_right_hand_sides, fold_starts, fold_counts,
+      ridge_parameters, fold_predictions, fold_coefficients,
+      params->profile_step1 ? &batched_timings : nullptr);
+  if(params->profile_step1 && used_batched_cholesky) {
+    l0->profile_eigensolve_ms +=
+      batched_timings.eigensolve_ms + batched_timings.transform_ms;
+    l0->profile_backend_upload_ms += batched_timings.upload_ms;
+    l0->profile_backend_download_ms += batched_timings.download_ms;
+    l0->profile_backend_ridge_compute_ms += batched_timings.ridge_ms;
+    l0->profile_cholesky_ridge_folds += params->cv_folds;
+    l0->profile_batched_cholesky_ridge_blocks++;
+  }
+
+  cum_size_folds = 0;
+  for(int i = 0; i < params->cv_folds; ++i ) {
+    if(used_batched_cholesky) {
+      batched_predictions.swap(fold_predictions[i]);
+      batched_coefficients.swap(fold_coefficients[i]);
+    } else {
+      MatrixXd fold_rhs;
+      if(prepare_batched_systems) {
+        ww1.swap(fold_grams[i]);
+        fold_rhs.swap(fold_right_hand_sides[i]);
+      } else {
+        ww1 = l0->GGt - l0->G_folds[i];
+        fold_rhs = l0->GTY - l0->GtY[i];
+      }
+      Step1ComputeTimings timings;
+      const bool used_cholesky = prepare_batched_systems &&
+        compute_backend->ridge_predict_preprocessed_system(
+          ww1, fold_rhs, cum_size_folds,
+          params->cv_sizes(i), ridge_parameters, batched_predictions,
+          batched_coefficients,
+          params->profile_step1 ? &timings : nullptr);
+      if(!used_cholesky) {
+        compute_backend->factorize_ridge_system(
+          ww1, fold_rhs,
+          params->profile_step1 ? &timings : nullptr);
+        if(Gblock->step1_pgen_packed_block)
+          compute_backend->ridge_predict_preprocessed(
+            cum_size_folds, params->cv_sizes(i), ridge_parameters,
+            batched_predictions, batched_coefficients,
+            params->profile_step1 ? &timings : nullptr);
+        else
+          compute_backend->ridge_predict_factorized(
+            Gblock->Gmat.block(0, cum_size_folds, bs,
+              params->cv_sizes(i)),
+            true, ridge_parameters, no_outcomes, false,
+            batched_predictions, batched_coefficients,
+            params->profile_step1 ? &timings : nullptr);
+      }
+      if(params->profile_step1) {
+        l0->profile_eigensolve_ms +=
+          timings.eigensolve_ms + timings.transform_ms;
+        l0->profile_backend_upload_ms += timings.upload_ms;
+        l0->profile_backend_download_ms += timings.download_ms;
+        l0->profile_backend_ridge_compute_ms += timings.ridge_ms;
+        if(used_cholesky)
+          l0->profile_cholesky_ridge_folds++;
+        else
+          l0->profile_eigendecomposition_ridge_folds++;
+      }
     }
 
     for(int j = 0; j < params->n_ridge_l0; ++j ) {

@@ -129,6 +129,16 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& coefficients,
       Step1ComputeTimings* timings = nullptr);
 
+    virtual bool ridge_predict_preprocessed_systems(
+      const std::vector<Eigen::MatrixXd>& grams,
+      const std::vector<Eigen::MatrixXd>& right_hand_sides,
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      std::vector<Eigen::MatrixXd>& predictions,
+      std::vector<Eigen::MatrixXd>& coefficients,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void release_preprocessed_genotypes();
 
     virtual void compute_products(

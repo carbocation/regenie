@@ -528,6 +528,54 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
       throw std::runtime_error(
         "packed hardcall resident Cholesky ridge conformance failed");
   }
+
+  const int batched_system_count = 3;
+  std::vector<Eigen::MatrixXd> batched_grams(
+    batched_system_count, expected_gram);
+  std::vector<Eigen::MatrixXd> batched_right_hand_sides(
+    batched_system_count, expected_crossproduct);
+  Eigen::VectorXi batched_starts(batched_system_count);
+  Eigen::VectorXi batched_counts = Eigen::VectorXi::Constant(
+    batched_system_count, slice_size);
+  for(int system = 0; system < batched_system_count; ++system)
+    batched_starts(system) = slice_start + system * slice_size;
+  std::vector<Eigen::MatrixXd> batched_actual_predictions;
+  std::vector<Eigen::MatrixXd> batched_actual_coefficients;
+  Step1ComputeTimings batched_cholesky_timings;
+  const bool batched_cholesky_supported =
+    candidate.ridge_predict_preprocessed_systems(
+      batched_grams, batched_right_hand_sides, batched_starts,
+      batched_counts, ridge_parameters, batched_actual_predictions,
+      batched_actual_coefficients, &batched_cholesky_timings);
+  double batched_cholesky_prediction_error = 0;
+  double batched_cholesky_coefficient_error = 0;
+  if(batched_cholesky_supported) {
+    const double cholesky_tolerance =
+      factorized_conformance_tolerance(candidate, preprocessing_tolerance);
+    if(batched_actual_predictions.size() != batched_system_count ||
+       batched_actual_coefficients.size() != batched_system_count)
+      throw std::runtime_error(
+        "packed hardcall batched Cholesky returned the wrong system count");
+    for(int system = 0; system < batched_system_count; ++system) {
+      batched_cholesky_prediction_error = std::max(
+        batched_cholesky_prediction_error,
+        relative_error(batched_actual_predictions[system],
+          expected_predictions.middleRows(
+            batched_starts(system), batched_counts(system))));
+      batched_cholesky_coefficient_error = std::max(
+        batched_cholesky_coefficient_error,
+        relative_error(batched_actual_coefficients[system],
+          expected_coefficients));
+    }
+    if(batched_cholesky_prediction_error > cholesky_tolerance ||
+       batched_cholesky_coefficient_error > cholesky_tolerance ||
+       batched_cholesky_timings.resident_reuse_count !=
+         batched_system_count ||
+       !std::isfinite(batched_cholesky_timings.ridge_ms) ||
+       batched_cholesky_timings.ridge_ms <= 0)
+      throw std::runtime_error(
+        "packed hardcall resident batched Cholesky ridge conformance failed");
+  }
   candidate.release_preprocessed_genotypes();
 
   bool rejected_negative_weight = false;
@@ -567,6 +615,12 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
               cholesky_prediction_error
             << " cholesky_coefficient_relative_error=" <<
               cholesky_coefficient_error
+            << " batched_cholesky_supported=" <<
+              batched_cholesky_supported
+            << " batched_cholesky_prediction_relative_error=" <<
+              batched_cholesky_prediction_error
+            << " batched_cholesky_coefficient_relative_error=" <<
+              batched_cholesky_coefficient_error
             << " status=PASS\n";
 }
 

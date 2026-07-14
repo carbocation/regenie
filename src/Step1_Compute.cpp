@@ -209,6 +209,26 @@ bool Step1ComputeBackend::ridge_predict_preprocessed_system(
   return false;
 }
 
+bool Step1ComputeBackend::ridge_predict_preprocessed_systems(
+  const std::vector<Eigen::MatrixXd>& grams,
+  const std::vector<Eigen::MatrixXd>& right_hand_sides,
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  std::vector<Eigen::MatrixXd>& predictions,
+  std::vector<Eigen::MatrixXd>& coefficients,
+  Step1ComputeTimings* timings) {
+  (void)grams;
+  (void)right_hand_sides;
+  (void)start_columns;
+  (void)column_counts;
+  (void)ridge_parameters;
+  (void)predictions;
+  (void)coefficients;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 

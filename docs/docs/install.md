@@ -136,6 +136,13 @@ other input paths and for any ridge grid containing zero. Set
 matched A/B comparison; the validation harness exposes the same switch as
 `CUDA_LEVEL0_CHOLESKY`.
 
+The independent k-fold systems are submitted to reusable CUDA streams so their
+Cholesky factorizations, solves, and held-out predictions can overlap. The
+number of streams follows the configured fold count; it is not tied to a
+particular phenotype count. Set `REGENIE_CUDA_LEVEL0_FOLD_BATCH=0` to retain
+the sequential Cholesky implementation for a matched A/B comparison. The
+validation harness exposes this switch as `CUDA_LEVEL0_FOLD_BATCH`.
+
 Large resident uploads use two reusable pinned host chunks so host packing can
 overlap transfer to the device. `REGENIE_CUDA_PINNED_STAGING_MB` controls the
 size of each chunk (64 MB by default); set it to `0` to restore direct pageable

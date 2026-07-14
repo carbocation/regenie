@@ -18,6 +18,7 @@ stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
 level1_resident_mb="${CUDA_LEVEL1_RESIDENT_MB:-${REGENIE_CUDA_LEVEL1_RESIDENT_MB:-}}"
 level0_cholesky="${CUDA_LEVEL0_CHOLESKY:-${REGENIE_CUDA_LEVEL0_CHOLESKY:-1}}"
+level0_fold_batch="${CUDA_LEVEL0_FOLD_BATCH:-${REGENIE_CUDA_LEVEL0_FOLD_BATCH:-1}}"
 gram_precision="${CUDA_GRAM_PRECISION:-${REGENIE_CUDA_GRAM_PRECISION:-fp64}}"
 fp32_gram_chunk_samples="${CUDA_FP32_GRAM_CHUNK_SAMPLES:-${REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES:-128}}"
 pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
@@ -74,6 +75,10 @@ if [[ ! "${pgen_packed}" =~ ^[01]$ ]]; then
 fi
 if [[ ! "${level0_cholesky}" =~ ^[01]$ ]]; then
   echo "CUDA_LEVEL0_CHOLESKY must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "${level0_fold_batch}" =~ ^[01]$ ]]; then
+  echo "CUDA_LEVEL0_FOLD_BATCH must be 0 or 1" >&2
   exit 2
 fi
 if [[ "${run_synthetic_benchmark}" == "1" ]]; then
@@ -155,6 +160,7 @@ stream_chunk_mb=${stream_chunk_mb} \
 resident_mb=${resident_mb} \
 level1_resident_mb=${level1_resident_mb:-auto} \
 level0_cholesky=${level0_cholesky} \
+level0_fold_batch=${level0_fold_batch} \
 gram_precision=${gram_precision} \
 fp32_gram_chunk_samples=${fp32_gram_chunk_samples} \
 pinned_staging_mb=${pinned_staging_mb} pgen_prefetch_mb=${pgen_prefetch_mb} pgen_tile_variants=${pgen_tile_variants} pgen_packed=${pgen_packed} \
@@ -166,6 +172,7 @@ synthetic_threads=${synthetic_threads} synthetic_seed=${synthetic_seed} \
 synthetic_max_bed_gb=${synthetic_max_bed_gb}"
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 export REGENIE_CUDA_LEVEL0_CHOLESKY="${level0_cholesky}"
+export REGENIE_CUDA_LEVEL0_FOLD_BATCH="${level0_fold_batch}"
 if [[ -n "${level1_resident_mb}" ]]; then
   export REGENIE_CUDA_LEVEL1_RESIDENT_MB="${level1_resident_mb}"
 else
@@ -200,6 +207,10 @@ if (( resident_mb > 0 )); then
     <<<"${cuda_output}"
   grep -q '^STEP1_BACKEND_TEST case=packed_hardcall_preprocessing supported=1 .* status=PASS$' \
     <<<"${cuda_output}"
+  if [[ "${level0_cholesky}" == "1" && "${level0_fold_batch}" == "1" ]]; then
+    grep -q '^STEP1_BACKEND_TEST case=packed_hardcall_preprocessing supported=1 .* batched_cholesky_supported=1 .* status=PASS$' \
+      <<<"${cuda_output}"
+  fi
 else
   grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=0 .* status=PASS$' \
     <<<"${cuda_output}"
@@ -347,7 +358,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=8 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=9 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
 
   compare_loco_files "${label}" "${cpu_prefix}" "${cuda_prefix}"
@@ -455,7 +466,7 @@ run_synthetic_end_to_end_benchmark() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q '^STEP1_PROFILE version=8 backend=cuda mode=kfold ' "${cuda_prefix}.log"
+  grep -q '^STEP1_PROFILE version=9 backend=cuda mode=kfold ' "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
   compare_loco_files synthetic_kfold "${cpu_prefix}" "${cuda_prefix}"
 
