@@ -569,31 +569,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ComputeClock::now();
       const ComputeClock::time_point validation_start =
         ComputeClock::now();
-      if(variants < 0 || samples < 0 || covariates.rows() != samples ||
-         sample_weights.size() != samples)
-        throw std::invalid_argument(
-          "Step 1 packed hardcall preprocessing received incompatible dimensions");
-      if(!std::isfinite(degrees_of_freedom) || degrees_of_freedom <= 0)
-        throw std::invalid_argument(
-          "Step 1 packed hardcall preprocessing requires positive degrees of freedom");
-      if(!std::isfinite(minimum_scale) || minimum_scale < 0)
-        throw std::invalid_argument(
-          "Step 1 packed hardcall preprocessing requires a non-negative minimum scale");
-      if((sample_weights.array() < 0).any() ||
-         !sample_weights.allFinite() || !covariates.allFinite())
-        throw std::invalid_argument(
-          "Step 1 packed hardcall preprocessing requires finite, non-negative weights");
-      const size_t minimum_stride =
-        (static_cast<size_t>(samples) + 3) / 4;
-      if(packed_stride_bytes < minimum_stride ||
-         (variants > 0 && packed_stride_bytes >
-           std::numeric_limits<size_t>::max() /
-             static_cast<size_t>(variants)) ||
-         packed_bytes < static_cast<size_t>(variants) *
-           packed_stride_bytes ||
-         (variants > 0 && !packed_hardcalls))
-        throw std::invalid_argument(
-          "Step 1 packed hardcall preprocessing received an invalid packed buffer");
+      validate_packed_hardcall_preprocessing_inputs(
+        packed_hardcalls, packed_bytes, packed_stride_bytes,
+        variants, samples, covariates, sample_weights,
+        degrees_of_freedom, minimum_scale);
       if(timings)
         timings->packed_hardcall_validation_ms +=
           elapsed_ms(validation_start);

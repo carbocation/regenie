@@ -496,6 +496,30 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
       "packed hardcall resident ridge conformance failed");
   candidate.release_preprocessed_genotypes();
 
+  bool rejected_negative_weight = false;
+  Eigen::VectorXd invalid_weights = sample_weights;
+  invalid_weights(1) = -1;
+  try {
+    candidate.preprocess_packed_hardcalls(
+      packed.data(), packed.size(), stride, rows, samples,
+      covariates, invalid_weights, degrees_of_freedom, 1e-12,
+      actual_scales);
+  } catch(const std::invalid_argument&) {
+    rejected_negative_weight = true;
+  }
+  bool rejected_short_buffer = false;
+  try {
+    candidate.preprocess_packed_hardcalls(
+      packed.data(), packed.size() - 1, stride, rows, samples,
+      covariates, sample_weights, degrees_of_freedom, 1e-12,
+      actual_scales);
+  } catch(const std::invalid_argument&) {
+    rejected_short_buffer = true;
+  }
+  if(!rejected_negative_weight || !rejected_short_buffer)
+    throw std::runtime_error(
+      "packed hardcall preprocessing validation conformance failed");
+
   std::cout << "STEP1_BACKEND_TEST case=packed_hardcall_preprocessing"
             << " supported=1"
             << " packed_bytes=" << packed.size()

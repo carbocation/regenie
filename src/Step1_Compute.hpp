@@ -234,6 +234,18 @@ class Step1ComputeBackend {
       const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
       Eigen::MatrixXd& predictions,
       Step1ComputeTimings* timings = nullptr);
+
+  protected:
+    static void validate_packed_hardcall_preprocessing_inputs(
+      const unsigned char* packed_hardcalls,
+      size_t packed_bytes,
+      size_t packed_stride_bytes,
+      Eigen::Index variants,
+      Eigen::Index samples,
+      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale);
 };
 
 std::unique_ptr<Step1ComputeBackend> make_cpu_step1_compute_backend();
