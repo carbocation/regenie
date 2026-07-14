@@ -1182,6 +1182,68 @@ void Data::level_0_calculations() {
   if(pgen_packed_pipeline_enabled)
     pgen_pipeline_sample_weights =
       in_filters.ind_in_analysis.matrix().cast<double>();
+
+  std::vector<int> level0_block_sizes;
+  level0_block_sizes.reserve(params.total_n_block);
+  for(size_t plan_itr = 0; plan_itr < files.chr_read.size(); ++plan_itr) {
+    const int plan_chromosome = files.chr_read[plan_itr];
+    const std::map<int, std::vector<int>>::const_iterator plan_entry =
+      chr_map.find(plan_chromosome);
+    if(plan_entry == chr_map.end() || plan_entry->second[1] == 0)
+      continue;
+    for(int plan_block = 0; plan_block < plan_entry->second[1];
+        ++plan_block) {
+      int plan_block_size = 0;
+      get_block_size(params.block_size, plan_entry->second[0], plan_block,
+        plan_block_size);
+      level0_block_sizes.push_back(plan_block_size);
+    }
+  }
+
+  const auto start_pgen_prefetch =
+    [this, pgen_packed_hardcalls, &pgen_prefetch_buffer,
+     &pgen_prefetch_future, &pgen_prefetch_pending](
+      int prefetch_block_size, uint32_t prefetch_snpcount) {
+      if(pgen_prefetch_pending)
+        throw std::logic_error(
+          "attempted to start overlapping Step 1 PGEN prefetches");
+      pgen_prefetch_future = std::async(std::launch::async,
+        [this, prefetch_block_size, prefetch_snpcount,
+         pgen_packed_hardcalls, &pgen_prefetch_buffer]() {
+          Step1PgenPrefetchResult result;
+          const ProfileClock::time_point service_start =
+            ProfileClock::now();
+          Step1PgenReadProfile* local_profile = params.profile_step1 ?
+            &result.profile : nullptr;
+          const ProcessIoCounters io_before = local_profile ?
+            read_process_io_counters() : ProcessIoCounters();
+          if(pgen_packed_hardcalls) {
+            readChunkFromPGENFileToPackedHardcalls(
+              prefetch_block_size, prefetch_snpcount, snpinfo, &params,
+              Gblock.pgr, pgen_prefetch_buffer.packed_hardcalls,
+              pgen_prefetch_buffer.packed_stride_bytes, local_profile);
+          } else {
+            pgen_prefetch_buffer.genotypes.resize(
+              prefetch_block_size, params.n_samples);
+            if(params.alpha_prior != -1)
+              pgen_prefetch_buffer.allele_frequencies.resize(
+                prefetch_block_size, 1);
+            readChunkFromPGENFileToG(prefetch_block_size,
+              prefetch_snpcount, snpinfo, &params,
+              pgen_prefetch_buffer.genotypes,
+              pgen_prefetch_buffer.allele_frequencies, Gblock.pgr,
+              &in_filters, &Gblock.step1_pgen_worker_tiles,
+              local_profile);
+          }
+          if(local_profile)
+            accumulate_process_io_delta(io_before,
+              read_process_io_counters(), local_profile);
+          result.service_ms = elapsed_ms(service_start);
+          return result;
+        });
+      pgen_prefetch_pending = true;
+    };
+
   if(pgen_cuda_backend) {
     sout << " - Step 1 PGEN block prefetch : [" <<
       (pgen_prefetch_enabled ? "enabled" : "disabled") << "]";
@@ -1196,7 +1258,7 @@ void Data::level_0_calculations() {
       (pgen_packed_pipeline_enabled ? "enabled" : "disabled") <<
       "] depth=" << pgen_packed_pipeline_depth;
     if(pgen_packed_pipeline_enabled)
-      sout << " schedule=level0_ridge";
+      sout << " schedule=three_stage read_ahead=2";
     if(!pgen_packed_pipeline_enabled) {
       if(!pgen_packed_hardcalls) sout << " reason=packed_hardcalls_disabled";
       else if(!pgen_prefetch_enabled) sout << " reason=prefetch_disabled";
@@ -1344,60 +1406,15 @@ void Data::level_0_calculations() {
             io_before, read_process_io_counters(), pgen_profile);
       }
 
-      int next_bs = 0;
-      bool has_next_block = false;
-      if(bb + 1 < chrom_nb) {
-        get_block_size(params.block_size, chrom_nsnps, bb + 1, next_bs);
-        has_next_block = true;
-      } else {
-        for(size_t next_itr = itr + 1;
-            next_itr < files.chr_read.size(); ++next_itr) {
-          const int next_chromosome = files.chr_read[next_itr];
-          const std::map<int, std::vector<int>>::const_iterator next_entry =
-            chr_map.find(next_chromosome);
-          if(next_entry == chr_map.end() || next_entry->second[1] == 0)
-            continue;
-          get_block_size(params.block_size, next_entry->second[0], 0,
-            next_bs);
-          has_next_block = true;
-          break;
-        }
-      }
-      if(pgen_prefetch_enabled && has_next_block) {
-        const uint32_t next_snpcount = in_filters.step1_snp_count + bs;
-        pgen_prefetch_future = std::async(std::launch::async,
-          [this, next_bs, next_snpcount, pgen_packed_hardcalls,
-           &pgen_prefetch_buffer]() {
-            Step1PgenPrefetchResult result;
-            const ProfileClock::time_point service_start =
-              ProfileClock::now();
-            Step1PgenReadProfile* local_profile = params.profile_step1 ?
-              &result.profile : nullptr;
-            const ProcessIoCounters io_before = local_profile ?
-              read_process_io_counters() : ProcessIoCounters();
-            if(pgen_packed_hardcalls) {
-              readChunkFromPGENFileToPackedHardcalls(
-                next_bs, next_snpcount, snpinfo, &params, Gblock.pgr,
-                pgen_prefetch_buffer.packed_hardcalls,
-                pgen_prefetch_buffer.packed_stride_bytes, local_profile);
-            } else {
-              pgen_prefetch_buffer.genotypes.resize(
-                next_bs, params.n_samples);
-              if(params.alpha_prior != -1)
-                pgen_prefetch_buffer.allele_frequencies.resize(next_bs, 1);
-              readChunkFromPGENFileToG(next_bs, next_snpcount, snpinfo,
-                &params, pgen_prefetch_buffer.genotypes,
-                pgen_prefetch_buffer.allele_frequencies, Gblock.pgr,
-                &in_filters, &Gblock.step1_pgen_worker_tiles,
-                local_profile);
-            }
-            if(local_profile)
-              accumulate_process_io_delta(io_before,
-                read_process_io_counters(), local_profile);
-            result.service_ms = elapsed_ms(service_start);
-            return result;
-          });
-        pgen_prefetch_pending = true;
+      const size_t next_block_index = static_cast<size_t>(block) + 1;
+      const bool has_next_block =
+        next_block_index < level0_block_sizes.size();
+      const int next_bs = has_next_block ?
+        level0_block_sizes[next_block_index] : 0;
+      if(pgen_prefetch_enabled && has_next_block &&
+         !pgen_prefetch_pending) {
+        start_pgen_prefetch(next_bs,
+          in_filters.step1_snp_count + bs);
       }
 
       if(pgen_packed_pipeline_enabled &&
@@ -1498,6 +1515,14 @@ void Data::level_0_calculations() {
             step1_profile.pgen_prefetch_service_ms += result.service_ms;
             step1_profile.pgen_prefetch_wait_ms += wait_ms;
             step1_profile.decode_ms += wait_ms;
+          }
+          const size_t read_ahead_block_index =
+            static_cast<size_t>(block) + 2;
+          if(pgen_prefetch_enabled &&
+             read_ahead_block_index < level0_block_sizes.size()) {
+            start_pgen_prefetch(
+              level0_block_sizes[read_ahead_block_index],
+              in_filters.step1_snp_count + bs + next_bs);
           }
         } else {
           pgen_prefetch_ready = true;
