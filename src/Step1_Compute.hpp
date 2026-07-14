@@ -58,6 +58,9 @@ struct Step1ComputeTimings {
   double packed_hardcall_allocation_ms = 0;
   double packed_hardcall_host_prepare_ms = 0;
   double packed_hardcall_backend_wall_ms = 0;
+  uint64_t packed_pipeline_submission_count = 0;
+  double packed_pipeline_service_ms = 0;
+  double packed_pipeline_wait_ms = 0;
   uint64_t design_upload_count = 0;
   uint64_t design_upload_bytes = 0;
   uint64_t resident_design_upload_count = 0;
@@ -101,6 +104,30 @@ class Step1ComputeBackend {
       double minimum_scale,
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings = nullptr);
+
+    virtual int configure_packed_hardcall_pipeline(
+      Eigen::Index maximum_variants,
+      Eigen::Index samples,
+      Eigen::Index covariate_count);
+
+    virtual bool submit_packed_hardcall_preprocessing(
+      const unsigned char* packed_hardcalls,
+      size_t packed_bytes,
+      size_t packed_stride_bytes,
+      Eigen::Index variants,
+      Eigen::Index samples,
+      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale,
+      int& pipeline_slot);
+
+    virtual bool activate_packed_hardcall_preprocessing(
+      int pipeline_slot,
+      Eigen::VectorXd& row_scales,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void finish_packed_hardcall_pipeline();
 
     virtual void compute_preprocessed_products(
       Eigen::Index start_column,

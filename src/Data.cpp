@@ -613,15 +613,23 @@ void Data::residualize_genotypes() {
   bool backend_processed = false;
   const ProfileClock::time_point backend_call_start = ProfileClock::now();
   if(Gblock.step1_pgen_packed_block) {
-    backend_processed =
-      step1_compute_backend->preprocess_packed_hardcalls(
-        Gblock.step1_pgen_packed_hardcalls.data(),
-        Gblock.step1_pgen_packed_hardcalls.size(),
-        Gblock.step1_pgen_packed_stride_bytes,
-        Gblock.Gmat.rows(), params.n_samples,
-        pheno_data.new_cov, sample_weights,
-        params.n_analyzed - params.ncov, params.numtol, scale_G,
-        params.profile_step1 ? &timings : nullptr);
+    if(Gblock.step1_pgen_packed_pipeline_slot >= 0) {
+      backend_processed =
+        step1_compute_backend->activate_packed_hardcall_preprocessing(
+          Gblock.step1_pgen_packed_pipeline_slot, scale_G,
+          params.profile_step1 ? &timings : nullptr);
+      Gblock.step1_pgen_packed_pipeline_slot = -1;
+    } else {
+      backend_processed =
+        step1_compute_backend->preprocess_packed_hardcalls(
+          Gblock.step1_pgen_packed_hardcalls.data(),
+          Gblock.step1_pgen_packed_hardcalls.size(),
+          Gblock.step1_pgen_packed_stride_bytes,
+          Gblock.Gmat.rows(), params.n_samples,
+          pheno_data.new_cov, sample_weights,
+          params.n_analyzed - params.ncov, params.numtol, scale_G,
+          params.profile_step1 ? &timings : nullptr);
+    }
     if(!backend_processed)
       throw std::runtime_error(
         "Step 1 packed PGEN block could not be preprocessed by the selected backend");
@@ -697,6 +705,12 @@ void Data::residualize_genotypes() {
       timings.packed_hardcall_host_prepare_ms;
     step1_profile.preprocess_packed_hardcall_backend_wall_ms +=
       timings.packed_hardcall_backend_wall_ms;
+    step1_profile.preprocess_packed_pipeline_submissions +=
+      timings.packed_pipeline_submission_count;
+    step1_profile.preprocess_packed_pipeline_service_ms +=
+      timings.packed_pipeline_service_ms;
+    step1_profile.preprocess_packed_pipeline_wait_ms +=
+      timings.packed_pipeline_wait_ms;
     if(backend_processed)
       step1_profile.preprocess_backend_blocks++;
     else
@@ -1148,9 +1162,26 @@ void Data::level_0_calculations() {
       sizeof(double);
   const bool pgen_prefetch_enabled = pgen_cuda_backend &&
     pgen_prefetch_limit > 0 && pgen_block_bytes <= pgen_prefetch_limit;
+  const int pgen_packed_pipeline_depth =
+    pgen_packed_hardcalls && pgen_prefetch_enabled ?
+      step1_compute_backend->configure_packed_hardcall_pipeline(
+        params.block_size, params.n_samples, pheno_data.new_cov.cols()) : 1;
+  bool pgen_packed_pipeline_enabled =
+    pgen_packed_pipeline_depth >= 2;
   Step1PgenPrefetchBuffer pgen_prefetch_buffer;
   std::future<Step1PgenPrefetchResult> pgen_prefetch_future;
   bool pgen_prefetch_pending = false;
+  bool pgen_prefetch_ready = false;
+  Step1PgenPrefetchResult pgen_prefetch_ready_result;
+  double pgen_prefetch_ready_wait_ms = 0;
+  int pgen_pipeline_pending_slot = -1;
+  Step1PgenPrefetchResult pgen_pipeline_pending_result;
+  double pgen_pipeline_pending_wait_ms = 0;
+  bool finish_pipeline_after_release = false;
+  VectorXd pgen_pipeline_sample_weights;
+  if(pgen_packed_pipeline_enabled)
+    pgen_pipeline_sample_weights =
+      in_filters.ind_in_analysis.matrix().cast<double>();
   if(pgen_cuda_backend) {
     sout << " - Step 1 PGEN block prefetch : [" <<
       (pgen_prefetch_enabled ? "enabled" : "disabled") << "]";
@@ -1160,6 +1191,15 @@ void Data::level_0_calculations() {
     else if(pgen_prefetch_limit > 0)
       sout << " block_mb=" << (pgen_block_bytes / 1000000.0) <<
         " limit_mb=" << (pgen_prefetch_limit / 1000000.0);
+    sout << "\n";
+    sout << " - Step 1 CUDA block pipeline : [" <<
+      (pgen_packed_pipeline_enabled ? "enabled" : "disabled") <<
+      "] depth=" << pgen_packed_pipeline_depth;
+    if(!pgen_packed_pipeline_enabled) {
+      if(!pgen_packed_hardcalls) sout << " reason=packed_hardcalls_disabled";
+      else if(!pgen_prefetch_enabled) sout << " reason=prefetch_disabled";
+      else sout << " reason=runtime_or_device_capacity";
+    }
     sout << "\n";
   }
 
@@ -1188,7 +1228,51 @@ void Data::level_0_calculations() {
       ProfileClock::time_point stage_start;
       if(params.profile_step1) stage_start = ProfileClock::now();
       Gblock.step1_pgen_packed_block = false;
-      if(pgen_prefetch_pending) {
+      Gblock.step1_pgen_packed_pipeline_slot = -1;
+      if(pgen_pipeline_pending_slot >= 0) {
+        Gblock.Gmat.resize(bs, 0);
+        Gblock.step1_pgen_packed_block = true;
+        Gblock.step1_pgen_packed_pipeline_slot =
+          pgen_pipeline_pending_slot;
+        pgen_pipeline_pending_slot = -1;
+        sout << " block [" << block + 1 << "] : " << bs <<
+          " snps (" << static_cast<long long>(
+            pgen_pipeline_pending_result.service_ms) <<
+          "ms prefetched; " << static_cast<long long>(
+            pgen_pipeline_pending_wait_ms) <<
+          "ms wait; device queued)" << endl;
+      } else if(pgen_prefetch_ready) {
+        pgen_prefetch_ready = false;
+        if(pgen_packed_hardcalls) {
+          Gblock.Gmat.resize(bs, 0);
+          Gblock.step1_pgen_packed_hardcalls.swap(
+            pgen_prefetch_buffer.packed_hardcalls);
+          Gblock.step1_pgen_packed_stride_bytes =
+            pgen_prefetch_buffer.packed_stride_bytes;
+          pgen_prefetch_buffer.packed_stride_bytes = 0;
+          Gblock.step1_pgen_packed_block = true;
+        } else {
+          Gblock.Gmat.swap(pgen_prefetch_buffer.genotypes);
+          if(params.alpha_prior != -1)
+            Gblock.snp_afs.swap(pgen_prefetch_buffer.allele_frequencies);
+        }
+        if(pgen_profile)
+          accumulate_step1_pgen_profile(
+            *pgen_profile, pgen_prefetch_ready_result.profile);
+        if(params.profile_step1) {
+          step1_profile.pgen_prefetched_blocks++;
+          step1_profile.pgen_prefetch_service_ms +=
+            pgen_prefetch_ready_result.service_ms;
+          step1_profile.pgen_prefetch_wait_ms +=
+            pgen_prefetch_ready_wait_ms;
+          step1_profile.decode_ms += pgen_prefetch_ready_wait_ms;
+        }
+        sout << " block [" << block + 1 << "] : " << bs <<
+          " snps (" << static_cast<long long>(
+            pgen_prefetch_ready_result.service_ms) <<
+          "ms prefetched; " << static_cast<long long>(
+            pgen_prefetch_ready_wait_ms) << "ms wait)" << endl;
+      } else if(pgen_prefetch_pending) {
         const ProfileClock::time_point wait_start = ProfileClock::now();
         Step1PgenPrefetchResult result = pgen_prefetch_future.get();
         const double wait_ms = elapsed_ms(wait_start);
@@ -1314,10 +1398,73 @@ void Data::level_0_calculations() {
         pgen_prefetch_pending = true;
       }
 
+      if(pgen_packed_pipeline_enabled &&
+         Gblock.step1_pgen_packed_block &&
+         Gblock.step1_pgen_packed_pipeline_slot < 0) {
+        int pipeline_slot = -1;
+        const bool submitted =
+          step1_compute_backend->submit_packed_hardcall_preprocessing(
+            Gblock.step1_pgen_packed_hardcalls.data(),
+            Gblock.step1_pgen_packed_hardcalls.size(),
+            Gblock.step1_pgen_packed_stride_bytes,
+            bs, params.n_samples, pheno_data.new_cov,
+            pgen_pipeline_sample_weights,
+            params.n_analyzed - params.ncov, params.numtol,
+            pipeline_slot);
+        if(submitted) {
+          Gblock.step1_pgen_packed_pipeline_slot = pipeline_slot;
+        } else {
+          pgen_packed_pipeline_enabled = false;
+          step1_compute_backend->finish_packed_hardcall_pipeline();
+          sout << " - Step 1 CUDA block pipeline disabled after "
+            "initial submission; continuing at depth 1\n";
+        }
+      }
+
       // residualize and scale genotypes
       if(params.profile_step1) stage_start = ProfileClock::now();
       residualize_genotypes();
       if(params.profile_step1) step1_profile.residualize_ms += elapsed_ms(stage_start);
+
+      if(pgen_packed_pipeline_enabled && pgen_prefetch_pending) {
+        const ProfileClock::time_point wait_start = ProfileClock::now();
+        Step1PgenPrefetchResult result = pgen_prefetch_future.get();
+        const double wait_ms = elapsed_ms(wait_start);
+        pgen_prefetch_pending = false;
+        int pipeline_slot = -1;
+        const bool submitted =
+          step1_compute_backend->submit_packed_hardcall_preprocessing(
+            pgen_prefetch_buffer.packed_hardcalls.data(),
+            pgen_prefetch_buffer.packed_hardcalls.size(),
+            pgen_prefetch_buffer.packed_stride_bytes,
+            next_bs, params.n_samples, pheno_data.new_cov,
+            pgen_pipeline_sample_weights,
+            params.n_analyzed - params.ncov, params.numtol,
+            pipeline_slot);
+        if(submitted) {
+          pgen_pipeline_pending_slot = pipeline_slot;
+          pgen_pipeline_pending_result = result;
+          pgen_pipeline_pending_wait_ms = wait_ms;
+          pgen_prefetch_buffer.packed_hardcalls.clear();
+          pgen_prefetch_buffer.packed_stride_bytes = 0;
+          if(pgen_profile)
+            accumulate_step1_pgen_profile(*pgen_profile, result.profile);
+          if(params.profile_step1) {
+            step1_profile.pgen_prefetched_blocks++;
+            step1_profile.pgen_prefetch_service_ms += result.service_ms;
+            step1_profile.pgen_prefetch_wait_ms += wait_ms;
+            step1_profile.decode_ms += wait_ms;
+          }
+        } else {
+          pgen_prefetch_ready = true;
+          pgen_prefetch_ready_result = result;
+          pgen_prefetch_ready_wait_ms = wait_ms;
+          pgen_packed_pipeline_enabled = false;
+          finish_pipeline_after_release = true;
+          sout << " - Step 1 CUDA block pipeline disabled after queued "
+            "submission; continuing at depth 1\n";
+        }
+      }
 
       // calc working matrices for ridge regressions across folds
       ProfileClock::time_point cv_start;
@@ -1415,9 +1562,15 @@ void Data::level_0_calculations() {
         l1_ests.beta_snp_step1.middleRows(in_filters.step1_snp_count, bs).array().colwise() /= scale_G.array() / pheno_data.scale_Y(0);
 
       step1_compute_backend->release_preprocessed_genotypes();
+      if(finish_pipeline_after_release) {
+        step1_compute_backend->finish_packed_hardcall_pipeline();
+        finish_pipeline_after_release = false;
+      }
       block++; in_filters.step1_snp_count += bs;
     }
   }
+
+  step1_compute_backend->finish_packed_hardcall_pipeline();
 
   // close streams
   if(params.write_l0_pred) {
@@ -1458,6 +1611,7 @@ void Data::level_0_calculations() {
   std::vector<unsigned char>().swap(Gblock.step1_pgen_packed_hardcalls);
   Gblock.step1_pgen_packed_stride_bytes = 0;
   Gblock.step1_pgen_packed_block = false;
+  Gblock.step1_pgen_packed_pipeline_slot = -1;
   if(params.write_l0_pred && (params.n_pheno > 1) ){
     // free level 0 predictions for (P-1) indices in test_mat
     for(int ph = 1; ph < params.n_pheno; ++ph ) {
@@ -1567,7 +1721,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=9 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=10 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -1667,6 +1821,15 @@ void Data::print_step1_profile() {
         step1_profile.preprocess_packed_hardcall_host_prepare_ms
       << " packed_hardcall_backend_wall_ms=" <<
         step1_profile.preprocess_packed_hardcall_backend_wall_ms
+      << " packed_pipeline_submissions=" <<
+        step1_profile.preprocess_packed_pipeline_submissions
+      << " packed_pipeline_service_ms=" <<
+        step1_profile.preprocess_packed_pipeline_service_ms
+      << " packed_pipeline_wait_ms=" <<
+        step1_profile.preprocess_packed_pipeline_wait_ms
+      << " packed_pipeline_estimated_overlap_ms=" << std::max(
+        0.0, step1_profile.preprocess_packed_pipeline_service_ms -
+          step1_profile.preprocess_packed_pipeline_wait_ms)
       << " packed_hardcall_backend_unaccounted_ms=" << std::max(
         0.0, step1_profile.preprocess_packed_hardcall_backend_wall_ms -
           step1_profile.preprocess_packed_hardcall_validation_ms -

@@ -141,6 +141,7 @@ struct geno_block {
   std::vector<unsigned char> step1_pgen_packed_hardcalls;
   size_t step1_pgen_packed_stride_bytes = 0;
   bool step1_pgen_packed_block = false;
+  int step1_pgen_packed_pipeline_slot = -1;
   std::vector<data_thread> thread_data;
 };
 

@@ -340,6 +340,12 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.packed_hardcall_host_prepare_ms;
   destination.packed_hardcall_backend_wall_ms +=
     source.packed_hardcall_backend_wall_ms;
+  destination.packed_pipeline_submission_count +=
+    source.packed_pipeline_submission_count;
+  destination.packed_pipeline_service_ms +=
+    source.packed_pipeline_service_ms;
+  destination.packed_pipeline_wait_ms +=
+    source.packed_pipeline_wait_ms;
   destination.design_upload_count += source.design_upload_count;
   destination.design_upload_bytes += source.design_upload_bytes;
   destination.resident_design_upload_count +=
@@ -578,6 +584,55 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
   }
   candidate.release_preprocessed_genotypes();
 
+  const bool pipeline_supported =
+    candidate.configure_packed_hardcall_pipeline(
+      rows, samples, covariates.cols()) >= 2;
+  double pipeline_scale_error = 0;
+  double pipeline_gram_error = 0;
+  if(pipeline_supported) {
+    int first_slot = -1;
+    int second_slot = -1;
+    if(!candidate.submit_packed_hardcall_preprocessing(
+         packed.data(), packed.size(), stride, rows, samples,
+         covariates, sample_weights, degrees_of_freedom, 1e-12,
+         first_slot) ||
+       !candidate.submit_packed_hardcall_preprocessing(
+         packed.data(), packed.size(), stride, rows, samples,
+         covariates, sample_weights, degrees_of_freedom, 1e-12,
+         second_slot) || first_slot == second_slot)
+      throw std::runtime_error(
+        "packed hardcall pipeline submission conformance failed");
+
+    for(int queued = 0; queued < 2; ++queued) {
+      Step1ComputeTimings pipeline_timings;
+      const int slot = queued == 0 ? first_slot : second_slot;
+      if(!candidate.activate_packed_hardcall_preprocessing(
+           slot, actual_scales, &pipeline_timings))
+        throw std::runtime_error(
+          "packed hardcall pipeline activation conformance failed");
+      pipeline_scale_error = std::max(pipeline_scale_error,
+        (actual_scales - expected_scales).cwiseAbs().maxCoeff() /
+          std::max(1.0, expected_scales.cwiseAbs().maxCoeff()));
+      candidate.compute_preprocessed_products(0, samples, outcomes,
+        actual_gram, actual_crossproduct, Step1GramMode::full_product);
+      pipeline_gram_error = std::max(
+        pipeline_gram_error, relative_error(actual_gram, expected_gram));
+      if(pipeline_timings.packed_pipeline_submission_count != 1 ||
+         pipeline_timings.packed_hardcall_upload_count != 1 ||
+         !std::isfinite(pipeline_timings.packed_pipeline_service_ms) ||
+         pipeline_timings.packed_pipeline_service_ms <= 0 ||
+         !std::isfinite(pipeline_timings.packed_pipeline_wait_ms))
+        throw std::runtime_error(
+          "packed hardcall pipeline timing conformance failed");
+      candidate.release_preprocessed_genotypes();
+    }
+    candidate.finish_packed_hardcall_pipeline();
+    if(pipeline_scale_error > preprocessing_tolerance ||
+       pipeline_gram_error > gram_tolerance)
+      throw std::runtime_error(
+        "packed hardcall pipeline numeric conformance failed");
+  }
+
   bool rejected_negative_weight = false;
   Eigen::VectorXd invalid_weights = sample_weights;
   invalid_weights(1) = -1;
@@ -621,6 +676,9 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
               batched_cholesky_prediction_error
             << " batched_cholesky_coefficient_relative_error=" <<
               batched_cholesky_coefficient_error
+            << " pipeline_supported=" << pipeline_supported
+            << " pipeline_scale_relative_error=" << pipeline_scale_error
+            << " pipeline_gram_relative_error=" << pipeline_gram_error
             << " status=PASS\n";
 }
 

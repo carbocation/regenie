@@ -85,6 +85,9 @@ struct Step1Profile {
   double preprocess_packed_hardcall_allocation_ms = 0;
   double preprocess_packed_hardcall_host_prepare_ms = 0;
   double preprocess_packed_hardcall_backend_wall_ms = 0;
+  uint64_t preprocess_packed_pipeline_submissions = 0;
+  double preprocess_packed_pipeline_service_ms = 0;
+  double preprocess_packed_pipeline_wait_ms = 0;
   uint64_t pgen_prefetched_blocks = 0;
   double pgen_prefetch_service_ms = 0;
   double pgen_prefetch_wait_ms = 0;
