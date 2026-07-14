@@ -55,9 +55,12 @@ bool cox_firth_score_warm_start_enabled() {
 }
 
 bool cox_firth_direct_reduced_fallback_enabled() {
+  // The historical first pass consistently exhausts its line search before
+  // retrying with these conservative settings. Keep an escape hatch for
+  // matched validation while avoiding that failed pass by default.
   const char* value =
     std::getenv("REGENIE_COX_FIRTH_DIRECT_REDUCED_FALLBACK");
-  return value != nullptr && std::string(value) != "0";
+  return value == nullptr || std::string(value) != "0";
 }
 
 enum class CoxFirthProfilePhase {
