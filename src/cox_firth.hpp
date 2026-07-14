@@ -9,6 +9,8 @@ class cox_firth {
         // prediction
         Eigen::VectorXd eta, eta_order, residual;
         int iter;
+        uint64_t likelihood_evaluations = 0;
+        uint64_t step_halving_evaluations = 0;
         bool converge = false;
 
         // prepare for test
@@ -41,6 +43,7 @@ class cox_firth {
         double _tol, _stephalf_tol, _betatol;
 		double _maxstep;
         bool _usefirth, _verbose, _compact_likelihood;
+        bool _direct_adjustment, _consistent_reduced_adjustment;
 
         Eigen::MatrixXd _X_order;
         Eigen::VectorXd _offset_order;
@@ -49,6 +52,7 @@ class cox_firth {
         Eigen::VectorXd _cumulative_hazard;
         Eigen::VectorXd _first_moment;
         Eigen::MatrixXd _second_moment;
+        std::vector<double> _third_moment;
         std::vector<Eigen::MatrixXd> _firth_der;
         Eigen::MatrixXd _XtW;
         Eigen::MatrixXd _solved_XtW;

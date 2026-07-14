@@ -12,6 +12,25 @@ bool compact_cox_firth_likelihood_enabled() {
     return value == nullptr || std::string(value) != "0";
 }
 
+bool direct_cox_firth_adjustment_enabled() {
+    const char* value = std::getenv("REGENIE_COX_FIRTH_DIRECT_ADJUSTMENT");
+    return value == nullptr || std::string(value) != "0";
+}
+
+bool consistent_reduced_cox_firth_adjustment_enabled() {
+    const char* value =
+        std::getenv("REGENIE_COX_FIRTH_CONSISTENT_REDUCED");
+    return value != nullptr && std::string(value) != "0";
+}
+
+size_t third_moment_index(int first, int second, int third, int dimension) {
+    if (first > second) std::swap(first, second);
+    if (second > third) std::swap(second, third);
+    if (first > second) std::swap(first, second);
+    return (static_cast<size_t>(first) * dimension + second) * dimension +
+        third;
+}
+
 }
 
 cox_firth::cox_firth(){}
@@ -30,6 +49,12 @@ void cox_firth::setup(const survival_data& survivalData, const Eigen::MatrixXd& 
     _verbose = verbose_obj;
     _cols_incl = cols_incl;
     _compact_likelihood = compact_cox_firth_likelihood_enabled();
+    _direct_adjustment = _compact_likelihood && _usefirth &&
+        direct_cox_firth_adjustment_enabled();
+    _consistent_reduced_adjustment = _direct_adjustment &&
+        consistent_reduced_cox_firth_adjustment_enabled();
+    likelihood_evaluations = 0;
+    step_halving_evaluations = 0;
     loglike.resize(_niter + 1);
     first_der.resize(p);
     mu.resize(survivalData.n);
@@ -43,6 +68,8 @@ void cox_firth::setup(const survival_data& survivalData, const Eigen::MatrixXd& 
     _cumulative_hazard.resize(survivalData.n_unique_time);
     _first_moment.resize(p);
     _second_moment.resize(p, p);
+    _third_moment.resize(
+        _direct_adjustment ? static_cast<size_t>(p) * p * p : 0);
     _firth_der.resize(_usefirth ? p : 0);
     for (int i = 0; i < static_cast<int>(_firth_der.size()); ++i) {
         _firth_der[i].resize(p, p);
@@ -64,6 +91,7 @@ void cox_firth::setup(const survival_data& survivalData, const Eigen::MatrixXd& 
 }
 
 void cox_firth::cox_firth_likelihood(const survival_data& survivalData, const Eigen::MatrixXd& Xmat) {
+    ++likelihood_evaluations;
     if (_compact_likelihood) {
         cox_firth_likelihood_compact(survivalData);
     } else {
@@ -110,6 +138,7 @@ void cox_firth::cox_firth_likelihood_compact(
     _S0.setZero();
     _first_moment.setZero();
     _second_moment.setZero();
+    std::fill(_third_moment.begin(), _third_moment.end(), 0.0);
     second_der.setZero(p, p);
     for (int t = 0; t < static_cast<int>(_firth_der.size()); ++t) {
         _firth_der[t].setZero();
@@ -129,7 +158,14 @@ void cox_firth::cox_firth_likelihood_compact(
             const double weighted_x = row_risk * _X_order(row, j);
             _first_moment(j) += weighted_x;
             for (int k = 0; k < p; ++k) {
-                _second_moment(j, k) += weighted_x * _X_order(row, k);
+                const double weighted_xx = weighted_x * _X_order(row, k);
+                _second_moment(j, k) += weighted_xx;
+                if (_direct_adjustment && k >= j) {
+                    for (int t = k; t < p; ++t) {
+                        _third_moment[third_moment_index(j, k, t, p)] +=
+                            weighted_xx * _X_order(row, t);
+                    }
+                }
             }
         }
 
@@ -157,7 +193,10 @@ void cox_firth::cox_firth_likelihood_compact(
                 for (int j = 0; j < p; ++j) {
                     for (int k = 0; k < p; ++k) {
                         _firth_der[t](j, k) += event_weight *
-                            ((-_second_moment(j, k) * _first_moment(t) -
+                            ((_direct_adjustment ?
+                                  _third_moment[third_moment_index(
+                                      t, j, k, p)] * inverse_risk : 0.0) +
+                             (-_second_moment(j, k) * _first_moment(t) -
                               _second_moment(j, t) * _first_moment(k) -
                               _second_moment(t, j) * _first_moment(k)) *
                                  inverse_risk2 +
@@ -180,18 +219,33 @@ void cox_firth::cox_firth_likelihood_compact(
         qrsd_incl.compute(second_der.block(0, 0, _cols_incl, _cols_incl));
         if (_usefirth) {
             loglik_val += 0.5 * qrsd.logAbsDeterminant();
-            _XtW = (_X_order.leftCols(_cols_incl).array().colwise() *
-                mu.array().sqrt()).transpose();
-            _solved_XtW = qrsd_incl.solve(_XtW);
-            _leverage = (_solved_XtW.array() * _XtW.array())
-                .colwise().sum().matrix().transpose();
-            first_der = _X_order.leftCols(_cols_incl).transpose() *
-                survivalData.keep_sample_order.select(
-                    residual + 0.5 * _leverage, 0);
-            for (int t = 0; t < _cols_incl; ++t) {
-                first_der(t) += 0.5 * qrsd_incl.solve(
-                    _firth_der[t].block(
-                        0, 0, _cols_incl, _cols_incl)).trace();
+            if (_direct_adjustment) {
+                first_der =
+                    _X_order.leftCols(_cols_incl).transpose() * residual;
+                for (int t = 0; t < _cols_incl; ++t) {
+                    if (_consistent_reduced_adjustment) {
+                        first_der(t) +=
+                            0.5 * qrsd.solve(_firth_der[t]).trace();
+                    } else {
+                        first_der(t) += 0.5 * qrsd_incl.solve(
+                            _firth_der[t].block(
+                                0, 0, _cols_incl, _cols_incl)).trace();
+                    }
+                }
+            } else {
+                _XtW = (_X_order.leftCols(_cols_incl).array().colwise() *
+                    mu.array().sqrt()).transpose();
+                _solved_XtW = qrsd_incl.solve(_XtW);
+                _leverage = (_solved_XtW.array() * _XtW.array())
+                    .colwise().sum().matrix().transpose();
+                first_der = _X_order.leftCols(_cols_incl).transpose() *
+                    survivalData.keep_sample_order.select(
+                        residual + 0.5 * _leverage, 0);
+                for (int t = 0; t < _cols_incl; ++t) {
+                    first_der(t) += 0.5 * qrsd_incl.solve(
+                        _firth_der[t].block(
+                            0, 0, _cols_incl, _cols_incl)).trace();
+                }
             }
         } else {
             first_der = _X_order.leftCols(_cols_incl).transpose() * residual;
@@ -199,17 +253,25 @@ void cox_firth::cox_firth_likelihood_compact(
     } else {
         if (_usefirth) {
             loglik_val += 0.5 * qrsd.logAbsDeterminant();
-            _XtW = (_X_order.array().colwise() *
-                mu.array().sqrt()).transpose();
-            _solved_XtW = qrsd.solve(_XtW);
-            _leverage = (_solved_XtW.array() * _XtW.array())
-                .colwise().sum().matrix().transpose();
-            first_der = _X_order.transpose() *
-                survivalData.keep_sample_order.select(
-                    residual + 0.5 * _leverage, 0);
-            for (int t = 0; t < p; ++t) {
-                first_der(t) +=
-                    0.5 * qrsd.solve(_firth_der[t]).trace();
+            if (_direct_adjustment) {
+                first_der = _X_order.transpose() * residual;
+                for (int t = 0; t < p; ++t) {
+                    first_der(t) +=
+                        0.5 * qrsd.solve(_firth_der[t]).trace();
+                }
+            } else {
+                _XtW = (_X_order.array().colwise() *
+                    mu.array().sqrt()).transpose();
+                _solved_XtW = qrsd.solve(_XtW);
+                _leverage = (_solved_XtW.array() * _XtW.array())
+                    .colwise().sum().matrix().transpose();
+                first_der = _X_order.transpose() *
+                    survivalData.keep_sample_order.select(
+                        residual + 0.5 * _leverage, 0);
+                for (int t = 0; t < p; ++t) {
+                    first_der(t) +=
+                        0.5 * qrsd.solve(_firth_der[t]).trace();
+                }
             }
         } else {
             first_der = _X_order.transpose() * residual;
@@ -357,6 +419,7 @@ void cox_firth::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
             ii = 0;
             while ((loglike(iter - 1) - loglik_val) > _stephalf_tol) {
                 ++ii;
+                ++step_halving_evaluations;
                 // std::cout << "inner iteration: " << ii << "\n";
                 if (ii > _mxitnr) {
                     // std::cout << "Convergence issue, inner loop: cannot correct step size, add eps\n";
@@ -400,6 +463,7 @@ void cox_firth::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
 void cox_firth::cox_firth_likelihood_1(
     const survival_data& survivalData,
     const Eigen::VectorXd& g) {
+    ++likelihood_evaluations;
     if (_compact_likelihood) {
         cox_firth_likelihood_1_compact(survivalData);
     } else {
@@ -545,6 +609,7 @@ void cox_firth::fit_1(const survival_data& survivalData, const Eigen::VectorXd& 
             ii = 0;
             while ((loglike(iter - 1) - loglik_val) > _stephalf_tol) {
                 ++ii;
+                ++step_halving_evaluations;
                 // std::cout << "inner iteration: " << ii << "\n";
                 if (ii > _mxitnr) {
                     // std::cout << "Convergence issue, inner loop: cannot correct step size, add eps\n";

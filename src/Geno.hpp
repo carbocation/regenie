@@ -121,6 +121,8 @@ struct Step2CorrectionProfile {
   uint64_t cox_firth_one_parameter_tests = 0;
   uint64_t cox_firth_fallbacks = 0;
   uint64_t cox_firth_iterations = 0;
+  uint64_t cox_firth_likelihood_evaluations = 0;
+  uint64_t cox_firth_step_halvings = 0;
   double cox_firth_thread_ms = 0;
 };
 

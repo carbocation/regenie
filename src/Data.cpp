@@ -426,6 +426,10 @@ void Data::print_step2_profile() {
       thread_profile.cox_firth_fallbacks;
     correction_profile.cox_firth_iterations +=
       thread_profile.cox_firth_iterations;
+    correction_profile.cox_firth_likelihood_evaluations +=
+      thread_profile.cox_firth_likelihood_evaluations;
+    correction_profile.cox_firth_step_halvings +=
+      thread_profile.cox_firth_step_halvings;
     correction_profile.cox_firth_thread_ms +=
       thread_profile.cox_firth_thread_ms;
   }
@@ -581,6 +585,17 @@ void Data::print_step2_profile() {
       std::getenv("REGENIE_COX_FIRTH_COMPACT");
     const bool compact_cox_firth = compact_cox_firth_value == nullptr ||
       std::string(compact_cox_firth_value) != "0";
+    const char* direct_cox_firth_value =
+      std::getenv("REGENIE_COX_FIRTH_DIRECT_ADJUSTMENT");
+    const bool direct_cox_firth_adjustment =
+      compact_cox_firth && (direct_cox_firth_value == nullptr ||
+      std::string(direct_cox_firth_value) != "0");
+    const char* consistent_reduced_cox_firth_value =
+      std::getenv("REGENIE_COX_FIRTH_CONSISTENT_REDUCED");
+    const bool consistent_reduced_cox_firth =
+      direct_cox_firth_adjustment &&
+      consistent_reduced_cox_firth_value != nullptr &&
+      std::string(consistent_reduced_cox_firth_value) != "0";
     const uint64_t correction_tests = correction_profile.spa_tests +
       correction_profile.logistic_firth_tests +
       correction_profile.cox_firth_tests;
@@ -637,6 +652,14 @@ void Data::print_step2_profile() {
         << " cox_firth_iterations=" <<
           correction_profile.cox_firth_iterations
         << " cox_firth_compact=" << (compact_cox_firth ? 1 : 0)
+        << " cox_firth_direct_adjustment=" <<
+          (direct_cox_firth_adjustment ? 1 : 0)
+        << " cox_firth_consistent_reduced=" <<
+          (consistent_reduced_cox_firth ? 1 : 0)
+        << " cox_firth_likelihood_evaluations=" <<
+          correction_profile.cox_firth_likelihood_evaluations
+        << " cox_firth_step_halvings=" <<
+          correction_profile.cox_firth_step_halvings
         << " cox_firth_thread_ms=" <<
           correction_profile.cox_firth_thread_ms
         << " cox_firth_average_ms=" << cox_firth_average_ms

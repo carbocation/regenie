@@ -302,6 +302,9 @@ number of corrections attempted and failed, average time per correction,
 fast/sparse or approximate/one-parameter path coverage, and solver diagnostics.
 SPA diagnostics count root-solver iterations, while logistic and Cox Firth
 diagnostics count fallback attempts; Cox Firth also reports fit iterations.
+The Cox diagnostics additionally report likelihood evaluations and
+step-halving evaluations, which distinguish expensive likelihood work from
+outer Newton iterations.
 The scope separately reports the per-chromosome penalized-null preparation
 time and fit count. Correction timings are sums over worker threads, so they
 are components of `variant_compute` worker time rather than additive wall-time
@@ -315,6 +318,18 @@ sparse risk-set products and temporary matrices. Set the developer diagnostic
 `REGENIE_COX_FIRTH_COMPACT=0` to retain the previous sparse implementation for
 matched numerical and performance comparisons. The `corrections` scope records
 the selected path as `cox_firth_compact=1` or `0`.
+
+Compact Cox Firth fitting computes the Jeffreys score directly from first,
+second, and third risk-set moments. This avoids constructing and solving the
+sample-sized leverage workspace used by the earlier implementation while
+retaining the same penalized likelihood and score. Set
+`REGENIE_COX_FIRTH_DIRECT_ADJUSTMENT=0` for a matched comparison with the
+leverage formulation. Exact Cox testing historically evaluates a full-model
+Jeffreys determinant at the reduced null while using a reduced-information
+score. The developer diagnostic
+`REGENIE_COX_FIRTH_CONSISTENT_REDUCED=1` instead differentiates the same full
+determinant used by the objective; it is opt-in while its large-sample exact
+test behavior is evaluated.
 
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy

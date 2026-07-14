@@ -88,11 +88,21 @@ cox_firth evaluate_general(
     const Eigen::VectorXd& offset,
     bool compact,
     int included_columns = -1,
-    bool use_firth = true) {
+    bool use_firth = true,
+    bool direct_adjustment = true,
+    bool consistent_reduced = false,
+    const Eigen::VectorXd* beta_override = nullptr) {
     setenv("REGENIE_COX_FIRTH_COMPACT", compact ? "1" : "0", 1);
+    setenv(
+        "REGENIE_COX_FIRTH_DIRECT_ADJUSTMENT",
+        direct_adjustment ? "1" : "0", 1);
+    setenv(
+        "REGENIE_COX_FIRTH_CONSISTENT_REDUCED",
+        consistent_reduced ? "1" : "0", 1);
     if (included_columns < 0) included_columns = design.cols();
     Eigen::VectorXd beta(4);
     beta << 0.03, -0.08, 0.05, 0.11;
+    if (beta_override != nullptr) beta = *beta_override;
     cox_firth model;
     model.setup(
         data, design, offset, included_columns, 40, 30, 1e-8, 2.5e-4,
@@ -149,6 +159,15 @@ int main() {
             "general residual", general_legacy.residual,
             general_compact.residual, 1e-10);
 
+        const cox_firth general_leverage =
+            evaluate_general(data, design, offset, true, 4, true, false);
+        require_close(
+            "direct versus leverage log likelihood",
+            general_leverage.loglik_val, general_compact.loglik_val, 1e-9);
+        require_close(
+            "direct versus leverage score",
+            general_leverage.first_der, general_compact.first_der, 1e-8);
+
         const cox_firth reduced_legacy =
             evaluate_general(data, design, offset, false, 3);
         const cox_firth reduced_compact =
@@ -162,6 +181,37 @@ int main() {
         require_close(
             "reduced information", reduced_legacy.second_der,
             reduced_compact.second_der, 1e-9);
+
+        const cox_firth reduced_leverage =
+            evaluate_general(data, design, offset, true, 3, true, false);
+        require_close(
+            "reduced direct versus leverage score",
+            reduced_leverage.first_der, reduced_compact.first_der, 1e-8);
+
+        Eigen::VectorXd finite_difference_beta(4);
+        finite_difference_beta << 0.03, -0.08, 0.05, 0.0;
+        const cox_firth consistent_reduced = evaluate_general(
+            data, design, offset, true, 3, true, true, true,
+            &finite_difference_beta);
+        const double epsilon = 1e-6;
+        for (int coefficient = 0; coefficient < 3; ++coefficient) {
+            Eigen::VectorXd beta_plus = finite_difference_beta;
+            Eigen::VectorXd beta_minus = finite_difference_beta;
+            beta_plus(coefficient) += epsilon;
+            beta_minus(coefficient) -= epsilon;
+            const cox_firth plus = evaluate_general(
+                data, design, offset, true, 3, true, true, true,
+                &beta_plus);
+            const cox_firth minus = evaluate_general(
+                data, design, offset, true, 3, true, true, true,
+                &beta_minus);
+            const double numerical_score =
+                (plus.loglik_val - minus.loglik_val) / (2 * epsilon);
+            require_close(
+                "consistent reduced finite-difference score",
+                numerical_score, consistent_reduced.first_der(coefficient),
+                1e-5);
+        }
 
         const cox_firth unpenalized_legacy =
             evaluate_general(data, design, offset, false, 4, false);
@@ -230,6 +280,8 @@ int main() {
             one_fit_compact.loglike.tail(1)(0), 1e-8);
 
         unsetenv("REGENIE_COX_FIRTH_COMPACT");
+        unsetenv("REGENIE_COX_FIRTH_DIRECT_ADJUSTMENT");
+        unsetenv("REGENIE_COX_FIRTH_CONSISTENT_REDUCED");
         std::cout << "COX_FIRTH_TEST status=PASS\n";
         return 0;
     } catch (const std::exception& error) {

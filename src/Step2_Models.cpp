@@ -47,6 +47,20 @@ using namespace boost;
 using boost::math::normal;
 using boost::math::chi_squared;
 
+namespace {
+
+void add_cox_firth_profile(
+    data_thread* thread_data,
+    const cox_firth& model) {
+  thread_data->correction_profile.cox_firth_iterations += model.iter;
+  thread_data->correction_profile.cox_firth_likelihood_evaluations +=
+    model.likelihood_evaluations;
+  thread_data->correction_profile.cox_firth_step_halvings +=
+    model.step_halving_evaluations;
+}
+
+}  // namespace
+
 
 void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, struct in_files& files, struct filter const& filters, struct phenodt const& pheno_data, struct param& params, mstream& sout) {
 
@@ -827,16 +841,14 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   cox_firth cox_firth_null;
   cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
-  if(params->profile_step2)
-    dt_thr->correction_profile.cox_firth_iterations += cox_firth_null.iter;
+  if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_null);
 
   if (!cox_firth_null.converge) {
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
     cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
-    if(params->profile_step2)
-      dt_thr->correction_profile.cox_firth_iterations += cox_firth_null.iter;
+    if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_null);
   }
 
   if (!cox_firth_null.converge) {
@@ -849,16 +861,14 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   cox_firth cox_firth_test;
   cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, cox_firth_null.beta);
   cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
-  if(params->profile_step2)
-    dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
+  if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
 
   if (!cox_firth_test.converge) {
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
     cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
     cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
-    if(params->profile_step2)
-      dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
+    if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
   }
 
   if (!cox_firth_test.converge) {
@@ -901,16 +911,14 @@ void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, st
   cox_firth cox_firth_test;
   cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false);
   cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
-  if(params->profile_step2)
-    dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
+  if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
 
   if(!cox_firth_test.converge){
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
     cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->maxstep/5, !params->cox_nofirth, false);
     cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
-    if(params->profile_step2)
-      dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
+    if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
   }
 
   if(!cox_firth_test.converge){
