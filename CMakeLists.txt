@@ -316,7 +316,8 @@ if(BUILD_TESTING)
     ${CMAKE_SOURCE_DIR}/src/survival_data.cpp)
   target_include_directories(cox_firth_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/
+    ${BGEN_PATH}/3rd_party/boost_1_55_0/)
   if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
     target_include_directories(cox_firth_test PRIVATE
       ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
