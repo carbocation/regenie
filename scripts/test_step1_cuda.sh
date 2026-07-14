@@ -241,6 +241,18 @@ awk '
 ' "${repo_root}/example/phenotype_bin.txt" \
   "${repo_root}/example/phenotype.txt" > "${validation_dir}/phenotype_t2e.txt"
 
+binary_kfold_prefix="${validation_dir}/binary_kfold"
+python3 "${repo_root}/scripts/generate_step1_bed.py" \
+  --prefix "${binary_kfold_prefix}" \
+  --samples 6000 \
+  --variants 1000 \
+  --phenotypes 2 \
+  --chromosomes 2 \
+  --seed 20260714 \
+  --max-bed-gb 1 \
+  --trait-type bt \
+  --missingness-profile none
+
 qt_common_args=(
   --step 1
   --bed "${repo_root}/example/example"
@@ -278,6 +290,18 @@ binary_common_args=(
   --bsize 100
   --threads 1
   --seed 12345
+  --step1-profile
+)
+
+binary_kfold_common_args=(
+  --step 1
+  --bed "${binary_kfold_prefix}"
+  --covarFile "${binary_kfold_prefix}.covar"
+  --phenoFile "${binary_kfold_prefix}.pheno"
+  --bt
+  --bsize 100
+  --threads 1
+  --seed 20260714
   --step1-profile
 )
 
@@ -458,8 +482,8 @@ run_end_to_end_pair test_l0_loocv loocv \
   "${qt_common_args[@]}" --loocv --test-l0 --l0-pval-thr 0.05
 run_end_to_end_pair count_kfold kfold "${count_common_args[@]}"
 run_end_to_end_pair count_loocv loocv "${count_common_args[@]}" --loocv
-run_end_to_end_pair binary_kfold kfold "${binary_common_args[@]}"
-run_end_to_end_pair binary_loocv loocv "${binary_common_args[@]}"
+run_end_to_end_pair binary_kfold kfold "${binary_kfold_common_args[@]}"
+run_end_to_end_pair binary_loocv loocv "${binary_common_args[@]}" --loocv
 run_end_to_end_pair binary_full loocv \
   "${binary_common_args[@]}" --loocv --l1-full
 run_end_to_end_pair t2e_kfold kfold "${t2e_common_args[@]}"
