@@ -1368,6 +1368,10 @@ void Data::level_0_calculations() {
       const double download_before_ms = params.profile_step1 ? l0.profile_backend_download_ms : 0;
       const double backend_ridge_before_ms = params.profile_step1 ?
         l0.profile_backend_ridge_compute_ms : 0;
+      const uint64_t cholesky_folds_before = params.profile_step1 ?
+        l0.profile_cholesky_ridge_folds : 0;
+      const uint64_t eigendecomposition_folds_before = params.profile_step1 ?
+        l0.profile_eigendecomposition_ridge_folds : 0;
       if(params.use_loocv)
         ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, step1_compute_backend.get(), sout);
       else
@@ -1389,6 +1393,11 @@ void Data::level_0_calculations() {
         step1_profile.ridge_eigensolve_ms += eigensolve_ms;
         step1_profile.ridge_transfer_ms += upload_ms + download_ms;
         step1_profile.ridge_backend_compute_ms += backend_ridge_ms;
+        step1_profile.ridge_cholesky_folds +=
+          l0.profile_cholesky_ridge_folds - cholesky_folds_before;
+        step1_profile.ridge_eigendecomposition_folds +=
+          l0.profile_eigendecomposition_ridge_folds -
+            eigendecomposition_folds_before;
         step1_profile.ridge_host_orchestration_ms += std::max(0.0,
           ridge_total_ms - eigensolve_ms - upload_ms - download_ms -
             backend_ridge_ms);
@@ -1553,7 +1562,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=7 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=8 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -1672,6 +1681,9 @@ void Data::print_step1_profile() {
       << "\n";
   out << "STEP1_PROFILE scope=level0_ridge"
       << " wall_ms=" << step1_profile.ridge_wall_ms
+      << " cholesky_folds=" << step1_profile.ridge_cholesky_folds
+      << " eigendecomposition_folds=" <<
+        step1_profile.ridge_eigendecomposition_folds
       << " eigensolve_transform_ms=" << step1_profile.ridge_eigensolve_ms
       << " backend_compute_ms=" << step1_profile.ridge_backend_compute_ms
       << " transfer_ms=" << step1_profile.ridge_transfer_ms

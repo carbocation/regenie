@@ -126,6 +126,16 @@ and blocks above the resident limit retain the general host-matrix path. Set
 `REGENIE_STEP1_PGEN_PACKED=0` to disable this specialization for matched A/B
 validation; the validation harness exposes it as `STEP1_PGEN_PACKED`.
 
+Packed-resident k-fold runs solve each Level 0 ridge system directly with one
+Cholesky factorization per ridge parameter. This avoids computing a complete
+eigendecomposition when only the configured ridge solutions are needed, and
+the resulting coefficients are multiplied by the already resident genotype
+block. The existing eigendecomposition implementation remains the fallback for
+other input paths and for any ridge grid containing zero. Set
+`REGENIE_CUDA_LEVEL0_CHOLESKY=0` to force the previous implementation for a
+matched A/B comparison; the validation harness exposes the same switch as
+`CUDA_LEVEL0_CHOLESKY`.
+
 Large resident uploads use two reusable pinned host chunks so host packing can
 overlap transfer to the device. `REGENIE_CUDA_PINNED_STAGING_MB` controls the
 size of each chunk (64 MB by default); set it to `0` to restore direct pageable

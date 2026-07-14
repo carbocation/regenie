@@ -189,6 +189,26 @@ void Step1ComputeBackend::ridge_predict_preprocessed(
     "Step 1 backend has no resident preprocessed genotype block");
 }
 
+bool Step1ComputeBackend::ridge_predict_preprocessed_system(
+  const Eigen::Ref<const Eigen::MatrixXd>& gram,
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  Eigen::Index start_column,
+  Eigen::Index column_count,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  Eigen::MatrixXd& predictions,
+  Eigen::MatrixXd& coefficients,
+  Step1ComputeTimings* timings) {
+  (void)gram;
+  (void)right_hand_sides;
+  (void)start_column;
+  (void)column_count;
+  (void)ridge_parameters;
+  (void)predictions;
+  (void)coefficients;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 

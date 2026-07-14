@@ -205,6 +205,14 @@ bool cuda_direct_grouped_upload_enabled() {
     "REGENIE_CUDA_DIRECT_GROUPED_UPLOAD must be '0' or '1'");
 }
 
+bool cuda_level0_cholesky_enabled() {
+  const char* value = std::getenv("REGENIE_CUDA_LEVEL0_CHOLESKY");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_CUDA_LEVEL0_CHOLESKY must be '0' or '1'");
+}
+
 double elapsed_ms(const ComputeClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ComputeClock::now() - start).count();
 }
@@ -489,6 +497,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         fp32_gram_chunk_samples_(cuda_fp32_gram_chunk_samples()),
         pinned_staging_chunk_bytes_(cuda_pinned_staging_bytes()),
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
+        level0_cholesky_enabled_(cuda_level0_cholesky_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
@@ -605,6 +614,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         " MB";
       result << ", grouped upload " <<
         (direct_grouped_upload_ ? "direct" : "materialized");
+      result << ", level0 solver " <<
+        (level0_cholesky_enabled_ ? "cholesky" : "eigendecomposition");
       result << ")";
       return result.str();
     }
@@ -1609,6 +1620,78 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "copy resident ridge prediction chunk from CUDA device");
         if(timings) timings->download_ms += elapsed_ms(transfer_start);
       }
+    }
+
+    bool ridge_predict_preprocessed_system(
+      const Eigen::Ref<const Eigen::MatrixXd>& gram,
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Eigen::Index start_column,
+      Eigen::Index column_count,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      Eigen::MatrixXd& predictions,
+      Eigen::MatrixXd& coefficients,
+      Step1ComputeTimings* timings) override {
+
+      if(!level0_cholesky_enabled_) return false;
+      if(!resident_valid_ || gram.rows() != gram.cols() ||
+         gram.rows() != resident_rows_ ||
+         right_hand_sides.rows() != resident_rows_ ||
+         start_column < 0 || column_count < 0 ||
+         start_column > resident_columns_ - column_count)
+        throw std::invalid_argument(
+          "Step 1 resident Cholesky ridge prediction received incompatible dimensions");
+      if((ridge_parameters.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 resident Cholesky ridge parameters must be non-negative");
+      if((ridge_parameters.array() == 0).any()) return false;
+
+      const Eigen::VectorXd penalty_multipliers =
+        Eigen::VectorXd::Ones(gram.rows());
+      diagonal_penalty_solve(gram, right_hand_sides, ridge_parameters,
+        penalty_multipliers, coefficients, timings);
+
+      const int size = checked_int(
+        resident_rows_, "resident Cholesky ridge system size");
+      const int sample_count = checked_int(
+        column_count, "resident Cholesky ridge sample count");
+      const int combination_count = checked_int(
+        coefficients.cols(), "resident Cholesky ridge combination count");
+      predictions.resize(sample_count, combination_count);
+      if(size == 0 || sample_count == 0 || combination_count == 0) {
+        predictions.setZero();
+        return true;
+      }
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      ensure_capacity(d_inverse_, inverse_capacity_, predictions.size(),
+        "cudaMalloc(resident Cholesky ridge predictions)");
+      const double* device_prediction_matrix = d_resident_genotypes_ +
+        start_column * resident_rows_;
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      std::unique_ptr<CudaEventPair> prediction_events;
+      if(timings) {
+        prediction_events.reset(new CudaEventPair());
+        prediction_events->record_start();
+      }
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        sample_count, combination_count, size, &alpha,
+        device_prediction_matrix, size, d_predictions_, size, &beta,
+        d_inverse_, sample_count),
+        "cublasDgemm(resident Cholesky ridge predictions)");
+      if(timings) {
+        timings->ridge_ms +=
+          prediction_events->record_stop_and_elapsed_ms();
+        timings->resident_reuse_count++;
+      }
+
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(predictions.data(), d_inverse_,
+        predictions.size() * sizeof(double), cudaMemcpyDeviceToHost),
+        "copy resident Cholesky ridge predictions from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      return true;
     }
 
     void compute_products(
@@ -3997,6 +4080,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     int fp32_gram_chunk_samples_;
     size_t pinned_staging_chunk_bytes_;
     bool direct_grouped_upload_;
+    bool level0_cholesky_enabled_;
     Eigen::Index resident_preprocess_max_elements_;
     Eigen::Index level1_resident_max_elements_;
     void* pinned_staging_[2] = {nullptr, nullptr};
