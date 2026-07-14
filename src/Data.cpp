@@ -424,6 +424,10 @@ void Data::print_step2_profile() {
       thread_profile.cox_firth_one_parameter_tests;
     correction_profile.cox_firth_fallbacks +=
       thread_profile.cox_firth_fallbacks;
+    correction_profile.cox_firth_reduced_fallbacks +=
+      thread_profile.cox_firth_reduced_fallbacks;
+    correction_profile.cox_firth_full_fallbacks +=
+      thread_profile.cox_firth_full_fallbacks;
     correction_profile.cox_firth_iterations +=
       thread_profile.cox_firth_iterations;
     correction_profile.cox_firth_likelihood_evaluations +=
@@ -432,6 +436,22 @@ void Data::print_step2_profile() {
       thread_profile.cox_firth_step_halvings;
     correction_profile.cox_firth_line_search_exhaustions +=
       thread_profile.cox_firth_line_search_exhaustions;
+    correction_profile.cox_firth_reduced_iterations +=
+      thread_profile.cox_firth_reduced_iterations;
+    correction_profile.cox_firth_reduced_likelihood_evaluations +=
+      thread_profile.cox_firth_reduced_likelihood_evaluations;
+    correction_profile.cox_firth_reduced_step_halvings +=
+      thread_profile.cox_firth_reduced_step_halvings;
+    correction_profile.cox_firth_reduced_line_search_exhaustions +=
+      thread_profile.cox_firth_reduced_line_search_exhaustions;
+    correction_profile.cox_firth_full_iterations +=
+      thread_profile.cox_firth_full_iterations;
+    correction_profile.cox_firth_full_likelihood_evaluations +=
+      thread_profile.cox_firth_full_likelihood_evaluations;
+    correction_profile.cox_firth_full_step_halvings +=
+      thread_profile.cox_firth_full_step_halvings;
+    correction_profile.cox_firth_full_line_search_exhaustions +=
+      thread_profile.cox_firth_full_line_search_exhaustions;
     correction_profile.cox_firth_final_score_max = std::max(
       correction_profile.cox_firth_final_score_max,
       thread_profile.cox_firth_final_score_max);
@@ -605,10 +625,11 @@ void Data::print_step2_profile() {
       std::getenv("REGENIE_COX_FIRTH_SCORE_WARM_START");
     const bool score_warm_start = score_warm_start_value == nullptr ||
       std::string(score_warm_start_value) != "0";
-    const char* direct_fallback_value =
-      std::getenv("REGENIE_COX_FIRTH_DIRECT_FALLBACK");
-    const bool direct_fallback = direct_fallback_value != nullptr &&
-      std::string(direct_fallback_value) != "0";
+    const char* direct_reduced_fallback_value =
+      std::getenv("REGENIE_COX_FIRTH_DIRECT_REDUCED_FALLBACK");
+    const bool direct_reduced_fallback =
+      direct_reduced_fallback_value != nullptr &&
+      std::string(direct_reduced_fallback_value) != "0";
     const uint64_t correction_tests = correction_profile.spa_tests +
       correction_profile.logistic_firth_tests +
       correction_profile.cox_firth_tests;
@@ -662,6 +683,10 @@ void Data::print_step2_profile() {
           correction_profile.cox_firth_one_parameter_tests
         << " cox_firth_fallbacks=" <<
           correction_profile.cox_firth_fallbacks
+        << " cox_firth_reduced_fallbacks=" <<
+          correction_profile.cox_firth_reduced_fallbacks
+        << " cox_firth_full_fallbacks=" <<
+          correction_profile.cox_firth_full_fallbacks
         << " cox_firth_iterations=" <<
           correction_profile.cox_firth_iterations
         << " cox_firth_compact=" << (compact_cox_firth ? 1 : 0)
@@ -671,14 +696,30 @@ void Data::print_step2_profile() {
           (consistent_reduced_cox_firth ? 1 : 0)
         << " cox_firth_score_warm_start=" <<
           (score_warm_start ? 1 : 0)
-        << " cox_firth_direct_fallback=" <<
-          (direct_fallback ? 1 : 0)
+        << " cox_firth_direct_reduced_fallback=" <<
+          (direct_reduced_fallback ? 1 : 0)
         << " cox_firth_likelihood_evaluations=" <<
           correction_profile.cox_firth_likelihood_evaluations
         << " cox_firth_step_halvings=" <<
           correction_profile.cox_firth_step_halvings
         << " cox_firth_line_search_exhaustions=" <<
           correction_profile.cox_firth_line_search_exhaustions
+        << " cox_firth_reduced_iterations=" <<
+          correction_profile.cox_firth_reduced_iterations
+        << " cox_firth_reduced_likelihood_evaluations=" <<
+          correction_profile.cox_firth_reduced_likelihood_evaluations
+        << " cox_firth_reduced_step_halvings=" <<
+          correction_profile.cox_firth_reduced_step_halvings
+        << " cox_firth_reduced_line_search_exhaustions=" <<
+          correction_profile.cox_firth_reduced_line_search_exhaustions
+        << " cox_firth_full_iterations=" <<
+          correction_profile.cox_firth_full_iterations
+        << " cox_firth_full_likelihood_evaluations=" <<
+          correction_profile.cox_firth_full_likelihood_evaluations
+        << " cox_firth_full_step_halvings=" <<
+          correction_profile.cox_firth_full_step_halvings
+        << " cox_firth_full_line_search_exhaustions=" <<
+          correction_profile.cox_firth_full_line_search_exhaustions
         << " cox_firth_final_score_max=" <<
           correction_profile.cox_firth_final_score_max
         << " cox_firth_thread_ms=" <<
