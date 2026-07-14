@@ -430,6 +430,11 @@ void Data::print_step2_profile() {
       thread_profile.cox_firth_likelihood_evaluations;
     correction_profile.cox_firth_step_halvings +=
       thread_profile.cox_firth_step_halvings;
+    correction_profile.cox_firth_line_search_exhaustions +=
+      thread_profile.cox_firth_line_search_exhaustions;
+    correction_profile.cox_firth_final_score_max = std::max(
+      correction_profile.cox_firth_final_score_max,
+      thread_profile.cox_firth_final_score_max);
     correction_profile.cox_firth_thread_ms +=
       thread_profile.cox_firth_thread_ms;
   }
@@ -596,6 +601,14 @@ void Data::print_step2_profile() {
       direct_cox_firth_adjustment &&
       consistent_reduced_cox_firth_value != nullptr &&
       std::string(consistent_reduced_cox_firth_value) != "0";
+    const char* score_warm_start_value =
+      std::getenv("REGENIE_COX_FIRTH_SCORE_WARM_START");
+    const bool score_warm_start = score_warm_start_value == nullptr ||
+      std::string(score_warm_start_value) != "0";
+    const char* legacy_line_search_value =
+      std::getenv("REGENIE_COX_FIRTH_LEGACY_LINE_SEARCH");
+    const bool legacy_line_search = legacy_line_search_value != nullptr &&
+      std::string(legacy_line_search_value) != "0";
     const uint64_t correction_tests = correction_profile.spa_tests +
       correction_profile.logistic_firth_tests +
       correction_profile.cox_firth_tests;
@@ -656,10 +669,18 @@ void Data::print_step2_profile() {
           (direct_cox_firth_adjustment ? 1 : 0)
         << " cox_firth_consistent_reduced=" <<
           (consistent_reduced_cox_firth ? 1 : 0)
+        << " cox_firth_score_warm_start=" <<
+          (score_warm_start ? 1 : 0)
+        << " cox_firth_legacy_line_search=" <<
+          (legacy_line_search ? 1 : 0)
         << " cox_firth_likelihood_evaluations=" <<
           correction_profile.cox_firth_likelihood_evaluations
         << " cox_firth_step_halvings=" <<
           correction_profile.cox_firth_step_halvings
+        << " cox_firth_line_search_exhaustions=" <<
+          correction_profile.cox_firth_line_search_exhaustions
+        << " cox_firth_final_score_max=" <<
+          correction_profile.cox_firth_final_score_max
         << " cox_firth_thread_ms=" <<
           correction_profile.cox_firth_thread_ms
         << " cox_firth_average_ms=" << cox_firth_average_ms

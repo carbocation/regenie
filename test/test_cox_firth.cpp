@@ -168,6 +168,28 @@ int main() {
             "direct versus leverage score",
             general_leverage.first_der, general_compact.first_der, 1e-8);
 
+        const double full_epsilon = 1e-6;
+        Eigen::VectorXd full_finite_difference_beta(4);
+        full_finite_difference_beta << 0.03, -0.08, 0.05, 0.11;
+        for (int coefficient = 0; coefficient < 4; ++coefficient) {
+            Eigen::VectorXd beta_plus = full_finite_difference_beta;
+            Eigen::VectorXd beta_minus = full_finite_difference_beta;
+            beta_plus(coefficient) += full_epsilon;
+            beta_minus(coefficient) -= full_epsilon;
+            const cox_firth plus = evaluate_general(
+                data, design, offset, true, 4, true, true, false,
+                &beta_plus);
+            const cox_firth minus = evaluate_general(
+                data, design, offset, true, 4, true, true, false,
+                &beta_minus);
+            const double numerical_score =
+                (plus.loglik_val - minus.loglik_val) /
+                (2 * full_epsilon);
+            require_close(
+                "full finite-difference score", numerical_score,
+                general_compact.first_der(coefficient), 1e-5);
+        }
+
         const cox_firth reduced_legacy =
             evaluate_general(data, design, offset, false, 3);
         const cox_firth reduced_compact =
@@ -251,6 +273,35 @@ int main() {
             cold_reduced.likelihood_evaluations) {
             throw std::runtime_error(
                 "reduced warm start did not reduce likelihood evaluations");
+        }
+
+        cox_firth cold_full;
+        cold_full.setup(
+            data, design, offset, 4, 80, 30, 1e-8, 2.5e-4,
+            1e-8, 1, true, false, warm_beta);
+        cold_full.fit(data, design, offset);
+        cox_firth first_full = evaluate_general(
+            data, design, offset, true, 4, true, true, false,
+            &warm_beta);
+        Eigen::VectorXd full_warm_beta = warm_beta;
+        full_warm_beta += first_full.qrsd.solve(first_full.first_der);
+        cox_firth warm_full;
+        warm_full.setup(
+            data, design, offset, 4, 80, 30, 1e-8, 2.5e-4,
+            1e-8, 1, true, false, full_warm_beta);
+        warm_full.fit(data, design, offset);
+        if (!cold_full.converge || !warm_full.converge) {
+            throw std::runtime_error("full warm-start convergence mismatch");
+        }
+        require_close(
+            "full warm-start beta", cold_full.beta, warm_full.beta, 1e-7);
+        require_close(
+            "full warm-start likelihood", cold_full.loglike.tail(1)(0),
+            warm_full.loglike.tail(1)(0), 1e-8);
+        if (warm_full.likelihood_evaluations >=
+            cold_full.likelihood_evaluations) {
+            throw std::runtime_error(
+                "full warm start did not reduce likelihood evaluations");
         }
 
         const cox_firth unpenalized_legacy =

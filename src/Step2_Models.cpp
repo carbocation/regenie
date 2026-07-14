@@ -49,6 +49,11 @@ using boost::math::chi_squared;
 
 namespace {
 
+bool cox_firth_score_warm_start_enabled() {
+  const char* value = std::getenv("REGENIE_COX_FIRTH_SCORE_WARM_START");
+  return value == nullptr || std::string(value) != "0";
+}
+
 void add_cox_firth_profile(
     data_thread* thread_data,
     const cox_firth& model) {
@@ -57,6 +62,11 @@ void add_cox_firth_profile(
     model.likelihood_evaluations;
   thread_data->correction_profile.cox_firth_step_halvings +=
     model.step_halving_evaluations;
+  thread_data->correction_profile.cox_firth_line_search_exhaustions +=
+    model.line_search_exhaustions;
+  thread_data->correction_profile.cox_firth_final_score_max = std::max(
+    thread_data->correction_profile.cox_firth_final_score_max,
+    model.final_score_max);
 }
 
 }  // namespace
@@ -848,7 +858,8 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   if (!cox_firth_null.converge) {
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
-    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, beta0);
+    if(cox_firth_null.beta.allFinite()) beta0 = cox_firth_null.beta;
+    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null/5, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_null);
   }
@@ -860,15 +871,29 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   }
 
   // test model
+  VectorXd test_beta0 = cox_firth_null.beta;
+  const double score_information = dt_thr->denum(ph);
+  if(cox_firth_score_warm_start_enabled() &&
+      std::isfinite(score_information) && score_information > 0) {
+    const double score_beta =
+      dt_thr->stats(ph) / std::sqrt(score_information);
+    if(std::isfinite(score_beta)) {
+      test_beta0.tail(1)(0) = std::max(
+        -static_cast<double>(params->maxstep),
+        std::min(static_cast<double>(params->maxstep), score_beta));
+    }
+  }
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, cox_firth_null.beta);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, test_beta0);
   cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
 
   if (!cox_firth_test.converge) {
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
+    VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
+      cox_firth_test.beta : test_beta0;
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
   }
@@ -896,6 +921,18 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
 void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, struct param const* params, struct phenodt* pheno_data, struct ests const* m_ests, struct f_ests const* fest, const Ref<const VectorXd>& Gvec, variant_block* block_info, data_thread* dt_thr, mstream& sout) {
   // if firth is used, fit based on penalized log-likelihood
   double lrt;
+  VectorXd beta0 = VectorXd::Zero(1);
+  const double score_information = dt_thr->denum(ph);
+  if(!params->firth_approx && cox_firth_score_warm_start_enabled() &&
+      std::isfinite(score_information) && score_information > 0) {
+    const double score_beta =
+      dt_thr->stats(ph) / std::sqrt(score_information);
+    if(std::isfinite(score_beta)) {
+      beta0(0) = std::max(
+        -static_cast<double>(params->maxstep),
+        std::min(static_cast<double>(params->maxstep), score_beta));
+    }
+  }
 
   // // For rare variants, set entries in Gvec for non-carriers to 0
   // int mac_thr_sparse = (params->skip_fast_firth ? 0 : 50), i = 0, index_j;
@@ -911,14 +948,16 @@ void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, st
   // }
 
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, beta0);
   cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
   if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
 
   if(!cox_firth_test.converge){
     if(params->profile_step2)
       ++dt_thr->correction_profile.cox_firth_fallbacks;
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->maxstep/5, !params->cox_nofirth, false);
+    VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
+      cox_firth_test.beta : beta0;
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
     if(params->profile_step2) add_cox_firth_profile(dt_thr, cox_firth_test);
   }

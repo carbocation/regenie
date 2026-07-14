@@ -123,6 +123,8 @@ struct Step2CorrectionProfile {
   uint64_t cox_firth_iterations = 0;
   uint64_t cox_firth_likelihood_evaluations = 0;
   uint64_t cox_firth_step_halvings = 0;
+  uint64_t cox_firth_line_search_exhaustions = 0;
+  double cox_firth_final_score_max = 0;
   double cox_firth_thread_ms = 0;
 };
 

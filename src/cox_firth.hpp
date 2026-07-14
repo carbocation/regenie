@@ -11,6 +11,8 @@ class cox_firth {
         int iter;
         uint64_t likelihood_evaluations = 0;
         uint64_t step_halving_evaluations = 0;
+        uint64_t line_search_exhaustions = 0;
+        double final_score_max = 0;
         bool converge = false;
 
         // prepare for test
