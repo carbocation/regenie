@@ -24,6 +24,8 @@
 
 */
 
+#include <cstdlib>
+#include <stdexcept>
 
 #include "Regenie.hpp"
 #include "Files.hpp"
@@ -51,6 +53,14 @@ using boost::math::beta_distribution;
 using boost::math::chi_squared;
 
 namespace {
+
+bool step1_bulk_l0_read_enabled() {
+  const char* value = std::getenv("REGENIE_STEP1_BULK_L0_READ");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_STEP1_BULK_L0_READ must be '0' or '1'");
+}
 
 template<typename Derived>
 ArrayXd compute_step1_design_score(
@@ -2159,10 +2169,25 @@ void read_l0_chunk(int const& ph, int const& ph_eff, int const& start, int const
 
     int nt = 0;
 
-    for( int m = start; nt < np; nt++, m++ )
-      for( int i = 0; i < params->cv_folds; ++i )
-        for( int k = 0; k < params->cv_sizes(i); ++k )
-          infile.read( reinterpret_cast<char *> (&l1->test_mat[ph_eff][i](k,m)), sizeof(double) );
+    if(step1_bulk_l0_read_enabled()) {
+      for(int m = start; nt < np; nt++, m++)
+        for(int i = 0; i < params->cv_folds; ++i) {
+          const int fold_size = params->cv_sizes(i);
+          if(fold_size == 0) continue;
+          infile.read(reinterpret_cast<char *>(
+            l1->test_mat[ph_eff][i].col(m).data()),
+            static_cast<std::streamsize>(fold_size) * sizeof(double));
+        }
+    } else {
+      for(int m = start; nt < np; nt++, m++)
+        for(int i = 0; i < params->cv_folds; ++i)
+          for(int k = 0; k < params->cv_sizes(i); ++k)
+            infile.read(reinterpret_cast<char *>(
+              &l1->test_mat[ph_eff][i](k,m)), sizeof(double));
+    }
+
+    if(!infile)
+      throw "cannot successfully read temporary level 0 predictions from disk";
 
   //if(start==0) cerr << endl <<l1->test_mat[ph_eff][0].block(0,0,3,3) << endl;
 
