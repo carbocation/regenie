@@ -154,6 +154,37 @@ Eigen::Index cuda_resident_preprocess_max_elements() {
     INT_MAX);
 }
 
+Eigen::Index cuda_level1_resident_max_elements() {
+  const char* resident_mb_text =
+    std::getenv("REGENIE_CUDA_LEVEL1_RESIDENT_MB");
+  if(resident_mb_text && *resident_mb_text) {
+    char* end = nullptr;
+    const long resident_mb = std::strtol(resident_mb_text, &end, 10);
+    if(end == resident_mb_text || *end != '\0' || resident_mb < 0 ||
+       resident_mb > std::numeric_limits<int>::max())
+      throw std::invalid_argument(
+        "REGENIE_CUDA_LEVEL1_RESIDENT_MB must be a non-negative integer");
+    return std::min<Eigen::Index>(
+      static_cast<Eigen::Index>(resident_mb) *
+        1000000 / sizeof(double),
+      INT_MAX);
+  }
+
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+  free_bytes = std::min(free_bytes, total_bytes);
+  // Weighted IRLS needs both the resident design and an equally sized
+  // weighted-design workspace.  Limit one copy to 40% of device memory and
+  // leave the remainder for cuBLAS/cuSOLVER workspaces and model state.
+  const size_t automatic_cap_bytes = size_t(16000) * 1000000;
+  const size_t automatic_budget_bytes = std::min(
+    automatic_cap_bytes, free_bytes / 5 * 2);
+  return std::min<Eigen::Index>(
+    static_cast<Eigen::Index>(automatic_budget_bytes / sizeof(double)),
+    INT_MAX);
+}
+
 size_t cuda_pinned_staging_bytes() {
   const char* value = std::getenv("REGENIE_CUDA_PINNED_STAGING_MB");
   if(!value || !*value) return size_t(64) * 1000000;
@@ -459,6 +490,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         pinned_staging_chunk_bytes_(cuda_pinned_staging_bytes()),
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
+        level1_resident_max_elements_(0),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_fp32_genotypes_(nullptr), d_fp32_gram_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
@@ -476,7 +508,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         genotypes_capacity_(0), resident_genotypes_capacity_(0),
         fp32_genotypes_capacity_(0), fp32_gram_capacity_(0),
         resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
-        resident_valid_(false), phenotypes_capacity_(0), gram_capacity_(0),
+        resident_valid_(false), resident_design_rows_(0),
+        resident_design_columns_(0), resident_design_valid_(false),
+        phenotypes_capacity_(0), gram_capacity_(0),
         factorized_capacity_(0), factorized_size_(-1),
         ridge_vectors_capacity_(0), ridge_values_capacity_(0),
         ridge_rhs_capacity_(0),
@@ -487,6 +521,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       resident_preprocess_max_elements_ =
         cuda_resident_preprocess_max_elements();
+      level1_resident_max_elements_ =
+        cuda_level1_resident_max_elements();
       check_cuda(cudaGetDeviceProperties(&properties_, device_), "cudaGetDeviceProperties");
       check_cublas(cublasCreate(&handle_), "cublasCreate");
       try {
@@ -564,6 +600,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       result << ", resident preprocess " <<
         (resident_preprocess_max_elements_ * sizeof(double) / 1000000.0) <<
         " MB";
+      result << ", resident level1 " <<
+        (level1_resident_max_elements_ * sizeof(double) / 1000000.0) <<
+        " MB";
       result << ", grouped upload " <<
         (direct_grouped_upload_ ? "direct" : "materialized");
       result << ")";
@@ -609,6 +648,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const ComputeClock::time_point allocation_start =
         ComputeClock::now();
+      invalidate_resident_design();
       invalidate_resident_genotypes();
       if(!can_preprocess_packed_hardcalls(variants, samples)) {
         if(timings) {
@@ -816,6 +856,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeBackend::preprocess_genotypes(genotypes, covariates,
         sample_weights, degrees_of_freedom, minimum_scale,
         row_multipliers, copy_to_host, row_scales, timings);
+      invalidate_resident_design();
       invalidate_resident_genotypes();
       const long long required_elements_long =
         static_cast<long long>(genotypes.rows()) * genotypes.cols();
@@ -961,6 +1002,357 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
     void release_preprocessed_genotypes() override {
       invalidate_resident_genotypes();
+    }
+
+    bool cache_design_partitions(
+      const std::vector<Eigen::MatrixXd>& partitions,
+      Step1ComputeTimings* timings) override {
+
+      invalidate_resident_design();
+      invalidate_resident_genotypes();
+      if(partitions.empty()) return false;
+
+      const Eigen::Index columns = partitions.front().cols();
+      Eigen::Index rows = 0;
+      for(const Eigen::MatrixXd& partition : partitions) {
+        if(partition.cols() != columns)
+          throw std::invalid_argument(
+            "Step 1 cached design partitions have inconsistent columns");
+        if(partition.rows() > std::numeric_limits<Eigen::Index>::max() - rows)
+          throw std::runtime_error(
+            "Step 1 cached design row count overflows Eigen dimensions");
+        rows += partition.rows();
+      }
+      const long long required_elements_long =
+        static_cast<long long>(rows) * columns;
+      if(required_elements_long < 0 || required_elements_long > INT_MAX ||
+         required_elements_long > level1_resident_max_elements_)
+        return false;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const Eigen::Index required_elements =
+        static_cast<Eigen::Index>(required_elements_long);
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+      (void)total_bytes;
+      const size_t resident_growth = required_elements >
+        static_cast<Eigen::Index>(resident_genotypes_capacity_) ?
+        static_cast<size_t>(required_elements -
+          static_cast<Eigen::Index>(resident_genotypes_capacity_)) *
+            sizeof(double) : 0;
+      const size_t workspace_growth = required_elements >
+        static_cast<Eigen::Index>(projected_capacity_) ?
+        static_cast<size_t>(required_elements -
+          static_cast<Eigen::Index>(projected_capacity_)) *
+            sizeof(double) : 0;
+      const size_t reserve_bytes = size_t(512) * 1000000;
+      if(resident_growth > free_bytes ||
+         workspace_growth > free_bytes - resident_growth ||
+         reserve_bytes > free_bytes - resident_growth - workspace_growth)
+        return false;
+
+      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+        required_elements, "cudaMalloc(resident Level 1 design)");
+      ensure_capacity(d_projected_, projected_capacity_, required_elements,
+        "cudaMalloc(resident Level 1 weighted-design workspace)");
+
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      Eigen::Index row_offset = 0;
+      for(const Eigen::MatrixXd& partition : partitions) {
+        if(partition.rows() > 0 && columns > 0) {
+          const size_t row_bytes =
+            static_cast<size_t>(partition.rows()) * sizeof(double);
+          check_cuda(cudaMemcpy2D(
+            d_resident_genotypes_ + row_offset,
+            static_cast<size_t>(rows) * sizeof(double),
+            partition.data(),
+            static_cast<size_t>(partition.outerStride()) * sizeof(double),
+            row_bytes, static_cast<size_t>(columns),
+            cudaMemcpyHostToDevice),
+            "copy Level 1 design partition to CUDA device");
+        }
+        row_offset += partition.rows();
+      }
+      if(timings) {
+        timings->upload_ms += elapsed_ms(transfer_start);
+        timings->resident_design_upload_count += partitions.size();
+        timings->resident_design_upload_bytes +=
+          static_cast<uint64_t>(required_elements) * sizeof(double);
+      }
+      resident_design_rows_ = rows;
+      resident_design_columns_ = columns;
+      resident_design_valid_ = true;
+      return true;
+    }
+
+    void predict_cached_design(
+      const Eigen::Ref<const Eigen::VectorXd>& coefficients,
+      Eigen::VectorXd& predictions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_valid_ ||
+         coefficients.size() != resident_design_columns_)
+        throw std::invalid_argument(
+          "Step 1 cached design prediction received incompatible dimensions");
+      if(!coefficients.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached design prediction requires finite coefficients");
+      predictions.resize(resident_design_rows_);
+      if(resident_design_rows_ == 0) return;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_rows_, "cached design prediction row count");
+      const int columns = checked_int(
+        resident_design_columns_, "cached design prediction column count");
+      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+        "cudaMalloc(cached design coefficients)");
+      ensure_capacity(d_predictions_, predictions_capacity_, predictions.size(),
+        "cudaMalloc(cached design predictions)");
+
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      if(coefficients.size() > 0)
+        check_cuda(cudaMemcpy(d_inverse_, coefficients.data(),
+          static_cast<size_t>(coefficients.size()) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "copy cached design coefficients to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> prediction_events;
+      if(timings) {
+        prediction_events.reset(new CudaEventPair());
+        prediction_events->record_start();
+      }
+      if(columns > 0) {
+        const double alpha = 1.0;
+        const double beta = 0.0;
+        check_cublas(cublasDgemv(handle_, CUBLAS_OP_N,
+          rows, columns, &alpha, d_resident_genotypes_, rows,
+          d_inverse_, 1, &beta, d_predictions_, 1),
+          "cublasDgemv(cached design prediction)");
+      } else {
+        check_cuda(cudaMemset(d_predictions_, 0,
+          static_cast<size_t>(rows) * sizeof(double)),
+          "clear empty cached design prediction");
+      }
+      if(timings)
+        timings->ridge_ms +=
+          prediction_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(predictions.data(), d_predictions_,
+        static_cast<size_t>(rows) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy cached design predictions from CUDA device");
+      if(timings) {
+        timings->download_ms += elapsed_ms(transfer_start);
+        timings->resident_design_reuse_count++;
+      }
+    }
+
+    void compute_cached_weighted_design_products(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_valid_ || weights.size() != resident_design_rows_ ||
+         outcomes.rows() != resident_design_rows_)
+        throw std::invalid_argument(
+          "Step 1 cached weighted design products received incompatible dimensions");
+      if(!weights.allFinite() || (weights.array() < 0).any() ||
+         !outcomes.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached weighted design products require finite inputs and non-negative weights");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_rows_, "cached weighted design row count");
+      const int features = checked_int(
+        resident_design_columns_, "cached weighted design feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "cached weighted design outcome count");
+      gram.resize(features, features);
+      crossproduct.resize(features, outcome_count);
+      if(features == 0 || rows == 0) {
+        gram.setZero();
+        crossproduct.setZero();
+        return;
+      }
+
+      const int design_count = checked_element_count(
+        rows, features, "cached weighted design matrix");
+      ensure_capacity(d_projected_, projected_capacity_, design_count,
+        "cudaMalloc(cached weighted design matrix)");
+      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, rows,
+        "cudaMalloc(cached design weights)");
+      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+        "cudaMalloc(cached weighted Gram matrix)");
+      if(outcome_count > 0) {
+        ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
+          "cudaMalloc(cached weighted outcomes)");
+        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, outcomes.size(),
+          "cudaMalloc(cached weighted outcome matrix)");
+        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+          crossproduct.size(), "cudaMalloc(cached weighted crossproduct)");
+      }
+
+      const Eigen::MatrixXd packed_outcomes = outcome_count > 0 ?
+        contiguous_copy_if_needed(outcomes) : Eigen::MatrixXd();
+      const double* outcome_data = packed_outcomes.size() ?
+        packed_outcomes.data() : outcomes.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
+        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
+        "copy cached design weights to CUDA device");
+      if(outcome_count > 0)
+        check_cuda(cudaMemcpy(d_phenotypes_, outcome_data,
+          static_cast<size_t>(outcomes.size()) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "copy cached weighted outcomes to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      const int threads = 256;
+      scale_matrix_rows<<<
+        (design_count + threads - 1) / threads, threads>>>(
+        d_resident_genotypes_, d_ridge_parameters_, d_projected_, rows,
+        design_count);
+      check_cuda(cudaGetLastError(),
+        "scale cached weighted design rows kernel");
+      if(outcome_count > 0) {
+        const int outcome_elements = checked_element_count(
+          rows, outcome_count, "cached weighted outcomes");
+        scale_matrix_rows<<<
+          (outcome_elements + threads - 1) / threads, threads>>>(
+          d_phenotypes_, d_ridge_parameters_, d_scaled_rhs_, rows,
+          outcome_elements);
+        check_cuda(cudaGetLastError(),
+          "scale cached weighted outcomes kernel");
+      }
+
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      if(outcome_count > 0) {
+        std::unique_ptr<CudaEventPair> crossproduct_events;
+        if(timings) {
+          crossproduct_events.reset(new CudaEventPair());
+          crossproduct_events->record_start();
+        }
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+          features, outcome_count, rows, &alpha,
+          d_resident_genotypes_, rows, d_scaled_rhs_, rows, &beta,
+          d_crossproduct_, features),
+          "cublasDgemm(cached weighted crossproduct)");
+        if(timings)
+          timings->crossproduct_ms +=
+            crossproduct_events->record_stop_and_elapsed_ms();
+      }
+
+      std::unique_ptr<CudaEventPair> gram_events;
+      if(timings) {
+        gram_events.reset(new CudaEventPair());
+        gram_events->record_start();
+      }
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        features, features, rows, &alpha,
+        d_resident_genotypes_, rows, d_projected_, rows, &beta,
+        d_gram_, features),
+        "cublasDgemm(cached weighted Gram matrix)");
+      if(timings)
+        timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      if(outcome_count > 0)
+        check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_,
+          static_cast<size_t>(crossproduct.size()) * sizeof(double),
+          cudaMemcpyDeviceToHost),
+          "copy cached weighted crossproduct from CUDA device");
+      check_cuda(cudaMemcpy(gram.data(), d_gram_,
+        static_cast<size_t>(gram.size()) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy cached weighted Gram matrix from CUDA device");
+      if(timings) {
+        timings->download_ms += elapsed_ms(transfer_start);
+        timings->resident_design_reuse_count++;
+      }
+    }
+
+    void compute_cached_design_crossproduct(
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Eigen::MatrixXd& crossproduct,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_valid_ ||
+         outcomes.rows() != resident_design_rows_)
+        throw std::invalid_argument(
+          "Step 1 cached design crossproduct received incompatible dimensions");
+      if(!outcomes.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached design crossproduct requires finite outcomes");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_rows_, "cached crossproduct row count");
+      const int features = checked_int(
+        resident_design_columns_, "cached crossproduct feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "cached crossproduct outcome count");
+      crossproduct.resize(features, outcome_count);
+      if(features == 0 || outcome_count == 0 || rows == 0) {
+        crossproduct.setZero();
+        return;
+      }
+
+      ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
+        "cudaMalloc(cached crossproduct outcomes)");
+      ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        crossproduct.size(), "cudaMalloc(cached design crossproduct)");
+      const Eigen::MatrixXd packed_outcomes =
+        contiguous_copy_if_needed(outcomes);
+      const double* outcome_data = packed_outcomes.size() ?
+        packed_outcomes.data() : outcomes.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_phenotypes_, outcome_data,
+        static_cast<size_t>(outcomes.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached crossproduct outcomes to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> crossproduct_events;
+      if(timings) {
+        crossproduct_events.reset(new CudaEventPair());
+        crossproduct_events->record_start();
+      }
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        features, outcome_count, rows, &alpha,
+        d_resident_genotypes_, rows, d_phenotypes_, rows, &beta,
+        d_crossproduct_, features),
+        "cublasDgemm(cached design crossproduct)");
+      if(timings)
+        timings->crossproduct_ms +=
+          crossproduct_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_,
+        static_cast<size_t>(crossproduct.size()) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy cached design crossproduct from CUDA device");
+      if(timings) {
+        timings->download_ms += elapsed_ms(transfer_start);
+        timings->resident_design_reuse_count++;
+      }
+    }
+
+    void release_cached_design() override {
+      invalidate_resident_design();
     }
 
     void compute_preprocessed_products(
@@ -3433,6 +3825,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       resident_valid_ = false;
     }
 
+    void invalidate_resident_design() {
+      resident_design_rows_ = 0;
+      resident_design_columns_ = 0;
+      resident_design_valid_ = false;
+    }
+
     const double* resident_genotype_columns(
       const Eigen::Ref<const Eigen::MatrixXd>& matrix,
       Eigen::Index start_column, Eigen::Index column_count) const {
@@ -3600,6 +3998,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     size_t pinned_staging_chunk_bytes_;
     bool direct_grouped_upload_;
     Eigen::Index resident_preprocess_max_elements_;
+    Eigen::Index level1_resident_max_elements_;
     void* pinned_staging_[2] = {nullptr, nullptr};
     cudaStream_t upload_streams_[2] = {nullptr, nullptr};
     double* d_genotypes_;
@@ -3640,6 +4039,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     Eigen::Index resident_rows_;
     Eigen::Index resident_columns_;
     bool resident_valid_;
+    Eigen::Index resident_design_rows_;
+    Eigen::Index resident_design_columns_;
+    bool resident_design_valid_;
     size_t phenotypes_capacity_;
     size_t gram_capacity_;
     size_t factorized_capacity_;

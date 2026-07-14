@@ -192,6 +192,51 @@ void Step1ComputeBackend::ridge_predict_preprocessed(
 void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 
+bool Step1ComputeBackend::cache_design_partitions(
+  const std::vector<Eigen::MatrixXd>& partitions,
+  Step1ComputeTimings* timings) {
+  (void)partitions;
+  (void)timings;
+  return false;
+}
+
+void Step1ComputeBackend::predict_cached_design(
+  const Eigen::Ref<const Eigen::VectorXd>& coefficients,
+  Eigen::VectorXd& predictions,
+  Step1ComputeTimings* timings) {
+  (void)coefficients;
+  (void)predictions;
+  (void)timings;
+  throw std::runtime_error("Step 1 backend has no cached design matrix");
+}
+
+void Step1ComputeBackend::compute_cached_weighted_design_products(
+  const Eigen::Ref<const Eigen::VectorXd>& weights,
+  const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+  Eigen::MatrixXd& gram,
+  Eigen::MatrixXd& crossproduct,
+  Step1ComputeTimings* timings) {
+  (void)weights;
+  (void)outcomes;
+  (void)gram;
+  (void)crossproduct;
+  (void)timings;
+  throw std::runtime_error("Step 1 backend has no cached design matrix");
+}
+
+void Step1ComputeBackend::compute_cached_design_crossproduct(
+  const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+  Eigen::MatrixXd& crossproduct,
+  Step1ComputeTimings* timings) {
+  (void)outcomes;
+  (void)crossproduct;
+  (void)timings;
+  throw std::runtime_error("Step 1 backend has no cached design matrix");
+}
+
+void Step1ComputeBackend::release_cached_design() {
+}
+
 void Step1ComputeBackend::diagonal_penalty_predict(
   const Eigen::Ref<const Eigen::MatrixXd>& gram,
   const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,

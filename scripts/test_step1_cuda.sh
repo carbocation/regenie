@@ -16,6 +16,7 @@ benchmark_repeats="${BENCHMARK_REPEATS:-3}"
 benchmark_warmup_repeats="${BENCHMARK_WARMUP_REPEATS:-1}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
+level1_resident_mb="${CUDA_LEVEL1_RESIDENT_MB:-${REGENIE_CUDA_LEVEL1_RESIDENT_MB:-}}"
 gram_precision="${CUDA_GRAM_PRECISION:-${REGENIE_CUDA_GRAM_PRECISION:-fp64}}"
 fp32_gram_chunk_samples="${CUDA_FP32_GRAM_CHUNK_SAMPLES:-${REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES:-128}}"
 pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
@@ -147,6 +148,7 @@ benchmark_repeats=${benchmark_repeats} \
 benchmark_warmup_repeats=${benchmark_warmup_repeats} \
 stream_chunk_mb=${stream_chunk_mb} \
 resident_mb=${resident_mb} \
+level1_resident_mb=${level1_resident_mb:-auto} \
 gram_precision=${gram_precision} \
 fp32_gram_chunk_samples=${fp32_gram_chunk_samples} \
 pinned_staging_mb=${pinned_staging_mb} pgen_prefetch_mb=${pgen_prefetch_mb} pgen_tile_variants=${pgen_tile_variants} pgen_packed=${pgen_packed} \
@@ -157,6 +159,11 @@ synthetic_chromosomes=${synthetic_chromosomes} synthetic_bsize=${synthetic_bsize
 synthetic_threads=${synthetic_threads} synthetic_seed=${synthetic_seed} \
 synthetic_max_bed_gb=${synthetic_max_bed_gb}"
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
+if [[ -n "${level1_resident_mb}" ]]; then
+  export REGENIE_CUDA_LEVEL1_RESIDENT_MB="${level1_resident_mb}"
+else
+  unset REGENIE_CUDA_LEVEL1_RESIDENT_MB
+fi
 export REGENIE_CUDA_GRAM_PRECISION="${gram_precision}"
 export REGENIE_CUDA_FP32_GRAM_CHUNK_SAMPLES="${fp32_gram_chunk_samples}"
 export REGENIE_CUDA_PINNED_STAGING_MB="${pinned_staging_mb}"
