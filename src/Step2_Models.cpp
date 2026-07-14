@@ -63,9 +63,33 @@ bool cox_firth_direct_reduced_fallback_enabled() {
   return value == nullptr || std::string(value) != "0";
 }
 
+bool cox_firth_direct_null_fallback_enabled() {
+  const char* value =
+    std::getenv("REGENIE_COX_FIRTH_DIRECT_NULL_FALLBACK");
+  return value != nullptr && std::string(value) != "0";
+}
+
 enum class CoxFirthProfilePhase {
   reduced,
   full
+};
+
+struct CoxFirthFitProfile {
+  uint64_t attempts = 0;
+  uint64_t iterations = 0;
+  uint64_t likelihood_evaluations = 0;
+  uint64_t step_halvings = 0;
+  uint64_t line_search_exhaustions = 0;
+  double final_score_max = 0;
+
+  void add(const cox_firth& model) {
+    ++attempts;
+    iterations += model.iter;
+    likelihood_evaluations += model.likelihood_evaluations;
+    step_halvings += model.step_halving_evaluations;
+    line_search_exhaustions += model.line_search_exhaustions;
+    final_score_max = std::max(final_score_max, model.final_score_max);
+  }
 };
 
 void add_cox_firth_profile(
@@ -788,6 +812,10 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   auto t1 = std::chrono::high_resolution_clock::now();
   ArrayXb has_converged = params->pheno_pass; // if null log reg converged
   IOFormat Fmt(StreamPrecision, DontAlignCols, " ", "\n", "", "","","");
+  const bool direct_null_fallback =
+    cox_firth_direct_null_fallback_enabled();
+  std::vector<CoxFirthFitProfile> null_profiles(params->n_pheno);
+  std::string null_profile_line;
 
   if(!silent) sout << "   -fitting null Firth cox regression on time-to-event phenotypes..." << flush;
 
@@ -806,25 +834,38 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
     else offset = m_ests->blups.col(i).array();
 
     cox_firth cox_firth_null;
-    cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
+    const int initial_iterations = direct_null_fallback ?
+      params->niter_max_firth_null * 5 : params->niter_max_firth_null;
+    const double initial_stephalf_tolerance = direct_null_fallback ?
+      0 : params->numtol_cox_stephalf;
+    const double initial_max_step = direct_null_fallback ?
+      params->maxstep_null / 5.0 : params->maxstep_null;
+    cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), initial_iterations, params->niter_max_line_search, params->numtol_cox, initial_stephalf_tolerance, params->numtol_beta_cox, initial_max_step, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
     cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
+    null_profiles[i].add(cox_firth_null);
 
-    if( !cox_firth_null.converge ){ // if failed to converge
+    if( !cox_firth_null.converge && !direct_null_fallback ){ // if failed to converge
       cerr << "WARNING: Cox regression with Firth correction did not converge. Step-halving tol=" << params->numtol_cox_stephalf << "\n";
 
       cerr << "Retrying with strict convergence criteria: step-halving tol=0.\n";
 
       cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
       cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
+      null_profiles[i].add(cox_firth_null);
     }
 
     if( !cox_firth_null.converge ){ // if failed to converge
-      cerr << "WARNING: Cox regression with Firth correction did not converge (step-halving tol=0, maximum step size=" << params->maxstep_null <<";maximum number of iterations=" << params->niter_max_firth_null <<").";
+      if(direct_null_fallback) {
+        cerr << "WARNING: Direct Cox Firth null fallback did not converge from the Cox MLE coefficients. ";
+      } else {
+        cerr << "WARNING: Cox regression with Firth correction did not converge (step-halving tol=0, maximum step size=" << params->maxstep_null <<";maximum number of iterations=" << params->niter_max_firth_null <<").";
+      }
 
       cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << params->maxstep_null/5 <<";maximum number of iterations=" << params->niter_max_firth_null*5 <<";initiate at 0).\n";
 
       cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null/5, !params->cox_nofirth, false);
       cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
+      null_profiles[i].add(cox_firth_null);
     }
     has_converged(i) = cox_firth_null.converge;
     if(!has_converged(i)) continue;
@@ -838,6 +879,48 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
 #if defined(_OPENMP)
   if((params->n_pheno>2) && !params->blup_cov) setNbThreads(params->threads);
 #endif
+
+  if(params->profile_step2) {
+    uint64_t profiled_phenotypes = 0;
+    uint64_t successful_phenotypes = 0;
+    uint64_t total_attempts = 0;
+    uint64_t total_iterations = 0;
+    uint64_t total_likelihood_evaluations = 0;
+    uint64_t total_step_halvings = 0;
+    uint64_t total_line_search_exhaustions = 0;
+    double final_score_max = 0;
+    for(int i = 0; i < params->n_pheno; ++i) {
+      const CoxFirthFitProfile& profile = null_profiles[i];
+      if(profile.attempts == 0) continue;
+      ++profiled_phenotypes;
+      if(has_converged(i)) ++successful_phenotypes;
+      total_attempts += profile.attempts;
+      total_iterations += profile.iterations;
+      total_likelihood_evaluations += profile.likelihood_evaluations;
+      total_step_halvings += profile.step_halvings;
+      total_line_search_exhaustions += profile.line_search_exhaustions;
+      final_score_max = std::max(
+        final_score_max, profile.final_score_max);
+    }
+    std::ostringstream profile_output;
+    profile_output << "STEP2_PROFILE scope=cox_firth_null"
+                   << " phenotypes=" << profiled_phenotypes
+                   << " successes=" << successful_phenotypes
+                   << " attempts=" << total_attempts
+                   << " fallbacks=" <<
+                     (total_attempts >= profiled_phenotypes ?
+                       total_attempts - profiled_phenotypes : 0)
+                   << " direct_fallback=" <<
+                     (direct_null_fallback ? 1 : 0)
+                   << " iterations=" << total_iterations
+                   << " likelihood_evaluations=" <<
+                     total_likelihood_evaluations
+                   << " step_halvings=" << total_step_halvings
+                   << " line_search_exhaustions=" <<
+                     total_line_search_exhaustions
+                   << " final_score_max=" << final_score_max << "\n";
+    null_profile_line = profile_output.str();
+  }
 
   // check if some did not converge
   if(!has_converged.any()) { //  none passed
@@ -865,12 +948,16 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   if(params->blup_cov)
     pheno_data->new_cov.rightCols(1).array() = 0;
 
-  if (silent) return;
+  if (silent) {
+    if(params->profile_step2) sout << null_profile_line;
+    return;
+  }
 
   sout << "done";
   auto t2 = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
   sout << " (" << duration.count() << "ms) "<< endl;
+  if(params->profile_step2) sout << null_profile_line;
 }
 
 // firth cov + test snp
