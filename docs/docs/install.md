@@ -164,7 +164,9 @@ memory-bandwidth tradeoff. Each worker retains one tile buffer, so its host
 memory cost is `tile variants * samples * 8` bytes per worker.
 
 Packed-hardcall k-fold runs can additionally overlap preprocessing block
-`i+1` with the working-matrix and Level 0 ridge calculations for block `i`.
+`i+1` with the Level 0 ridge calculations for block `i`. Submission waits
+until the current block's working matrices are complete because preprocessing
+and Gram construction compete for the same device bandwidth.
 Set `REGENIE_CUDA_BLOCK_PIPELINE_DEPTH=2` to preallocate two independent CUDA
 preprocessing/resident-genotype slots and enable this pipeline. REGENIE keeps
 block consumption and output in their original order, falls back to depth one

@@ -1195,6 +1195,8 @@ void Data::level_0_calculations() {
     sout << " - Step 1 CUDA block pipeline : [" <<
       (pgen_packed_pipeline_enabled ? "enabled" : "disabled") <<
       "] depth=" << pgen_packed_pipeline_depth;
+    if(pgen_packed_pipeline_enabled)
+      sout << " schedule=level0_ridge";
     if(!pgen_packed_pipeline_enabled) {
       if(!pgen_packed_hardcalls) sout << " reason=packed_hardcalls_disabled";
       else if(!pgen_prefetch_enabled) sout << " reason=prefetch_disabled";
@@ -1426,6 +1428,48 @@ void Data::level_0_calculations() {
       residualize_genotypes();
       if(params.profile_step1) step1_profile.residualize_ms += elapsed_ms(stage_start);
 
+      // calc working matrices for ridge regressions across folds
+      ProfileClock::time_point cv_start;
+      double cv_gram_before_ms = 0;
+      double cv_gty_before_ms = 0;
+      double cv_eigensolve_before_ms = 0;
+      double cv_upload_before_ms = 0;
+      double cv_download_before_ms = 0;
+      double cv_ridge_before_ms = 0;
+      if(params.profile_step1) {
+        cv_start = ProfileClock::now();
+        cv_gram_before_ms = step1_profile.gram_ms;
+        cv_gty_before_ms = step1_profile.gty_ms;
+        cv_eigensolve_before_ms = step1_profile.eigensolve_ms;
+        cv_upload_before_ms = step1_profile.backend_upload_ms;
+        cv_download_before_ms = step1_profile.backend_download_ms;
+        cv_ridge_before_ms = step1_profile.backend_ridge_compute_ms;
+      }
+      calc_cv_matrices(&l0);
+      if(params.profile_step1) {
+        const double cv_wall_ms = elapsed_ms(cv_start);
+        const double cv_backend_compute_ms =
+          step1_profile.gram_ms - cv_gram_before_ms +
+          step1_profile.gty_ms - cv_gty_before_ms +
+          step1_profile.eigensolve_ms - cv_eigensolve_before_ms +
+          step1_profile.backend_ridge_compute_ms - cv_ridge_before_ms;
+        const double cv_transfer_ms =
+          step1_profile.backend_upload_ms - cv_upload_before_ms +
+          step1_profile.backend_download_ms - cv_download_before_ms;
+        step1_profile.cv_wall_ms += cv_wall_ms;
+        step1_profile.cv_backend_compute_ms += cv_backend_compute_ms;
+        step1_profile.cv_transfer_ms += cv_transfer_ms;
+        step1_profile.cv_host_orchestration_ms += std::max(
+          0.0, cv_wall_ms - cv_backend_compute_ms - cv_transfer_ms);
+      }
+
+      // Delay the next block's device preprocessing until the current block's
+      // working matrices are complete. Both operations are bandwidth-heavy;
+      // running them together slowed the CV products on both A100 and T4.
+      // Level 0 ridge is substantially more host-orchestrated on the target
+      // A100 workload, so it offers useful overlap without competing with the
+      // current block's Gram products. Waiting here also gives the host PGEN
+      // prefetch the full CV interval in which to finish.
       if(pgen_packed_pipeline_enabled && pgen_prefetch_pending) {
         const ProfileClock::time_point wait_start = ProfileClock::now();
         Step1PgenPrefetchResult result = pgen_prefetch_future.get();
@@ -1464,41 +1508,6 @@ void Data::level_0_calculations() {
           sout << " - Step 1 CUDA block pipeline disabled after queued "
             "submission; continuing at depth 1\n";
         }
-      }
-
-      // calc working matrices for ridge regressions across folds
-      ProfileClock::time_point cv_start;
-      double cv_gram_before_ms = 0;
-      double cv_gty_before_ms = 0;
-      double cv_eigensolve_before_ms = 0;
-      double cv_upload_before_ms = 0;
-      double cv_download_before_ms = 0;
-      double cv_ridge_before_ms = 0;
-      if(params.profile_step1) {
-        cv_start = ProfileClock::now();
-        cv_gram_before_ms = step1_profile.gram_ms;
-        cv_gty_before_ms = step1_profile.gty_ms;
-        cv_eigensolve_before_ms = step1_profile.eigensolve_ms;
-        cv_upload_before_ms = step1_profile.backend_upload_ms;
-        cv_download_before_ms = step1_profile.backend_download_ms;
-        cv_ridge_before_ms = step1_profile.backend_ridge_compute_ms;
-      }
-      calc_cv_matrices(&l0);
-      if(params.profile_step1) {
-        const double cv_wall_ms = elapsed_ms(cv_start);
-        const double cv_backend_compute_ms =
-          step1_profile.gram_ms - cv_gram_before_ms +
-          step1_profile.gty_ms - cv_gty_before_ms +
-          step1_profile.eigensolve_ms - cv_eigensolve_before_ms +
-          step1_profile.backend_ridge_compute_ms - cv_ridge_before_ms;
-        const double cv_transfer_ms =
-          step1_profile.backend_upload_ms - cv_upload_before_ms +
-          step1_profile.backend_download_ms - cv_download_before_ms;
-        step1_profile.cv_wall_ms += cv_wall_ms;
-        step1_profile.cv_backend_compute_ms += cv_backend_compute_ms;
-        step1_profile.cv_transfer_ms += cv_transfer_ms;
-        step1_profile.cv_host_orchestration_ms += std::max(
-          0.0, cv_wall_ms - cv_backend_compute_ms - cv_transfer_ms);
       }
 
       // test association for block
