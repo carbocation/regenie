@@ -478,11 +478,11 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
   const Eigen::MatrixXd no_outcomes(0, 0);
   Eigen::MatrixXd expected_predictions, expected_coefficients;
   Eigen::MatrixXd actual_predictions, actual_coefficients;
-  oracle->ridge_predict_factorized(expected_slice, true,
+  oracle->ridge_predict_factorized(imputed, true,
     ridge_parameters, no_outcomes, false,
     expected_predictions, expected_coefficients);
   Step1ComputeTimings ridge_timings;
-  candidate.ridge_predict_preprocessed(slice_start, slice_size,
+  candidate.ridge_predict_preprocessed(0, samples,
     ridge_parameters, actual_predictions, actual_coefficients,
     &ridge_timings);
   const double prediction_error =
