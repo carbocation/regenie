@@ -3325,6 +3325,7 @@ void initialize_thread_data(vector<data_thread>& all_snp_data, struct param cons
     snp_data->se_b = ArrayXd::Zero(params.n_pheno);
     snp_data->scores = ArrayXd::Zero(params.n_pheno);
     snp_data->cal_factor = ArrayXd::Zero(params.n_pheno);
+    snp_data->correction_profile = Step2CorrectionProfile();
     if(params.trait_mode){
       snp_data->stats = ArrayXd::Zero(params.n_pheno);
       snp_data->denum = ArrayXd::Zero(params.n_pheno);

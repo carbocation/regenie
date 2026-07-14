@@ -392,6 +392,44 @@ void Data::run_step2(){
 
 void Data::print_step2_profile() {
 
+  Step2CorrectionProfile correction_profile;
+  for(const data_thread& thread_data : Gblock.thread_data) {
+    const Step2CorrectionProfile& thread_profile =
+      thread_data.correction_profile;
+    correction_profile.spa_tests += thread_profile.spa_tests;
+    correction_profile.spa_failures += thread_profile.spa_failures;
+    correction_profile.spa_fast_tests += thread_profile.spa_fast_tests;
+    correction_profile.spa_sparse_tests += thread_profile.spa_sparse_tests;
+    correction_profile.spa_root_iterations +=
+      thread_profile.spa_root_iterations;
+    correction_profile.spa_thread_ms += thread_profile.spa_thread_ms;
+    correction_profile.logistic_firth_tests +=
+      thread_profile.logistic_firth_tests;
+    correction_profile.logistic_firth_failures +=
+      thread_profile.logistic_firth_failures;
+    correction_profile.logistic_firth_approximate_tests +=
+      thread_profile.logistic_firth_approximate_tests;
+    correction_profile.logistic_firth_sparse_tests +=
+      thread_profile.logistic_firth_sparse_tests;
+    correction_profile.logistic_firth_fallbacks +=
+      thread_profile.logistic_firth_fallbacks;
+    correction_profile.logistic_firth_thread_ms +=
+      thread_profile.logistic_firth_thread_ms;
+    correction_profile.cox_firth_tests += thread_profile.cox_firth_tests;
+    correction_profile.cox_firth_failures +=
+      thread_profile.cox_firth_failures;
+    correction_profile.cox_firth_approximate_tests +=
+      thread_profile.cox_firth_approximate_tests;
+    correction_profile.cox_firth_one_parameter_tests +=
+      thread_profile.cox_firth_one_parameter_tests;
+    correction_profile.cox_firth_fallbacks +=
+      thread_profile.cox_firth_fallbacks;
+    correction_profile.cox_firth_iterations +=
+      thread_profile.cox_firth_iterations;
+    correction_profile.cox_firth_thread_ms +=
+      thread_profile.cox_firth_thread_ms;
+  }
+
   const double measured_ms = step2_profile.setup_ms +
     step2_profile.prediction_read_ms + step2_profile.null_model_ms +
     step2_profile.genotype_io_ms + step2_profile.variant_compute_ms +
@@ -537,6 +575,73 @@ void Data::print_step2_profile() {
         << " score_percent=" <<
           (100 * step2_variant_compute_profile.score_thread_ms /
             thread_denominator) << "\n";
+  }
+  {
+    const uint64_t correction_tests = correction_profile.spa_tests +
+      correction_profile.logistic_firth_tests +
+      correction_profile.cox_firth_tests;
+    const uint64_t correction_failures = correction_profile.spa_failures +
+      correction_profile.logistic_firth_failures +
+      correction_profile.cox_firth_failures;
+    const double correction_thread_ms = correction_profile.spa_thread_ms +
+      correction_profile.logistic_firth_thread_ms +
+      correction_profile.cox_firth_thread_ms;
+    const double spa_average_ms = correction_profile.spa_tests > 0 ?
+      correction_profile.spa_thread_ms / correction_profile.spa_tests : 0;
+    const double logistic_firth_average_ms =
+      correction_profile.logistic_firth_tests > 0 ?
+        correction_profile.logistic_firth_thread_ms /
+          correction_profile.logistic_firth_tests : 0;
+    const double cox_firth_average_ms =
+      correction_profile.cox_firth_tests > 0 ?
+        correction_profile.cox_firth_thread_ms /
+          correction_profile.cox_firth_tests : 0;
+    out << "STEP2_PROFILE scope=corrections"
+        << " tests=" << correction_tests
+        << " failures=" << correction_failures
+        << " thread_work_ms=" << correction_thread_ms
+        << " spa_tests=" << correction_profile.spa_tests
+        << " spa_failures=" << correction_profile.spa_failures
+        << " spa_fast_tests=" << correction_profile.spa_fast_tests
+        << " spa_sparse_tests=" << correction_profile.spa_sparse_tests
+        << " spa_root_iterations=" <<
+          correction_profile.spa_root_iterations
+        << " spa_thread_ms=" << correction_profile.spa_thread_ms
+        << " spa_average_ms=" << spa_average_ms
+        << " logistic_firth_tests=" <<
+          correction_profile.logistic_firth_tests
+        << " logistic_firth_failures=" <<
+          correction_profile.logistic_firth_failures
+        << " logistic_firth_approximate_tests=" <<
+          correction_profile.logistic_firth_approximate_tests
+        << " logistic_firth_sparse_tests=" <<
+          correction_profile.logistic_firth_sparse_tests
+        << " logistic_firth_fallbacks=" <<
+          correction_profile.logistic_firth_fallbacks
+        << " logistic_firth_thread_ms=" <<
+          correction_profile.logistic_firth_thread_ms
+        << " logistic_firth_average_ms=" << logistic_firth_average_ms
+        << " cox_firth_tests=" << correction_profile.cox_firth_tests
+        << " cox_firth_failures=" <<
+          correction_profile.cox_firth_failures
+        << " cox_firth_approximate_tests=" <<
+          correction_profile.cox_firth_approximate_tests
+        << " cox_firth_one_parameter_tests=" <<
+          correction_profile.cox_firth_one_parameter_tests
+        << " cox_firth_fallbacks=" <<
+          correction_profile.cox_firth_fallbacks
+        << " cox_firth_iterations=" <<
+          correction_profile.cox_firth_iterations
+        << " cox_firth_thread_ms=" <<
+          correction_profile.cox_firth_thread_ms
+        << " cox_firth_average_ms=" << cox_firth_average_ms
+        << " logistic_firth_null_fits=" <<
+          step2_profile.logistic_firth_null_fits
+        << " logistic_firth_null_ms=" <<
+          step2_profile.logistic_firth_null_ms
+        << " cox_firth_null_fits=" << step2_profile.cox_firth_null_fits
+        << " cox_firth_null_ms=" << step2_profile.cox_firth_null_ms
+        << "\n";
   }
   out << "STEP2_PROFILE_FINAL version=1 mode=" << mode
       << " setup_ms=" << step2_profile.setup_ms
@@ -3542,12 +3647,25 @@ void Data::compute_res_bin(int const& chrom){
   res.array() *= pheno_data.masked_indivs.array().cast<double>();
 
   // if using firth approximation, fit null penalized model with only covariates and store the estimates (to be used as offset when computing LRT in full model)
+  ProfileClock::time_point correction_null_start;
+  uint64_t correction_null_fits = 0;
+  const bool profile_firth_null = params.profile_step2 &&
+    (params.firth || params.firth_approx);
+  if(profile_firth_null)
+    correction_null_fits = params.pheno_pass.count();
+  if(profile_firth_null)
+    correction_null_start = ProfileClock::now();
   if(params.firth_approx) fit_null_firth(false, chrom, &firth_est, &pheno_data, &m_ests, &files, &params, sout);
   else if(params.firth){ // get estimates of covs without tested snp
     params.cov_betas = MatrixXd::Zero(pheno_data.new_cov.cols(), params.n_pheno);
     for( int ph = 0; ph < params.n_pheno; ++ph ) 
       if(params.pheno_pass(ph))
         params.pheno_pass(ph) = fit_approx_firth_null(chrom, ph, &pheno_data, &m_ests, params.cov_betas.col(ph), &params);
+  }
+  if(profile_firth_null) {
+    step2_profile.logistic_firth_null_fits += correction_null_fits;
+    step2_profile.logistic_firth_null_ms +=
+      elapsed_ms(correction_null_start);
   }
 }
 
@@ -3565,7 +3683,18 @@ void Data::compute_res_cox(int const& chrom){
 
   fit_null_cox(false, chrom, &params, &pheno_data, &m_ests, &files, sout); // for all phenotypes
 
-  if(params.firth_approx) fit_null_firth_cox(false, chrom, &firth_est, &pheno_data, &m_ests, &files, &params, sout);
+  if(params.firth_approx) {
+    ProfileClock::time_point correction_null_start;
+    uint64_t correction_null_fits = 0;
+    if(params.profile_step2)
+      correction_null_fits = params.pheno_pass.count();
+    if(params.profile_step2) correction_null_start = ProfileClock::now();
+    fit_null_firth_cox(false, chrom, &firth_est, &pheno_data, &m_ests, &files, &params, sout);
+    if(params.profile_step2) {
+      step2_profile.cox_firth_null_fits += correction_null_fits;
+      step2_profile.cox_firth_null_ms += elapsed_ms(correction_null_start);
+    }
+  }
 
 }
 

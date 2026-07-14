@@ -184,8 +184,36 @@ elif ! grep -q '^STEP2_PROFILE version=1 mode=single_variant file_type=bgen trai
   print_custom_err "Step 2 profiling header is missing."
 elif ! grep -q '^STEP2_PROFILE scope=bgen_parse variants=1000 ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
   print_custom_err "Step 2 BGEN parsing profile is missing."
+elif ! grep -q '^STEP2_PROFILE scope=corrections tests=20 failures=0 .*logistic_firth_tests=20 logistic_firth_failures=0 logistic_firth_approximate_tests=20 ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
+  print_custom_err "Step 2 correction profile is missing."
 elif ! grep -q '^STEP2_PROFILE_FINAL version=1 mode=single_variant ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
   print_custom_err "Step 2 final profiling output is missing."
+fi
+
+rgcmd="--step 2 \
+  --bgen ${mntpt}example/example.bgen \
+  --covarFile ${mntpt}example/covariates.txt${fsuf} \
+  --phenoFile ${mntpt}example/phenotype_bin.txt${fsuf} \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --bt \
+  --spa \
+  --pThresh 0.01 \
+  --step2-profile \
+  --pred ${mntpt}test/fit_bin_out_pred.list \
+  $arg_gz \
+  --out ${mntpt}test/test_bin_out_spa_profile"
+
+./$regenie_bin $rgcmd
+
+if [ -f ${REGENIE_PATH}test/test_bin_out_spa_profile_Y1.regenie.gz ]; then
+  ( zcat < ${REGENIE_PATH}test/test_bin_out_spa_profile_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_spa_profile_Y1.regenie
+fi
+
+if [ "`cat ${REGENIE_PATH}test/test_bin_out_spa_profile_Y1.regenie | wc -l`" != "1001" ]; then
+  print_err
+elif ! grep -q '^STEP2_PROFILE scope=corrections tests=20 failures=0 .*spa_tests=20 spa_failures=0 ' ${REGENIE_PATH}test/test_bin_out_spa_profile.log; then
+  print_custom_err "Step 2 SPA correction profile is missing."
 fi
 
 

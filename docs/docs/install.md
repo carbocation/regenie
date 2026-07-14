@@ -296,6 +296,18 @@ denominator calculation. Set the developer diagnostic
 `REGENIE_STEP2_UNSCALED_DENSE_QT=0` to disable it for matched output and
 performance comparisons.
 
+For single-variant tests, a `corrections` scope separates the aggregate worker
+time spent in SPA, logistic Firth, and Cox Firth corrections. It reports the
+number of corrections attempted and failed, average time per correction,
+fast/sparse or approximate/one-parameter path coverage, and solver diagnostics.
+SPA diagnostics count root-solver iterations, while logistic and Cox Firth
+diagnostics count fallback attempts; Cox Firth also reports fit iterations.
+The scope separately reports the per-chromosome penalized-null preparation
+time and fit count. Correction timings are sums over worker threads, so they
+are components of `variant_compute` worker time rather than additive wall-time
+stages. The counters cover corrections invoked by the main single-variant
+path; internal SPA evaluations used by aggregate tests are not included.
+
 `scripts/compare_numeric_files.py` compares large whitespace-delimited outputs
 one line at a time and automatically uses a vectorized NumPy engine when NumPy
 is installed, with a dependency-free Python fallback. Its default tolerances

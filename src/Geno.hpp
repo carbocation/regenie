@@ -102,6 +102,28 @@ struct Step2BgenParseProfile {
   double finalize_thread_ms = 0;
 };
 
+struct Step2CorrectionProfile {
+  uint64_t spa_tests = 0;
+  uint64_t spa_failures = 0;
+  uint64_t spa_fast_tests = 0;
+  uint64_t spa_sparse_tests = 0;
+  uint64_t spa_root_iterations = 0;
+  double spa_thread_ms = 0;
+  uint64_t logistic_firth_tests = 0;
+  uint64_t logistic_firth_failures = 0;
+  uint64_t logistic_firth_approximate_tests = 0;
+  uint64_t logistic_firth_sparse_tests = 0;
+  uint64_t logistic_firth_fallbacks = 0;
+  double logistic_firth_thread_ms = 0;
+  uint64_t cox_firth_tests = 0;
+  uint64_t cox_firth_failures = 0;
+  uint64_t cox_firth_approximate_tests = 0;
+  uint64_t cox_firth_one_parameter_tests = 0;
+  uint64_t cox_firth_fallbacks = 0;
+  uint64_t cox_firth_iterations = 0;
+  double cox_firth_thread_ms = 0;
+};
+
 // for step 2 per thread
 struct data_thread {
   SpVec Gsparse;
@@ -129,6 +151,7 @@ struct data_thread {
   // QT residual is retained on its raw scale for the fused dense score path.
   bool qt_unscaled = false;
   bool qt_complete_masks = false;
+  Step2CorrectionProfile correction_profile;
 };
 
 struct geno_block {

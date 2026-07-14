@@ -108,12 +108,16 @@ struct Step2Profile {
   uint64_t variants = 0;
   uint64_t corrected_tests = 0;
   uint64_t failed_tests = 0;
+  uint64_t logistic_firth_null_fits = 0;
+  uint64_t cox_firth_null_fits = 0;
   double setup_ms = 0;
   double prediction_read_ms = 0;
   double null_model_ms = 0;
   double genotype_io_ms = 0;
   double variant_compute_ms = 0;
   double output_ms = 0;
+  double logistic_firth_null_ms = 0;
+  double cox_firth_null_ms = 0;
   double end_to_end_ms = 0;
 };
 

@@ -827,10 +827,16 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   cox_firth cox_firth_null;
   cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
+  if(params->profile_step2)
+    dt_thr->correction_profile.cox_firth_iterations += cox_firth_null.iter;
 
   if (!cox_firth_null.converge) {
+    if(params->profile_step2)
+      ++dt_thr->correction_profile.cox_firth_fallbacks;
     cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
+    if(params->profile_step2)
+      dt_thr->correction_profile.cox_firth_iterations += cox_firth_null.iter;
   }
 
   if (!cox_firth_null.converge) {
@@ -843,10 +849,16 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   cox_firth cox_firth_test;
   cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, cox_firth_null.beta);
   cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
+  if(params->profile_step2)
+    dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
 
   if (!cox_firth_test.converge) {
+    if(params->profile_step2)
+      ++dt_thr->correction_profile.cox_firth_fallbacks;
     cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
     cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
+    if(params->profile_step2)
+      dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
   }
 
   if (!cox_firth_test.converge) {
@@ -889,10 +901,16 @@ void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, st
   cox_firth cox_firth_test;
   cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false);
   cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
+  if(params->profile_step2)
+    dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
 
   if(!cox_firth_test.converge){
+    if(params->profile_step2)
+      ++dt_thr->correction_profile.cox_firth_fallbacks;
     cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->maxstep/5, !params->cox_nofirth, false);
     cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
+    if(params->profile_step2)
+      dt_thr->correction_profile.cox_firth_iterations += cox_firth_test.iter;
   }
 
   if(!cox_firth_test.converge){
@@ -1139,6 +1157,8 @@ void fit_firth_logistic_snp(int const& chrom, int const& ph, int const& isnp, bo
 
   // If didn't converge
   if(!success){
+    if(params->profile_step2)
+      ++dt_thr->correction_profile.logistic_firth_fallbacks;
     if(!null_fit) { // reset beta
       if(params->firth_approx) betaold = ArrayXd::Zero(col_incl); 
       else betaold = dt_thr->beta_null_firth.col(0);
@@ -1238,6 +1258,8 @@ void fit_firth_logistic_snp_fast(int const& chrom, int const& ph, int const& isn
 
   // If didn't converge, try again with NR at 0
   if(fit_state && (bstart != 0) && index_carriers.size()) {
+    if(params->profile_step2)
+      ++dt_thr->correction_profile.logistic_firth_fallbacks;
     if(params->debug) cerr << "WARNING: Pseudo-firth did not converge (" << fit_state << "; LRT = " << lrt << "; dev0 = " << dev0 << ") !\n";
     betaold = 0;
     fit_state = !fit_firth(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, 100, tol, params); // try NR (slower)
@@ -1245,6 +1267,8 @@ void fit_firth_logistic_snp_fast(int const& chrom, int const& ph, int const& isn
 
   // If didn't converge, try with NR
   if(fit_state){
+    if(params->profile_step2)
+      ++dt_thr->correction_profile.logistic_firth_fallbacks;
     if(params->debug) cerr << "WARNING: NR-firth did not converge (" << fit_state << "; LRT = " << lrt << ") !\n";
     betaold = bstart; 
     fit_state = !fit_firth(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, niter_nr, tol, params); // try NR (slower)
@@ -2018,8 +2042,41 @@ void check_pval_snp(variant_block* block_info, data_thread* dt_thr, int const& c
   }
 
   if(params.firth){ // firth
-    
+    std::chrono::steady_clock::time_point correction_start;
+    if(params.profile_step2)
+      correction_start = std::chrono::steady_clock::now();
+    if(params.profile_step2) {
+      if(params.trait_mode == 1) {
+        ++dt_thr->correction_profile.logistic_firth_tests;
+        if(params.firth_approx)
+          ++dt_thr->correction_profile.logistic_firth_approximate_tests;
+        if(params.firth_approx && dt_thr->is_sparse &&
+            !params.skip_fast_firth && block_info->mac(ph) < 50)
+          ++dt_thr->correction_profile.logistic_firth_sparse_tests;
+      } else if(params.trait_mode == 3) {
+        ++dt_thr->correction_profile.cox_firth_tests;
+        if(params.firth_approx)
+          ++dt_thr->correction_profile.cox_firth_approximate_tests;
+        if(params.firth_approx || pheno_data.new_cov.cols() == 0)
+          ++dt_thr->correction_profile.cox_firth_one_parameter_tests;
+      }
+    }
     run_firth_correction_snp(chrom, ph, isnp, gblock, block_info, dt_thr, pheno_data, m_ests, fest, params, sout);
+    if(params.profile_step2) {
+      const double correction_ms =
+        std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - correction_start).count();
+      if(params.trait_mode == 1) {
+        dt_thr->correction_profile.logistic_firth_thread_ms +=
+          correction_ms;
+        if(block_info->test_fail(ph))
+          ++dt_thr->correction_profile.logistic_firth_failures;
+      } else if(params.trait_mode == 3) {
+        dt_thr->correction_profile.cox_firth_thread_ms += correction_ms;
+        if(block_info->test_fail(ph))
+          ++dt_thr->correction_profile.cox_firth_failures;
+      }
+    }
     if(block_info->test_fail(ph)) {
       get_sumstats(true, ph, dt_thr);
       return;
@@ -2033,8 +2090,21 @@ void check_pval_snp(variant_block* block_info, data_thread* dt_thr, int const& c
       dt_thr->se_b(ph) = fabs(dt_thr->bhat(ph)) / sqrt(dt_thr->chisq_val(ph));
 
   } else if(params.use_SPA) { // spa
-
+    std::chrono::steady_clock::time_point correction_start;
+    if(params.profile_step2) {
+      correction_start = std::chrono::steady_clock::now();
+      ++dt_thr->correction_profile.spa_tests;
+      if(dt_thr->fastSPA) ++dt_thr->correction_profile.spa_fast_tests;
+      if(dt_thr->is_sparse) ++dt_thr->correction_profile.spa_sparse_tests;
+    }
     run_SPA_test(block_info->test_fail(ph), ph, dt_thr, pheno_data.masked_indivs.col(ph).array(), m_ests, params);
+    if(params.profile_step2) {
+      dt_thr->correction_profile.spa_thread_ms +=
+        std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - correction_start).count();
+      if(block_info->test_fail(ph))
+        ++dt_thr->correction_profile.spa_failures;
+    }
     if(block_info->test_fail(ph)) {
       get_sumstats(true, ph, dt_thr);
       return;
@@ -2088,10 +2158,10 @@ void run_firth_correction_snp(int const& chrom, int const& ph, int const& isnp, 
 }
 
 void run_SPA_test(bool& test_fail, int const& ph, data_thread* dt_thr, const Ref<const ArrayXb>& mask, struct ests const& m_ests, struct param const& params){
-  run_SPA_test_snp(dt_thr->chisq_val(ph), dt_thr->pval_log(ph), dt_thr->stats(ph), dt_thr->denum(ph), dt_thr->fastSPA, dt_thr->Gsparse, dt_thr->Gres.array(), m_ests.Y_hat_p.col(ph).array(), m_ests.Gamma_sqrt.col(ph).array(), mask, test_fail, params.tol_spa, params.niter_max_spa, params.missing_value_double, params.nl_dbl_dmin);
+  run_SPA_test_snp(dt_thr->chisq_val(ph), dt_thr->pval_log(ph), dt_thr->stats(ph), dt_thr->denum(ph), dt_thr->fastSPA, dt_thr->Gsparse, dt_thr->Gres.array(), m_ests.Y_hat_p.col(ph).array(), m_ests.Gamma_sqrt.col(ph).array(), mask, test_fail, params.tol_spa, params.niter_max_spa, params.missing_value_double, params.nl_dbl_dmin, params.profile_step2 ? &dt_thr->correction_profile.spa_root_iterations : nullptr);
 }
 
-void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const double& denum, bool const& fastSPA, SpVec const& Gsparse, const Ref<const ArrayXd>& Gres, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, const Ref<const ArrayXb>& mask, bool& test_fail, const double& tol, const double& niter_max, const double& missing_value_double, const double& nl_dbl_dmin){
+void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const double& denum, bool const& fastSPA, SpVec const& Gsparse, const Ref<const ArrayXd>& Gres, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, const Ref<const ArrayXb>& mask, bool& test_fail, const double& tol, const double& niter_max, const double& missing_value_double, const double& nl_dbl_dmin, uint64_t* iteration_count){
 
   int index_j;
   double score_num, tval, limK1_low, limK1_high, root_K1, pval1, pval2;
@@ -2131,7 +2201,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
   // 1.for T
   spa_df.pos_score = true;
   // solve K'(t)= tval using a mix of Newton-Raphson and bisection method
-  root_K1 = solve_K1_snp(tval, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, tol, niter_max, missing_value_double);
+  root_K1 = solve_K1_snp(tval, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, tol, niter_max, missing_value_double, iteration_count);
   if( root_K1 == missing_value_double ){
     test_fail = true;
     return;
@@ -2143,7 +2213,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
   // 2.for -T
   spa_df.pos_score = false;
   // solve K'(t)= tval using a mix of Newton-Raphson and bisection method
-  root_K1 = solve_K1_snp(tval, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, tol, niter_max, missing_value_double);
+  root_K1 = solve_K1_snp(tval, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, tol, niter_max, missing_value_double, iteration_count);
   if( root_K1 == missing_value_double ){
     test_fail = true;
     return;
@@ -2165,7 +2235,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
 
 
 // SPA (MT in OpenMP)
-double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask, double const& tol, int const& niter_max, double const& missing_value_double){
+double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask, double const& tol, int const& niter_max, double const& missing_value_double, uint64_t* iteration_count){
 
   int niter_cur;
   int lambda = spa_df.pos_score ? 1 : -1; // if score is negative, adjust K' and K''
@@ -2182,7 +2252,10 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
   while( niter_cur++ < niter_max ){
 
     hess = spa_df.fastSPA ? compute_K2_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
-    if(hess == 0) return missing_value_double;
+    if(hess == 0) {
+      if(iteration_count) *iteration_count += niter_cur;
+      return missing_value_double;
+    }
     t_new = t_old - f_old / hess;
     f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
     f_new *= lambda;
@@ -2212,10 +2285,12 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
   // If didn't converge
   if( niter_cur > niter_max ){
     //if(params->verbose) sout << "WARNING: SPA did not converge to root for K'(t)=s.\n";
+    if(iteration_count) *iteration_count += niter_cur;
     return missing_value_double;
   }
   //sout << "#iterations = " << niter_cur << "; f= " << f_new << endl;
 
+  if(iteration_count) *iteration_count += niter_cur;
   return t_new;
 }
 
