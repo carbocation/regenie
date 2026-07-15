@@ -27,6 +27,21 @@
 #ifndef DATA_H
 #define DATA_H
 
+class Step1ComputeBackend;
+
+struct Step1Profile {
+  uint64_t blocks = 0;
+  uint64_t variants = 0;
+  double total_ms = 0;
+  double decode_ms = 0;
+  double residualize_ms = 0;
+  double gram_ms = 0;
+  double gty_ms = 0;
+  double eigensolve_ms = 0;
+  double association_ms = 0;
+  double ridge_ms = 0;
+};
+
 class Data {
 
   public:
@@ -63,6 +78,8 @@ class Data {
     Eigen::RowVectorXd p_sd_yres;
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
     MultiPhen mphen;
+    Step1Profile step1_profile;
+    std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions
     void run();
@@ -84,6 +101,7 @@ class Data {
     void setmem();
     void calc_cv_matrices(struct ridgel0*);
     void level_0_calculations();
+    void print_step1_profile();
     void prep_l1_models();
     void write_inputs(); 
     void exit_early();

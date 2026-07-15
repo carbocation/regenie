@@ -46,6 +46,7 @@
 #include "survival_data.hpp"
 #include "cox_score.hpp"
 #include "Step1_Models.hpp"
+#include "Step1_Compute.hpp"
 #include "Step2_Models.hpp"
 #include "Pheno.hpp"
 #include "MultiTrait_Tests.hpp"
@@ -69,7 +70,17 @@ namespace fs = boost::filesystem;
 using boost::math::normal;
 using boost::math::chi_squared;
 
-Data::Data() { // @suppress("Class members should be properly initialized")
+namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+
+double elapsed_ms(const ProfileClock::time_point& start) {
+  return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
+}
+
+}
+
+Data::Data() : step1_compute_backend(make_cpu_step1_compute_backend()) { // @suppress("Class members should be properly initialized")
 }
 
 Data::~Data() {
@@ -648,27 +659,48 @@ void Data::level_0_calculations() {
     for(int bb = 0; bb < chrom_nb ; bb++) {
 
       get_block_size(params.block_size, chrom_nsnps, bb, bs);
+      ProfileClock::time_point block_start;
+      if(params.profile_step1) block_start = ProfileClock::now();
 
       Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
       if(params.alpha_prior != -1) Gblock.snp_afs = MatrixXd::Zero(bs, 1);
 
+      ProfileClock::time_point stage_start;
+      if(params.profile_step1) stage_start = ProfileClock::now();
       get_G(block, bs, chrom, in_filters.step1_snp_count, snpinfo, &params, &files, &Gblock, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, sout);
+      if(params.profile_step1) step1_profile.decode_ms += elapsed_ms(stage_start);
 
       // residualize and scale genotypes
+      if(params.profile_step1) stage_start = ProfileClock::now();
       residualize_genotypes();
+      if(params.profile_step1) step1_profile.residualize_ms += elapsed_ms(stage_start);
 
       // calc working matrices for ridge regressions across folds
       calc_cv_matrices(&l0);
 
       // test association for block
-      if(params.test_l0)
+      if(params.test_l0) {
+        if(params.profile_step1) stage_start = ProfileClock::now();
         test_assoc_block(chrom, block, l0, l1_ests, &Gblock, &pheno_data, &snpinfo[in_filters.step1_snp_count], params, sout);
+        if(params.profile_step1) step1_profile.association_ms += elapsed_ms(stage_start);
+      }
 
       // calc level 0 ridge regressions
+      if(params.profile_step1) stage_start = ProfileClock::now();
+      const double eigensolve_before_ms = params.profile_step1 ? l0.profile_eigensolve_ms : 0;
       if(params.use_loocv)
         ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, sout);
       else
         ridge_level_0(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, masked_in_folds, sout);
+      if(params.profile_step1) {
+        const double ridge_total_ms = elapsed_ms(stage_start);
+        const double eigensolve_ms = l0.profile_eigensolve_ms - eigensolve_before_ms;
+        step1_profile.eigensolve_ms += eigensolve_ms;
+        step1_profile.ridge_ms += std::max(0.0, ridge_total_ms - eigensolve_ms);
+        step1_profile.total_ms += elapsed_ms(block_start);
+        step1_profile.blocks++;
+        step1_profile.variants += bs;
+      }
 
       if(params.print_block_betas && params.use_loocv) // keep on raw scale
         l1_ests.beta_snp_step1.middleRows(in_filters.step1_snp_count, bs).array().colwise() /= scale_G.array() / pheno_data.scale_Y(0);
@@ -684,6 +716,8 @@ void Data::level_0_calculations() {
       if(files.write_preds_files[ph]->is_open()) files.write_preds_files[ph]->close();
     }
   }
+
+  if(params.profile_step1) print_step1_profile();
   
   if(params.test_l0) {
     if(params.use_loocv) {
@@ -740,30 +774,42 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
 
     for( int i = 0; i < params.cv_folds; ++i ) {
       MapMatXd Gmat (&(Gblock.Gmat(0,cum_size_folds)), bs, params.cv_sizes(i));
+      ProfileClock::time_point profile_start;
+      if(params.profile_step1) profile_start = ProfileClock::now();
       if(params.test_l0)
-        l0->GtY[i] = Gmat * l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i));
+        step1_compute_backend->compute_crossproduct(Gmat, l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i)), l0->GtY[i]);
       else
-        l0->GtY[i] = Gmat * pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i));
+        step1_compute_backend->compute_crossproduct(Gmat, pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i)), l0->GtY[i]);
       l0->GTY += l0->GtY[i];
-      l0->G_folds[i] = Gmat * Gmat.transpose();
+      if(params.profile_step1) step1_profile.gty_ms += elapsed_ms(profile_start);
+
+      if(params.profile_step1) profile_start = ProfileClock::now();
+      step1_compute_backend->compute_gram(Gmat, l0->G_folds[i], Step1GramMode::full_product);
       l0->GGt += l0->G_folds[i];
+      if(params.profile_step1) step1_profile.gram_ms += elapsed_ms(profile_start);
       cum_size_folds += params.cv_sizes(i);
     }
     
   } else { // loocv
 
-    l0->GGt.setZero(bs,bs);
-    l0->GGt.selfadjointView<Lower>().rankUpdate(Gblock.Gmat);
-    l0->GGt.triangularView<Eigen::Upper>() = l0->GGt.transpose(); // fill upper-triangular part
+    ProfileClock::time_point profile_start;
+    if(params.profile_step1) profile_start = ProfileClock::now();
+    step1_compute_backend->compute_gram(Gblock.Gmat, l0->GGt, Step1GramMode::selfadjoint_rank_update);
+    if(params.profile_step1) step1_profile.gram_ms += elapsed_ms(profile_start);
+
+    if(params.profile_step1) profile_start = ProfileClock::now();
     if(params.test_l0)
-      l0->GTY = Gblock.Gmat * l0->ymat_res;
+      step1_compute_backend->compute_crossproduct(Gblock.Gmat, l0->ymat_res, l0->GTY);
     else
-      l0->GTY = Gblock.Gmat * pheno_data.phenotypes;
+      step1_compute_backend->compute_crossproduct(Gblock.Gmat, pheno_data.phenotypes, l0->GTY);
+    if(params.profile_step1) step1_profile.gty_ms += elapsed_ms(profile_start);
     if(!params.test_l0){
+      if(params.profile_step1) profile_start = ProfileClock::now();
       SelfAdjointEigenSolver<MatrixXd> esG(l0->GGt);
       l0->GGt_eig_vec = esG.eigenvectors();
       l0->GGt_eig_val = esG.eigenvalues();
       l0->Wmat = l0->GGt_eig_vec.transpose() * l0->GTY;
+      if(params.profile_step1) step1_profile.eigensolve_ms += elapsed_ms(profile_start);
     }
 
   }
@@ -772,6 +818,41 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
   auto t3 = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2);
   sout << " (" << duration.count() << "ms) "<< endl;
+}
+
+void Data::print_step1_profile() {
+
+  const double measured_ms = step1_profile.decode_ms + step1_profile.residualize_ms +
+    step1_profile.gram_ms + step1_profile.gty_ms + step1_profile.eigensolve_ms +
+    step1_profile.association_ms + step1_profile.ridge_ms;
+  const double other_ms = std::max(0.0, step1_profile.total_ms - measured_ms);
+  const double denominator = step1_profile.total_ms > 0 ? step1_profile.total_ms : 1;
+
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(3);
+  out << "\nSTEP1_PROFILE version=1 backend=" << step1_compute_backend->name()
+      << " mode=" << (params.use_loocv ? "loocv" : "kfold")
+      << " blocks=" << step1_profile.blocks
+      << " variants=" << step1_profile.variants
+      << " samples=" << params.n_samples
+      << " phenotypes=" << params.n_pheno << "\n";
+
+  const auto print_stage = [&](const char* name, const double value) {
+    out << "STEP1_PROFILE stage=" << name
+        << " elapsed_ms=" << value
+        << " percent=" << (100 * value / denominator) << "\n";
+  };
+
+  print_stage("decode", step1_profile.decode_ms);
+  print_stage("residualize", step1_profile.residualize_ms);
+  print_stage("gram", step1_profile.gram_ms);
+  print_stage("phenotype_crossproduct", step1_profile.gty_ms);
+  print_stage("eigensolve_transform", step1_profile.eigensolve_ms);
+  print_stage("association", step1_profile.association_ms);
+  print_stage("ridge", step1_profile.ridge_ms);
+  print_stage("other", other_ms);
+  print_stage("block_total", step1_profile.total_ms);
+  sout << out.str();
 }
 
 // select which level 0 predictors to use at level 1
@@ -4447,4 +4528,3 @@ void Data::print_ld(SpMat& Gmat, ArrayXi& indices_ld, ArrayXb& is_absent, Files*
   exit_early();
 
 }
-

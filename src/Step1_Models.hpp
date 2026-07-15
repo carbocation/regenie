@@ -52,6 +52,7 @@ struct ridgel0 {
   MatrixXb picked_top_snp;
   bool subset_l0_snps_gmat = false;
   Eigen::ArrayXi nspns_picked_block, nspns_picked, indices_gmat_keep;
+  double profile_eigensolve_ms = 0;
 };
 
 struct ridgel1 {
@@ -125,4 +126,3 @@ void check_l0(int const&,int const&,struct param*,struct ridgel1*,struct phenodt
 
 uint64 getSize(std::string const& fname);
 #endif
-

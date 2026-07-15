@@ -107,6 +107,7 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/Regenie.cpp
   ${CMAKE_SOURCE_DIR}/src/SKAT.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/MultiTrait_Tests.cpp
   ${CMAKE_SOURCE_DIR}/src/MCC.cpp

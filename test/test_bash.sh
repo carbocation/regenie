@@ -73,6 +73,7 @@ basecmd="--step 1 \
 rgcmd="$basecmd \
   --lowmem \
   --lowmem-prefix tmp_rg \
+  --step1-profile \
   --out ${mntpt}test/fit_bin_out"
 
 # run regenie
@@ -86,6 +87,10 @@ if [ ! -f "${REGENIE_PATH}test/fit_bin_out.log" ] || \
   print_custom_err "$fail_msg"
 elif [ "`grep \"0.4504\" ${REGENIE_PATH}test/fit_bin_out.log | grep \"min value\"`" = "" ]; then
   print_custom_err "$fail_msg"
+elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "9" ]; then
+  print_custom_err "Step 1 profiling output is incomplete."
+elif ! grep -q '^STEP1_PROFILE version=1 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 profiling header is missing."
 fi
 
 #### Run step 1 splitting across jobs for level 0
@@ -469,4 +474,3 @@ fi
 echo "SUCCESS: REGENIE build passed the tests!"
 # file cleanup
 rm -f ${REGENIE_PATH}test/fit_bin_* ${REGENIE_PATH}test/test_bin_out* ${REGENIE_PATH}test/test_out* ${REGENIE_PATH}test/tmp[12].txt
-
