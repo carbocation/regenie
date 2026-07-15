@@ -27,6 +27,7 @@
 #include "Step1_Compute.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 
 #ifdef WITH_CUDA
@@ -42,6 +43,39 @@ double elapsed_ms(const ComputeClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ComputeClock::now() - start).count();
 }
 
+}
+
+bool Step1ComputeBackend::preprocess_genotypes(
+  Eigen::MatrixXd& genotypes,
+  const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+  const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+  double degrees_of_freedom,
+  double minimum_scale,
+  const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+  Eigen::VectorXd& row_scales,
+  Step1ComputeTimings* timings) {
+
+  (void)timings;
+  if(genotypes.cols() != covariates.rows() ||
+     genotypes.cols() != sample_weights.size() ||
+     (row_multipliers.size() != 0 &&
+      row_multipliers.size() != genotypes.rows()))
+    throw std::invalid_argument(
+      "Step 1 genotype preprocessing received incompatible dimensions");
+  if(!std::isfinite(degrees_of_freedom) || degrees_of_freedom <= 0)
+    throw std::invalid_argument(
+      "Step 1 genotype preprocessing requires positive degrees of freedom");
+  if(!std::isfinite(minimum_scale) || minimum_scale < 0)
+    throw std::invalid_argument(
+      "Step 1 genotype preprocessing requires a non-negative minimum scale");
+  if((sample_weights.array() < 0).any() ||
+     (row_multipliers.array() < 0).any() ||
+     !sample_weights.allFinite() || !covariates.allFinite() ||
+     !row_multipliers.allFinite())
+    throw std::invalid_argument(
+      "Step 1 genotype preprocessing requires finite, non-negative weights and multipliers");
+  row_scales.resize(genotypes.rows());
+  return false;
 }
 
 void Step1ComputeBackend::diagonal_penalty_predict(

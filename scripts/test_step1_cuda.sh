@@ -12,7 +12,12 @@ benchmark_samples="${BENCHMARK_SAMPLES:-20000}"
 benchmark_phenotypes="${BENCHMARK_PHENOTYPES:-10}"
 benchmark_repeats="${BENCHMARK_REPEATS:-3}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
+resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
 validation_dir="${build_dir}/a100-validation"
+if [[ ! "${resident_mb}" =~ ^[0-9]+$ ]]; then
+  echo "resident_mb must be a non-negative integer (received '${resident_mb}')" >&2
+  exit 2
+fi
 
 run_with_memory_log() {
   local label="$1"
@@ -62,6 +67,7 @@ run_with_memory_log() {
 }
 
 nvcc --version
+export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then
@@ -77,7 +83,25 @@ cmake --build "${build_dir}" --target regenie step1_compute_test -j "${jobs}"
 mkdir -p "${validation_dir}"
 
 "${build_dir}/step1_compute_test" --backend cpu
-"${build_dir}/step1_compute_test" --backend cuda --device "${device}"
+cuda_output="$("${build_dir}/step1_compute_test" --backend cuda --device "${device}")"
+printf '%s\n' "${cuda_output}"
+grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${cuda_output}"
+if (( resident_mb > 0 )); then
+  grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=1 .* status=PASS$' \
+    <<<"${cuda_output}"
+else
+  grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=0 .* status=PASS$' \
+    <<<"${cuda_output}"
+fi
+
+if (( resident_mb > 0 )); then
+  fallback_output="$(REGENIE_CUDA_RESIDENT_MB=0 \
+    "${build_dir}/step1_compute_test" --backend cuda --device "${device}")"
+  printf '%s\n' "${fallback_output}"
+  grep -q '^STEP1_BACKEND_TEST case=genotype_preprocessing backend_processed=0 .* status=PASS$' \
+    <<<"${fallback_output}"
+  grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${fallback_output}"
+fi
 auto_output="$("${build_dir}/step1_compute_test" --backend auto --device "${device}")"
 printf '%s\n' "${auto_output}"
 grep -q '^STEP1_BACKEND_TEST backend=cuda status=PASS$' <<<"${auto_output}"
@@ -183,7 +207,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=3 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=4 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
 
   shopt -s nullglob
   local cpu_loco_files=("${cpu_prefix}"_*.loco)
