@@ -91,12 +91,16 @@ elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" !
   print_custom_err "Step 1 profiling output is incomplete."
 elif ! grep -q '^STEP1_PROFILE version=9 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 profiling header is missing."
-elif [ "`grep -c '^STEP1_PROFILE scope=' ${REGENIE_PATH}test/fit_bin_out.log`" != "5" ]; then
-  print_custom_err "Step 1 profiling scope output is incomplete."
+# Scope records are path-dependent; require the scopes exercised by this
+# LOOCV regression instead of assuming every optional scope is present.
+elif ! grep -q '^STEP1_PROFILE scope=genotype_preprocess ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 genotype preprocessing profiling is missing."
+elif ! grep -q '^STEP1_PROFILE scope=cv_matrices ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 CV matrix profiling is missing."
+elif ! grep -q '^STEP1_PROFILE scope=level0_ridge ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 Level 0 ridge profiling is missing."
 elif ! grep -q '^STEP1_PROFILE scope=prediction_output ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 prediction output profiling is missing."
-elif ! grep -q '^STEP1_PROFILE scope=grouped_prediction ' ${REGENIE_PATH}test/fit_bin_out.log; then
-  print_custom_err "Step 1 grouped prediction profiling is missing."
 elif ! grep -q '^STEP1_PROFILE_FINAL version=1 backend=cpu ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 final profiling output is missing."
 fi
