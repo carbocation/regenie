@@ -172,6 +172,38 @@ fi
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
+# saddlepoint approximation
+rgcmd="--step 2 \
+  --bgen ${mntpt}example/example.bgen \
+  --covarFile ${mntpt}example/covariates.txt${fsuf} \
+  --phenoFile ${mntpt}example/phenotype_bin.txt${fsuf} \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --bt \
+  --spa \
+  --pThresh 0.01 \
+  --pred ${mntpt}test/fit_bin_out_pred.list \
+  $arg_gz \
+  --out ${mntpt}test/test_bin_out_spa"
+
+# run regenie
+./$regenie_bin $rgcmd
+
+if [ -f ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie.gz ]; then
+  ( zcat < ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie
+fi
+
+if [ "`cat ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie | wc -l`" != "1001" ]; then
+  print_err
+elif ! grep -Eq '^Number of tests with SPA correction : [1-9][0-9]*$' ${REGENIE_PATH}test/test_bin_out_spa.log; then
+  print_err
+elif ! grep -Eq '^Number of failed tests : \(0/[1-9][0-9]*\)$' ${REGENIE_PATH}test/test_bin_out_spa.log; then
+  print_err
+fi
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
 # interaction tests
 rgcmd="--step 2 \
   --bed ${mntpt}example/example \
@@ -469,4 +501,3 @@ fi
 echo "SUCCESS: REGENIE build passed the tests!"
 # file cleanup
 rm -f ${REGENIE_PATH}test/fit_bin_* ${REGENIE_PATH}test/test_bin_out* ${REGENIE_PATH}test/test_out* ${REGENIE_PATH}test/tmp[12].txt
-
