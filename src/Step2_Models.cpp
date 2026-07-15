@@ -56,8 +56,8 @@ bool cox_firth_score_warm_start_enabled() {
 
 bool cox_firth_direct_reduced_fallback_enabled() {
   // The historical first pass consistently exhausts its line search before
-  // retrying with these conservative settings. Keep an escape hatch for
-  // matched validation while avoiding that failed pass by default.
+  // retrying with strict convergence. Start there from the shared null fit,
+  // while retaining a matched-validation escape and a conservative retry.
   const char* value =
     std::getenv("REGENIE_COX_FIRTH_DIRECT_REDUCED_FALLBACK");
   return value == nullptr || std::string(value) != "0";
@@ -1007,6 +1007,7 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   col_incl = Xmat.cols();
   beta0 = VectorXd::Zero(col_incl);
   beta0.head(col_incl - 1) = fest->beta_null_firth.col(ph);
+  const VectorXd reduced_initial_beta = beta0;
 
   // null model
   cox_firth cox_firth_null;
@@ -1017,7 +1018,7 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   const double reduced_stephalf_tolerance = direct_reduced_fallback ?
     0 : params->numtol_cox_stephalf;
   const double reduced_max_step = direct_reduced_fallback ?
-    cox_firth_direct_reduced_max_step(params->maxstep_null / 5.0) :
+    cox_firth_direct_reduced_max_step(params->maxstep_null) :
     params->maxstep_null;
   const double reduced_fallback_max_step = params->maxstep_null / 5.0;
   if(params->profile_step2)
@@ -1037,7 +1038,8 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
       ++dt_thr->correction_profile.cox_firth_fallbacks;
       ++dt_thr->correction_profile.cox_firth_reduced_fallbacks;
     }
-    if(cox_firth_null.beta.allFinite()) beta0 = cox_firth_null.beta;
+    if(direct_reduced_fallback) beta0 = reduced_initial_beta;
+    else if(cox_firth_null.beta.allFinite()) beta0 = cox_firth_null.beta;
     cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, reduced_fallback_max_step, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2)
