@@ -107,6 +107,8 @@ struct Step2CorrectionProfile {
   uint64_t spa_failures = 0;
   uint64_t spa_fast_tests = 0;
   uint64_t spa_sparse_tests = 0;
+  uint64_t spa_fused_cgf_tests = 0;
+  uint64_t spa_fused_cgf_evaluations = 0;
   uint64_t spa_root_iterations = 0;
   double spa_thread_ms = 0;
   uint64_t logistic_firth_tests = 0;

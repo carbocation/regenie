@@ -212,7 +212,7 @@ fi
 
 if [ "`cat ${REGENIE_PATH}test/test_bin_out_spa_profile_Y1.regenie | wc -l`" != "1001" ]; then
   print_err
-elif ! grep -q '^STEP2_PROFILE scope=corrections tests=20 failures=0 .*spa_tests=20 spa_failures=0 ' ${REGENIE_PATH}test/test_bin_out_spa_profile.log; then
+elif ! grep -q '^STEP2_PROFILE scope=corrections tests=20 failures=0 .*spa_tests=20 spa_failures=0 .*spa_fused_cgf_tests=20 spa_fused_cgf_evaluations=[1-9][0-9]* ' ${REGENIE_PATH}test/test_bin_out_spa_profile.log; then
   print_custom_err "Step 2 SPA correction profile is missing."
 fi
 

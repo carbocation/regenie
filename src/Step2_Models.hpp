@@ -42,8 +42,10 @@ struct f_ests {
 struct spa_data {
 
   Eigen::ArrayXd Gmod;
+  Eigen::ArrayXd exponent;
   double val_a, val_b, val_c, val_d;
-  bool pos_score, fastSPA;
+  double root_k2;
+  bool pos_score, fastSPA, fused_cgf;
 
 };
 
@@ -89,8 +91,8 @@ void fit_firth_cox_snp_fast(int const&, int const&, int const&, struct param con
 
 // spa (multithreading in openmp)
 void run_SPA_test(bool&,int const&,data_thread*,const Eigen::Ref<const ArrayXb>&,struct ests const&,struct param const&);
-void run_SPA_test_snp(double&,double&,const double&,const double&,bool const&,SpVec const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,bool&,const double&,const double&,const double&,const double&,uint64_t* = nullptr);
-double solve_K1_snp(const double&,const double&,SpVec const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,struct spa_data&,const Eigen::Ref<const ArrayXb>&,const double&,const int&,const double&,uint64_t* = nullptr);
+void run_SPA_test_snp(double&,double&,const double&,const double&,bool const&,SpVec const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,bool&,const double&,const double&,const double&,const double&,uint64_t* = nullptr,uint64_t* = nullptr);
+double solve_K1_snp(const double&,const double&,SpVec const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,struct spa_data&,const Eigen::Ref<const ArrayXb>&,const double&,const int&,const double&,uint64_t* = nullptr,uint64_t* = nullptr);
 double compute_K_snp(const double&,const double&,const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&);
 double compute_K1_snp(const double&,const double&,const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&);
 double compute_K2_snp(const double&,const double&,const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&);

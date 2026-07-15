@@ -400,6 +400,10 @@ void Data::print_step2_profile() {
     correction_profile.spa_failures += thread_profile.spa_failures;
     correction_profile.spa_fast_tests += thread_profile.spa_fast_tests;
     correction_profile.spa_sparse_tests += thread_profile.spa_sparse_tests;
+    correction_profile.spa_fused_cgf_tests +=
+      thread_profile.spa_fused_cgf_tests;
+    correction_profile.spa_fused_cgf_evaluations +=
+      thread_profile.spa_fused_cgf_evaluations;
     correction_profile.spa_root_iterations +=
       thread_profile.spa_root_iterations;
     correction_profile.spa_thread_ms += thread_profile.spa_thread_ms;
@@ -676,6 +680,10 @@ void Data::print_step2_profile() {
         << " spa_failures=" << correction_profile.spa_failures
         << " spa_fast_tests=" << correction_profile.spa_fast_tests
         << " spa_sparse_tests=" << correction_profile.spa_sparse_tests
+        << " spa_fused_cgf_tests=" <<
+          correction_profile.spa_fused_cgf_tests
+        << " spa_fused_cgf_evaluations=" <<
+          correction_profile.spa_fused_cgf_evaluations
         << " spa_root_iterations=" <<
           correction_profile.spa_root_iterations
         << " spa_thread_ms=" << correction_profile.spa_thread_ms
