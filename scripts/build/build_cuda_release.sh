@@ -218,44 +218,50 @@ fi
 
 deps_dir="${XDG_CACHE_HOME:-$HOME/.cache}/regenie-build-deps"
 bgen_compatibility_patch=0
-if [[ -z "${BGEN_PATH:-}" ]]; then
-  for candidate in "${deps_dir}/v1.1.7" "${HOME}/src/v1.1.7"; do
-    if [[ -f "${candidate}/build/libbgen.a" ]]; then
-      BGEN_PATH="${candidate}"
-      break
-    fi
-  done
-fi
+bgen_source_sha256="unverified-external"
+bgen_provenance="provided"
 if [[ -z "${BGEN_PATH:-}" ]]; then
   BGEN_PATH="${deps_dir}/v1.1.7"
   bgen_archive="${deps_dir}/v1.1.7.tgz"
+  bgen_url="https://enkre.net/cgi-bin/code/bgen/tarball/release/v1.1.7"
+  bgen_expected_sha256="6476b077af6c8e98e85fd7e09f58cb3fdf143ff91850c984248fd4dc2d74a8c3"
+  bgen_stamp="${BGEN_PATH}/build/.regenie-${bgen_expected_sha256}-streampos-v1"
+  bgen_source_sha256="${bgen_expected_sha256}"
   mkdir -p "${deps_dir}"
-  if [[ ! -f "${BGEN_PATH}/build/libbgen.a" ]]; then
+  if [[ ! -f "${BGEN_PATH}/build/libbgen.a" || ! -f "${bgen_stamp}" ]]; then
     if [[ ! -f "${bgen_archive}" ]]; then
       if command -v curl >/dev/null 2>&1; then
         curl --fail --location --retry 3 --output "${bgen_archive}" \
-          http://code.enkre.net/bgen/tarball/release/v1.1.7
+          "${bgen_url}"
       elif command -v wget >/dev/null 2>&1; then
         wget --output-document="${bgen_archive}" \
-          http://code.enkre.net/bgen/tarball/release/v1.1.7
+          "${bgen_url}"
       else
         die "curl or wget is required to download BGEN"
       fi
     fi
+    bgen_actual_sha256="$("${sha256_command[@]}" "${bgen_archive}" | awk '{print $1}')"
+    [[ "${bgen_actual_sha256}" == "${bgen_expected_sha256}" ]] ||
+      die "BGEN archive checksum mismatch: expected ${bgen_expected_sha256}, received ${bgen_actual_sha256}"
+    cmake -E remove_directory "${BGEN_PATH}"
     tar -xzf "${bgen_archive}" -C "${deps_dir}"
     bgen_view="${BGEN_PATH}/src/View.cpp"
-    if [[ -f "${bgen_view}" ]] &&
-       grep -q 'std::ios::streampos origin' "${bgen_view}"; then
-      # BGEN 1.1.7 predates current libstdc++ releases. streampos belongs to
-      # namespace std, not the std::ios class; correct only that exact token.
-      sed -i 's/std::ios::streampos origin/std::streampos origin/' "${bgen_view}"
-      bgen_compatibility_patch=1
-    fi
+    [[ -f "${bgen_view}" ]] || die "verified BGEN archive has no src/View.cpp"
+    grep -q 'std::ios::streampos origin' "${bgen_view}" ||
+      die "verified BGEN source does not contain the expected compatibility token"
+    # BGEN 1.1.7 predates current libstdc++ releases. streampos belongs to
+    # namespace std, not the std::ios class; correct only that exact token.
+    sed -i 's/std::ios::streampos origin/std::streampos origin/' "${bgen_view}"
+    bgen_compatibility_patch=1
     (
       cd "${BGEN_PATH}"
       python3 waf configure
       python3 waf
     )
+    cmake -E touch "${bgen_stamp}"
+    bgen_provenance="verified-fresh-build"
+  else
+    bgen_provenance="verified-managed-cache"
   fi
 fi
 export BGEN_PATH
@@ -293,6 +299,8 @@ echo "CUDA_RELEASE_BUILD_CPU architecture=${cpu_architecture} tune=${cpu_tune}"
 echo "CUDA_RELEASE_BUILD_TOOLKIT=$(nvcc --version | tail -n 1)"
 echo "CUDA_RELEASE_BUILD_COMPILER=$(g++ --version | head -n 1)"
 echo "CUDA_RELEASE_BUILD_BGEN=${BGEN_PATH}"
+echo "CUDA_RELEASE_BUILD_BGEN_PROVENANCE=${bgen_provenance}"
+echo "CUDA_RELEASE_BUILD_BGEN_SOURCE_SHA256=${bgen_source_sha256}"
 echo "CUDA_RELEASE_BUILD_BGEN_COMPATIBILITY_PATCH=${bgen_compatibility_patch}"
 echo "CUDA_RELEASE_BUILD_MKL=${MKLROOT}"
 
@@ -383,6 +391,9 @@ cp "${repo_root}/LICENSE" "${repo_root}/README.md" "${repo_root}/VERSION" \
   printf 'CMAKE=%s\n' "$(cmake --version | head -n 1)"
   printf 'MKLROOT=%s\n' "${MKLROOT}"
   printf 'BGEN_PATH=%s\n' "${BGEN_PATH}"
+  printf 'BGEN_PROVENANCE=%s\n' "${bgen_provenance}"
+  printf 'BGEN_SOURCE_SHA256=%s\n' "${bgen_source_sha256}"
+  printf 'BGEN_COMPATIBILITY_PATCH=%s\n' "${bgen_compatibility_patch}"
   printf 'SOURCE_DATE_EPOCH=%s\n' "${source_date_epoch}"
 } > "${stage_dir}/BUILD-METADATA.txt"
 

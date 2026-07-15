@@ -79,7 +79,10 @@ bgen_dir="$deps_dir/v1.1.7"
 mkdir -p "$deps_dir"
 if [ ! -f "$bgen_dir/build/libbgen.a" ]; then
   wget -O "$deps_dir/v1.1.7.tgz" \
-    http://code.enkre.net/bgen/tarball/release/v1.1.7
+    https://enkre.net/cgi-bin/code/bgen/tarball/release/v1.1.7
+  echo \
+    "6476b077af6c8e98e85fd7e09f58cb3fdf143ff91850c984248fd4dc2d74a8c3  $deps_dir/v1.1.7.tgz" \
+    | sha256sum --check
   tar -xzf "$deps_dir/v1.1.7.tgz" -C "$deps_dir"
   sed -i \
     's/std::ios::streampos origin/std::streampos origin/' \
@@ -181,7 +184,10 @@ bgen_dir="$deps_dir/v1.1.7"
 mkdir -p "$deps_dir"
 if [ ! -f "$bgen_dir/build/libbgen.a" ]; then
   wget -O "$deps_dir/v1.1.7.tgz" \
-    http://code.enkre.net/bgen/tarball/release/v1.1.7
+    https://enkre.net/cgi-bin/code/bgen/tarball/release/v1.1.7
+  echo \
+    "6476b077af6c8e98e85fd7e09f58cb3fdf143ff91850c984248fd4dc2d74a8c3  $deps_dir/v1.1.7.tgz" \
+    | sha256sum --check
   tar -xzf "$deps_dir/v1.1.7.tgz" -C "$deps_dir"
   sed -i \
     's/std::ios::streampos origin/std::streampos origin/' \
