@@ -47,10 +47,8 @@ class cox_firth {
         Eigen::VectorXd _cumulative_hazard;
         Eigen::VectorXd _first_moment;
         Eigen::MatrixXd _second_moment;
+        std::vector<double> _third_moment;
         std::vector<Eigen::MatrixXd> _firth_der;
-        Eigen::MatrixXd _XtW;
-        Eigen::MatrixXd _solved_XtW;
-        Eigen::VectorXd _leverage;
 };
 
 #endif
