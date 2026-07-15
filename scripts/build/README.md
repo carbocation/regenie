@@ -1,8 +1,15 @@
 # Release build scripts
 
-`build_cuda_release.sh` builds a CUDA-enabled REGENIE executable with static
-oneMKL and GNU C++ runtime linkage, validates it, and creates a versioned
-tarball plus SHA-256 checksum under `dist/`.
+The sibling release builders produce performance-oriented Linux x86-64
+artifacts with static oneMKL and GNU C++ runtime linkage:
+
+- `build_cpu_release.sh` creates a CPU-only binary that has no CUDA runtime
+  dependency.
+- `build_cuda_release.sh` creates a CUDA-enabled binary containing both the
+  CUDA Step 1 backend and the CPU fallback backend.
+
+Both builders validate the executable and create a versioned tarball plus
+SHA-256 checksum under `dist/`.
 
 Artifact names contain the source commit, and the builder refuses tracked source
 changes that have not been committed. Untracked compiler products are allowed so
@@ -15,6 +22,33 @@ applies the narrow `std::ios::streampos` to `std::streampos` compatibility
 correction needed by current libstdc++ releases before invoking Waf. Supplying
 `BGEN_PATH` explicitly is treated as an unverified external dependency and is
 recorded as such in the package metadata.
+
+## CPU-only release
+
+The CPU builder defaults to `-march=x86-64-v3 -mtune=generic`, statically links
+oneMKL, and verifies that the resulting executable has no CUDA runtime
+dependencies. Its validation includes CTest, the Step 1 CPU backend test, and
+the repository regression suite running against an isolated copy of the
+committed fixtures:
+
+```bash
+# Portable optimized binary for modern x86-64 hosts.
+scripts/build/build_cpu_release.sh --clean
+
+# Machine-specific optimization; do not redistribute to dissimilar CPUs.
+scripts/build/build_cpu_release.sh --native-cpu --clean
+
+# Select a different portable CPU floor explicitly.
+scripts/build/build_cpu_release.sh \
+  --cpu-architecture x86-64-v2 \
+  --cpu-tune generic \
+  --clean
+```
+
+Run `scripts/build/build_cpu_release.sh --help` for dependency expectations,
+environment overrides, and validation controls.
+
+## CUDA release
 
 The default `datacenter` profile produces one CUDA fat binary for these compute
 capabilities:

@@ -47,6 +47,12 @@ This example installs the build dependencies and oneMKL, fetches this fork and
 the required BGEN library, builds a CPU-only binary, and installs it for the
 current user:
 
+For a redistributable CPU-only binary, use
+[`scripts/build/build_cpu_release.sh`](scripts/build/README.md) instead. The
+release builder defaults to the portable `x86-64-v3` CPU floor, runs the unit
+and regression tests, and packages the executable with build metadata and a
+SHA-256 checksum.
+
 ```bash
 set -eo pipefail
 export PATH="$HOME/.local/bin:$PATH"
