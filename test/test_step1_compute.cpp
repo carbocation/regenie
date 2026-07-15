@@ -22,10 +22,14 @@ struct Options {
   std::string backend = "cpu";
   int device = 0;
   bool benchmark = false;
+  bool level1_benchmark = false;
   int blocks = 512;
   int samples = 20000;
   int phenotypes = 10;
+  int folds = 5;
+  int ridge_parameters = 5;
   int repeats = 3;
+  int warmup_repeats = 1;
 };
 
 int parse_positive(const char* value, const char* option, bool allow_zero = false) {
@@ -41,6 +45,7 @@ Options parse_options(int argc, char** argv) {
   for(int i = 1; i < argc; ++i) {
     const std::string argument(argv[i]);
     if(argument == "--benchmark") options.benchmark = true;
+    else if(argument == "--level1-benchmark") options.level1_benchmark = true;
     else if(argument == "--backend" && i + 1 < argc) options.backend = argv[++i];
     else if(argument == "--device" && i + 1 < argc)
       options.device = parse_positive(argv[++i], "--device", true);
@@ -50,11 +55,21 @@ Options parse_options(int argc, char** argv) {
       options.samples = parse_positive(argv[++i], "--samples");
     else if(argument == "--phenotypes" && i + 1 < argc)
       options.phenotypes = parse_positive(argv[++i], "--phenotypes");
+    else if(argument == "--folds" && i + 1 < argc)
+      options.folds = parse_positive(argv[++i], "--folds");
+    else if(argument == "--ridge-parameters" && i + 1 < argc)
+      options.ridge_parameters = parse_positive(
+        argv[++i], "--ridge-parameters");
     else if(argument == "--repeats" && i + 1 < argc)
       options.repeats = parse_positive(argv[++i], "--repeats");
+    else if(argument == "--warmup-repeats" && i + 1 < argc)
+      options.warmup_repeats = parse_positive(
+        argv[++i], "--warmup-repeats");
     else
       throw std::runtime_error("unknown or incomplete option: " + argument);
   }
+  if(options.folds > options.samples)
+    throw std::runtime_error("--folds must not exceed --samples");
   return options;
 }
 
@@ -296,6 +311,9 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.packed_hardcall_host_prepare_ms;
   destination.packed_hardcall_backend_wall_ms +=
     source.packed_hardcall_backend_wall_ms;
+  destination.design_upload_count += source.design_upload_count;
+  destination.design_upload_bytes += source.design_upload_bytes;
+  destination.host_materialization_ms += source.host_materialization_ms;
 }
 
 void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
@@ -1778,7 +1796,114 @@ void run_nonlinear_benchmark(Step1ComputeBackend& backend,
             << " crossproduct_ms=" << totals.crossproduct_ms / divisor
             << " gram_ms=" << totals.gram_ms / divisor
             << " ridge_ms=" << totals.ridge_ms / divisor
-            << " download_ms=" << totals.download_ms / divisor << "\n";
+            << " download_ms=" << totals.download_ms / divisor
+            << " design_uploads=" << totals.design_upload_count / divisor
+            << " design_upload_bytes=" << totals.design_upload_bytes / divisor
+            << " host_materialization_ms=" <<
+              totals.host_materialization_ms / divisor << "\n";
+}
+
+void run_level1_benchmark(Step1ComputeBackend& backend,
+  const Options& options) {
+
+  std::vector<Eigen::MatrixXd> fold_designs;
+  std::vector<Eigen::MatrixXd> fold_outcomes;
+  fold_designs.reserve(options.folds);
+  fold_outcomes.reserve(options.folds);
+  int assigned_samples = 0;
+  for(int fold = 0; fold < options.folds; ++fold) {
+    const int fold_samples = options.samples / options.folds +
+      (fold < options.samples % options.folds ? 1 : 0);
+    fold_designs.push_back(deterministic_matrix(
+      fold_samples, options.blocks, 0.19 + 0.07 * fold));
+    fold_outcomes.push_back(deterministic_matrix(
+      fold_samples, options.phenotypes, -0.31 - 0.05 * fold));
+    assigned_samples += fold_samples;
+  }
+  if(assigned_samples != options.samples)
+    throw std::runtime_error("Level 1 benchmark fold construction failed");
+
+  const Eigen::VectorXd ridge_parameters = Eigen::VectorXd::LinSpaced(
+    options.ridge_parameters, 0.01, 1.0);
+  const Eigen::MatrixXd no_outcomes(0, 0);
+  std::vector<Eigen::MatrixXd> fold_grams(options.folds);
+  std::vector<Eigen::MatrixXd> fold_crossproducts(options.folds);
+  Eigen::MatrixXd gram_sum, crossproduct_sum, training_gram,
+    training_crossproduct, predictions, coefficients;
+  Step1ComputeTimings totals;
+  double wall_ms = 0;
+
+  const auto run_iteration = [&] (Step1ComputeTimings* timings) {
+    const Clock::time_point start = Clock::now();
+    for(int phenotype = 0; phenotype < options.phenotypes; ++phenotype) {
+      gram_sum.setZero(options.blocks, options.blocks);
+      crossproduct_sum.setZero(options.blocks, 1);
+      for(int fold = 0; fold < options.folds; ++fold) {
+        backend.compute_design_products(
+          fold_designs[fold], fold_outcomes[fold].col(phenotype),
+          fold_grams[fold], fold_crossproducts[fold], timings);
+        gram_sum += fold_grams[fold];
+        crossproduct_sum += fold_crossproducts[fold];
+      }
+      for(int fold = 0; fold < options.folds; ++fold) {
+        training_gram = gram_sum - fold_grams[fold];
+        training_crossproduct =
+          crossproduct_sum - fold_crossproducts[fold];
+        backend.factorize_ridge_system(
+          training_gram, training_crossproduct, timings);
+        backend.ridge_predict_factorized(
+          fold_designs[fold], false, ridge_parameters,
+          no_outcomes, false, predictions, coefficients, timings);
+      }
+    }
+    return std::chrono::duration<double, std::milli>(
+      Clock::now() - start).count();
+  };
+
+  double warmup_wall_ms = 0;
+  double first_warmup_wall_ms = 0;
+  for(int repeat = 0; repeat < options.warmup_repeats; ++repeat) {
+    Step1ComputeTimings ignored_timings;
+    const double iteration_wall_ms = run_iteration(&ignored_timings);
+    if(repeat == 0) first_warmup_wall_ms = iteration_wall_ms;
+    warmup_wall_ms += iteration_wall_ms;
+  }
+
+  for(int repeat = 0; repeat < options.repeats; ++repeat) {
+    Step1ComputeTimings timings;
+    wall_ms += run_iteration(&timings);
+    accumulate_timings(totals, timings);
+  }
+
+  const double divisor = options.repeats;
+  const double steady_wall_ms = wall_ms / divisor;
+  const double accounted_ms = total_timing_ms(totals) / divisor;
+  std::cout << "STEP1_BACKEND_BENCHMARK_LEVEL1 backend=" << backend.name()
+            << " features=" << options.blocks
+            << " samples=" << options.samples
+            << " phenotypes=" << options.phenotypes
+            << " folds=" << options.folds
+            << " ridge_parameters=" << options.ridge_parameters
+            << " warmup_repeats=" << options.warmup_repeats
+            << " first_warmup_wall_ms=" << first_warmup_wall_ms
+            << " mean_warmup_wall_ms=" <<
+              warmup_wall_ms / options.warmup_repeats
+            << " repeats=" << options.repeats
+            << " wall_ms=" << steady_wall_ms
+            << " steady_wall_ms=" << steady_wall_ms
+            << " accounted_ms=" << accounted_ms
+            << " unaccounted_ms=" << steady_wall_ms - accounted_ms
+            << " upload_ms=" << totals.upload_ms / divisor
+            << " crossproduct_ms=" << totals.crossproduct_ms / divisor
+            << " gram_ms=" << totals.gram_ms / divisor
+            << " eigensolve_ms=" << totals.eigensolve_ms / divisor
+            << " transform_ms=" << totals.transform_ms / divisor
+            << " ridge_ms=" << totals.ridge_ms / divisor
+            << " download_ms=" << totals.download_ms / divisor
+            << " design_uploads=" << totals.design_upload_count / divisor
+            << " design_upload_bytes=" << totals.design_upload_bytes / divisor
+            << " host_materialization_ms=" <<
+              totals.host_materialization_ms / divisor << "\n";
 }
 
 }
@@ -1795,6 +1920,8 @@ int main(int argc, char** argv) {
       run_benchmark(*backend, options);
       run_nonlinear_benchmark(*backend, options);
     }
+    if(options.level1_benchmark)
+      run_level1_benchmark(*backend, options);
     std::cout << "STEP1_BACKEND_TEST backend=" << backend->name() << " status=PASS\n";
     return 0;
   } catch(const std::exception& error) {

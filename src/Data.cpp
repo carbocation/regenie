@@ -1360,7 +1360,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=8 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=9 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -1524,6 +1524,23 @@ void Data::print_step1_final_profile() {
           step1_profile.output_ms -
           step1_profile.prediction_output_format_ms -
           step1_profile.prediction_output_write_ms)
+        << "\n";
+  }
+  const Step1GroupedPredictionProfile& grouped =
+    step1_profile.grouped_prediction;
+  if(grouped.calls > 0) {
+    out << "STEP1_PROFILE scope=grouped_prediction"
+        << " calls=" << grouped.calls
+        << " design_uploads=" << grouped.design_uploads
+        << " design_upload_bytes=" << grouped.design_upload_bytes
+        << " wall_ms=" << grouped.wall_ms
+        << " upload_ms=" << grouped.upload_ms
+        << " compute_ms=" << grouped.compute_ms
+        << " download_ms=" << grouped.download_ms
+        << " host_materialization_ms=" << grouped.host_materialization_ms
+        << " unaccounted_ms=" << std::max(0.0,
+          grouped.wall_ms - grouped.upload_ms - grouped.compute_ms -
+          grouped.download_ms - grouped.host_materialization_ms)
         << "\n";
   }
   sout << out.str();
@@ -1948,6 +1965,34 @@ std::string get_fullpath(std::string fname){
 
 }
 
+void Data::step1_grouped_predict(
+  const Ref<const MatrixXd>& design,
+  const Ref<const VectorXd>& coefficients,
+  const Ref<const VectorXi>& group_offsets,
+  const Ref<const VectorXi>& group_sizes,
+  MatrixXd& grouped_predictions) {
+
+  Step1ComputeTimings timings;
+  ProfileClock::time_point wall_start;
+  if(params.profile_step1) wall_start = ProfileClock::now();
+  step1_compute_backend->grouped_predict(
+    design, coefficients, group_offsets, group_sizes, grouped_predictions,
+    params.profile_step1 ? &timings : nullptr);
+  if(!params.profile_step1) return;
+
+  Step1GroupedPredictionProfile& profile =
+    step1_profile.grouped_prediction;
+  profile.calls++;
+  profile.design_uploads += timings.design_upload_count;
+  profile.design_upload_bytes += timings.design_upload_bytes;
+  profile.wall_ms += elapsed_ms(wall_start);
+  profile.upload_ms += timings.upload_ms;
+  profile.compute_ms += timings.crossproduct_ms + timings.gram_ms +
+    timings.eigensolve_ms + timings.transform_ms + timings.ridge_ms;
+  profile.download_ms += timings.download_ms;
+  profile.host_materialization_ms += timings.host_materialization_ms;
+}
+
 void Data::make_predictions(int const& ph, int const& val) {
 
   sout << "  * making predictions..." << flush;
@@ -2007,7 +2052,7 @@ void Data::make_predictions(int const& ph, int const& val) {
   for(int i = 0; i < params.cv_folds; ++i ) {
     const VectorXd fold_coefficients = params.within_sample_l0 ?
       beta_l1.col(0) : l1_ests.beta_hat_level_1[ph][i].col(val);
-    step1_compute_backend->grouped_predict(
+    step1_grouped_predict(
       l1_ests.test_mat[ph_eff][i], fold_coefficients,
       group_offsets, group_sizes, grouped_predictions);
     predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
@@ -2068,7 +2113,7 @@ void Data::make_predictions_loocv(int const& ph, int const& val) {
   VectorXi full_group_offset(1), full_group_size(1);
   full_group_offset(0) = 0;
   full_group_size(0) = bs_l1;
-  step1_compute_backend->grouped_predict(
+  step1_grouped_predict(
     l1_ests.test_mat_conc[ph_eff], bvec,
     full_group_offset, full_group_size, grouped_predictions);
   yres = (Yvec - grouped_predictions.col(0)).array();
@@ -2144,7 +2189,7 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
       XtWZ = MatrixXd::Zero(bs_l1, 1);
 
       for(int i = 0; i < params.cv_folds; ++i ) {
-        step1_compute_backend->grouped_predict(
+        step1_grouped_predict(
           l1_ests.test_mat[ph_eff][i], betaold.col(0),
           full_group_offset, full_group_size, linear_prediction);
         etavec = l1_ests.test_offset[ph][i].array() +
@@ -2168,7 +2213,7 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
       // compute score
       score = ArrayXd::Zero(betanew.rows());
       for(int i = 0; i < params.cv_folds; ++i ) {
-        step1_compute_backend->grouped_predict(
+        step1_grouped_predict(
           l1_ests.test_mat[ph_eff][i], betanew.col(0),
           full_group_offset, full_group_size, linear_prediction);
         etavec = l1_ests.test_offset[ph][i].array() +
@@ -2201,7 +2246,7 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
   for(int i = 0; i < params.cv_folds; ++i ) {
     if(!params.within_sample_l0)
       betanew = l1_ests.beta_hat_level_1[ph][i].col(val);
-    step1_compute_backend->grouped_predict(
+    step1_grouped_predict(
       l1_ests.test_mat[ph_eff][i], betanew.col(0),
       group_offsets, group_sizes, grouped_predictions);
     predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
@@ -2252,7 +2297,7 @@ void Data::make_predictions_binary_loocv_full(int const& ph, int const& val) {
     params.n_ridge_l0, l1_ests.chrom_map_ndiff,
     group_offsets, group_sizes, group_chromosomes);
   MatrixXd grouped_predictions;
-  step1_compute_backend->grouped_predict(
+  step1_grouped_predict(
     l1_ests.test_mat_conc[ph_eff], beta.matrix(),
     group_offsets, group_sizes, grouped_predictions);
   predictions[0].leftCols(group_offsets.size()) = grouped_predictions;
@@ -2379,7 +2424,7 @@ void Data::make_predictions_count(int const& ph, int const& val) {
   int cum_size_folds = 0;
   for(int i = 0; i < params.cv_folds; ++i ) {
     betanew = l1_ests.beta_hat_level_1[ph][i].col(val);
-    step1_compute_backend->grouped_predict(
+    step1_grouped_predict(
       l1_ests.test_mat[ph_eff][i], betanew.col(0),
       group_offsets, group_sizes, grouped_predictions);
     predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
@@ -2498,7 +2543,7 @@ void Data::make_predictions_cox(int const& ph, int const& val) {
   int cum_size_folds = 0;
   for(int i = 0; i < params.cv_folds; ++i ) {
     const VectorXd beta = l1_ests.beta_hat_level_1[ph][i].col(val);
-    step1_compute_backend->grouped_predict(
+    step1_grouped_predict(
       l1_ests.test_mat_conc[ph_eff].middleRows(
         cum_size_folds, params.cv_sizes(i)),
       beta, group_offsets, group_sizes, grouped_predictions);

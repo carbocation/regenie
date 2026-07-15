@@ -89,12 +89,14 @@ elif [ "`grep \"0.4504\" ${REGENIE_PATH}test/fit_bin_out.log | grep \"min value\
   print_custom_err "$fail_msg"
 elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "11" ]; then
   print_custom_err "Step 1 profiling output is incomplete."
-elif ! grep -q '^STEP1_PROFILE version=8 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
+elif ! grep -q '^STEP1_PROFILE version=9 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 profiling header is missing."
-elif [ "`grep -c '^STEP1_PROFILE scope=' ${REGENIE_PATH}test/fit_bin_out.log`" != "4" ]; then
+elif [ "`grep -c '^STEP1_PROFILE scope=' ${REGENIE_PATH}test/fit_bin_out.log`" != "5" ]; then
   print_custom_err "Step 1 profiling scope output is incomplete."
 elif ! grep -q '^STEP1_PROFILE scope=prediction_output ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 prediction output profiling is missing."
+elif ! grep -q '^STEP1_PROFILE scope=grouped_prediction ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 grouped prediction profiling is missing."
 elif ! grep -q '^STEP1_PROFILE_FINAL version=1 backend=cpu ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 final profiling output is missing."
 fi

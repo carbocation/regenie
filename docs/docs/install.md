@@ -127,6 +127,12 @@ particular phenotype count. Set `REGENIE_CUDA_LEVEL0_FOLD_BATCH=0` to retain
 the sequential Cholesky implementation for a matched A/B comparison. The
 validation harness exposes this switch as `CUDA_LEVEL0_FOLD_BATCH`.
 
+Chromosome-grouped prediction uploads copy row slices directly from the
+column-major Level 1 design into bounded device buffers. This avoids building
+a full temporary host matrix for every prediction chunk. Set
+`REGENIE_CUDA_DIRECT_GROUPED_UPLOAD=0` to restore the materialized upload path
+for a matched A/B comparison.
+
 Large resident uploads use two reusable pinned host chunks so host packing can
 overlap transfer to the device. `REGENIE_CUDA_PINNED_STAGING_MB` controls the
 size of each chunk (64 MB by default); set it to `0` to restore direct pageable
