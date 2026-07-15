@@ -131,10 +131,14 @@ struct Step2CorrectionProfile {
   uint64_t cox_firth_reduced_step_halvings = 0;
   uint64_t cox_firth_reduced_line_search_exhaustions = 0;
   double cox_firth_reduced_max_step = 0;
+  double cox_firth_reduced_tolerance = 0;
+  double cox_firth_reduced_final_score_max = 0;
   uint64_t cox_firth_full_iterations = 0;
   uint64_t cox_firth_full_likelihood_evaluations = 0;
   uint64_t cox_firth_full_step_halvings = 0;
   uint64_t cox_firth_full_line_search_exhaustions = 0;
+  double cox_firth_full_tolerance = 0;
+  double cox_firth_full_final_score_max = 0;
   double cox_firth_final_score_max = 0;
   double cox_firth_thread_ms = 0;
 };

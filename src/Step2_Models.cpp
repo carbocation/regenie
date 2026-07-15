@@ -97,6 +97,26 @@ double cox_firth_direct_reduced_max_step(double default_value) {
     "REGENIE_COX_FIRTH_DIRECT_REDUCED_MAX_STEP", default_value);
 }
 
+double scaled_environment_tolerance(
+    const char* name, double default_value) {
+  const double scale = positive_environment_double(name, 1.0);
+  const double tolerance = default_value * scale;
+  return std::isfinite(tolerance) && tolerance > 0 ?
+    tolerance : default_value;
+}
+
+double cox_firth_reduced_tolerance(double default_value) {
+  // Keep this exact-Cox control separate from the shared null and full fit so
+  // convergence can be profiled without changing unrelated Cox paths.
+  return scaled_environment_tolerance(
+    "REGENIE_COX_FIRTH_REDUCED_TOLERANCE_SCALE", default_value);
+}
+
+double cox_firth_full_tolerance(double default_value) {
+  return scaled_environment_tolerance(
+    "REGENIE_COX_FIRTH_FULL_TOLERANCE_SCALE", default_value);
+}
+
 enum class CoxFirthProfilePhase {
   reduced,
   full
@@ -145,6 +165,10 @@ void add_cox_firth_profile(
     thread_data->correction_profile.
       cox_firth_reduced_line_search_exhaustions +=
         model.line_search_exhaustions;
+    thread_data->correction_profile.cox_firth_reduced_final_score_max =
+      std::max(
+        thread_data->correction_profile.cox_firth_reduced_final_score_max,
+        model.final_score_max);
   } else {
     thread_data->correction_profile.cox_firth_full_iterations +=
       model.iter;
@@ -156,6 +180,10 @@ void add_cox_firth_profile(
     thread_data->correction_profile.
       cox_firth_full_line_search_exhaustions +=
         model.line_search_exhaustions;
+    thread_data->correction_profile.cox_firth_full_final_score_max =
+      std::max(
+        thread_data->correction_profile.cox_firth_full_final_score_max,
+        model.final_score_max);
   }
 }
 
@@ -1020,12 +1048,23 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   const double reduced_max_step = direct_reduced_fallback ?
     cox_firth_direct_reduced_max_step(params->maxstep_null) :
     params->maxstep_null;
+  const double reduced_tolerance =
+    cox_firth_reduced_tolerance(params->numtol_cox);
+  const double full_tolerance =
+    cox_firth_full_tolerance(params->numtol_cox);
   const double reduced_fallback_max_step = params->maxstep_null / 5.0;
-  if(params->profile_step2)
+  if(params->profile_step2) {
     dt_thr->correction_profile.cox_firth_reduced_max_step = std::max(
       dt_thr->correction_profile.cox_firth_reduced_max_step,
       reduced_max_step);
-  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, reduced_iterations, params->niter_max_line_search, params->numtol_cox, reduced_stephalf_tolerance, params->numtol_beta_cox, reduced_max_step, !params->cox_nofirth, false, beta0);
+    dt_thr->correction_profile.cox_firth_reduced_tolerance = std::max(
+      dt_thr->correction_profile.cox_firth_reduced_tolerance,
+      reduced_tolerance);
+    dt_thr->correction_profile.cox_firth_full_tolerance = std::max(
+      dt_thr->correction_profile.cox_firth_full_tolerance,
+      full_tolerance);
+  }
+  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, reduced_iterations, params->niter_max_line_search, reduced_tolerance, reduced_stephalf_tolerance, params->numtol_beta_cox, reduced_max_step, !params->cox_nofirth, false, beta0);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   if(params->profile_step2)
     add_cox_firth_profile(
@@ -1040,7 +1079,7 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
     }
     if(direct_reduced_fallback) beta0 = reduced_initial_beta;
     else if(cox_firth_null.beta.allFinite()) beta0 = cox_firth_null.beta;
-    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, reduced_fallback_max_step, !params->cox_nofirth, false, beta0);
+    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, reduced_tolerance, 0, params->numtol_beta_cox, reduced_fallback_max_step, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2)
       add_cox_firth_profile(
@@ -1067,7 +1106,7 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
     }
   }
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, test_beta0);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, full_tolerance, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, test_beta0);
   cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   if(params->profile_step2)
     add_cox_firth_profile(
@@ -1080,7 +1119,7 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
     }
     VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
       cox_firth_test.beta : test_beta0;
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, full_tolerance, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2)
       add_cox_firth_profile(
