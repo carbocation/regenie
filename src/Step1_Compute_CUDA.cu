@@ -1032,10 +1032,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      const Eigen::Index streaming_columns = std::max<Eigen::Index>(
-        size, combination_count);
       const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
-        column_count, streaming_columns);
+        column_count, combination_count);
       ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
         ridge_parameters.size(),
         "cudaMalloc(resident ridge parameters)");
@@ -1124,14 +1122,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             prediction_events->record_stop_and_elapsed_ms();
 
         if(timings) transfer_start = ComputeClock::now();
-        for(int combination = 0; combination < combination_count;
-            ++combination)
-          check_cuda(cudaMemcpy(
-            predictions.col(combination).segment(start, count_index).data(),
-            d_predictions_ +
-              static_cast<Eigen::Index>(combination) * count,
-            count * sizeof(double), cudaMemcpyDeviceToHost),
-            "copy resident ridge prediction chunk from CUDA device");
+        check_cuda(cudaMemcpy2D(
+          predictions.data() + start,
+          static_cast<size_t>(predictions.outerStride()) * sizeof(double),
+          d_predictions_, static_cast<size_t>(count) * sizeof(double),
+          static_cast<size_t>(count) * sizeof(double),
+          combination_count, cudaMemcpyDeviceToHost),
+          "copy resident ridge prediction chunk from CUDA device");
         if(timings) timings->download_ms += elapsed_ms(transfer_start);
       }
     }
