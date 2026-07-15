@@ -72,17 +72,29 @@ bool cox_firth_direct_null_fallback_enabled() {
   return value == nullptr || std::string(value) != "0";
 }
 
-double cox_firth_direct_null_max_step(double default_value) {
-  // Keep --maxstep-null available to the ordinary Cox null fit while
-  // allowing the Firth optimizer's conservative step to be profiled alone.
-  const char* value =
-    std::getenv("REGENIE_COX_FIRTH_DIRECT_NULL_MAX_STEP");
+double positive_environment_double(
+    const char* name, double default_value) {
+  const char* value = std::getenv(name);
   if(value == nullptr) return default_value;
 
   char* end = nullptr;
   const double parsed = std::strtod(value, &end);
   return end != value && *end == '\0' && std::isfinite(parsed) && parsed > 0 ?
     parsed : default_value;
+}
+
+double cox_firth_direct_null_max_step(double default_value) {
+  // Keep --maxstep-null available to the ordinary Cox null fit while
+  // allowing the Firth optimizer's step to be profiled alone.
+  return positive_environment_double(
+    "REGENIE_COX_FIRTH_DIRECT_NULL_MAX_STEP", default_value);
+}
+
+double cox_firth_direct_reduced_max_step(double default_value) {
+  // The per-variant reduced fit shares --maxstep-null with the ordinary and
+  // shared null fits. Isolate it so exact-Cox tuning does not perturb either.
+  return positive_environment_double(
+    "REGENIE_COX_FIRTH_DIRECT_REDUCED_MAX_STEP", default_value);
 }
 
 enum class CoxFirthProfilePhase {
@@ -1005,20 +1017,28 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   const double reduced_stephalf_tolerance = direct_reduced_fallback ?
     0 : params->numtol_cox_stephalf;
   const double reduced_max_step = direct_reduced_fallback ?
-    params->maxstep_null / 5.0 : params->maxstep_null;
+    cox_firth_direct_reduced_max_step(params->maxstep_null / 5.0) :
+    params->maxstep_null;
+  const double reduced_fallback_max_step = params->maxstep_null / 5.0;
+  if(params->profile_step2)
+    dt_thr->correction_profile.cox_firth_reduced_max_step = std::max(
+      dt_thr->correction_profile.cox_firth_reduced_max_step,
+      reduced_max_step);
   cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, reduced_iterations, params->niter_max_line_search, params->numtol_cox, reduced_stephalf_tolerance, params->numtol_beta_cox, reduced_max_step, !params->cox_nofirth, false, beta0);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   if(params->profile_step2)
     add_cox_firth_profile(
       dt_thr, cox_firth_null, CoxFirthProfilePhase::reduced);
 
-  if (!cox_firth_null.converge && !direct_reduced_fallback) {
+  if (!cox_firth_null.converge &&
+      (!direct_reduced_fallback ||
+       reduced_max_step != reduced_fallback_max_step)) {
     if(params->profile_step2) {
       ++dt_thr->correction_profile.cox_firth_fallbacks;
       ++dt_thr->correction_profile.cox_firth_reduced_fallbacks;
     }
     if(cox_firth_null.beta.allFinite()) beta0 = cox_firth_null.beta;
-    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null/5, !params->cox_nofirth, false, beta0);
+    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, reduced_fallback_max_step, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
     if(params->profile_step2)
       add_cox_firth_profile(

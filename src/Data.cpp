@@ -444,6 +444,9 @@ void Data::print_step2_profile() {
       thread_profile.cox_firth_reduced_step_halvings;
     correction_profile.cox_firth_reduced_line_search_exhaustions +=
       thread_profile.cox_firth_reduced_line_search_exhaustions;
+    correction_profile.cox_firth_reduced_max_step = std::max(
+      correction_profile.cox_firth_reduced_max_step,
+      thread_profile.cox_firth_reduced_max_step);
     correction_profile.cox_firth_full_iterations +=
       thread_profile.cox_firth_full_iterations;
     correction_profile.cox_firth_full_likelihood_evaluations +=
@@ -718,6 +721,8 @@ void Data::print_step2_profile() {
           correction_profile.cox_firth_reduced_step_halvings
         << " cox_firth_reduced_line_search_exhaustions=" <<
           correction_profile.cox_firth_reduced_line_search_exhaustions
+        << " cox_firth_reduced_max_step=" <<
+          correction_profile.cox_firth_reduced_max_step
         << " cox_firth_full_iterations=" <<
           correction_profile.cox_firth_full_iterations
         << " cox_firth_full_likelihood_evaluations=" <<
