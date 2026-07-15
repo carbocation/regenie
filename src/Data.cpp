@@ -146,11 +146,21 @@ uint64_t step1_pgen_prefetch_max_bytes() {
   return static_cast<uint64_t>(megabytes) * 1000000;
 }
 
+bool step1_pgen_packed_hardcalls_enabled() {
+  const char* value = std::getenv("REGENIE_STEP1_PGEN_PACKED");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_STEP1_PGEN_PACKED must be '0' or '1'");
+}
+
 void accumulate_step1_pgen_profile(
   Step1PgenReadProfile& destination,
   const Step1PgenReadProfile& source) {
   destination.variants += source.variants;
   destination.fused_variants += source.fused_variants;
+  destination.packed_variants += source.packed_variants;
+  destination.packed_bytes += source.packed_bytes;
   destination.materialization_tile_variants = std::max(
     destination.materialization_tile_variants,
     source.materialization_tile_variants);
@@ -168,6 +178,8 @@ void accumulate_step1_pgen_profile(
 struct Step1PgenPrefetchBuffer {
   Eigen::MatrixXd genotypes;
   Eigen::MatrixXd allele_frequencies;
+  std::vector<unsigned char> packed_hardcalls;
+  size_t packed_stride_bytes = 0;
 };
 
 struct Step1PgenPrefetchResult {
@@ -353,12 +365,30 @@ void Data::residualize_genotypes() {
   Step1ComputeTimings timings;
   const bool copy_preprocessed_genotypes_to_host =
     params.use_loocv || params.test_l0;
-  const bool backend_processed =
-    step1_compute_backend->preprocess_genotypes(
-      Gblock.Gmat, pheno_data.new_cov, sample_weights,
-      params.n_analyzed - params.ncov, params.numtol,
-      row_multipliers, copy_preprocessed_genotypes_to_host, scale_G,
-      params.profile_step1 ? &timings : nullptr);
+  bool backend_processed = false;
+  if(Gblock.step1_pgen_packed_block) {
+    backend_processed =
+      step1_compute_backend->preprocess_packed_hardcalls(
+        Gblock.step1_pgen_packed_hardcalls.data(),
+        Gblock.step1_pgen_packed_hardcalls.size(),
+        Gblock.step1_pgen_packed_stride_bytes,
+        Gblock.Gmat.rows(), params.n_samples,
+        pheno_data.new_cov, sample_weights,
+        params.n_analyzed - params.ncov, params.numtol, scale_G,
+        params.profile_step1 ? &timings : nullptr);
+    if(!backend_processed)
+      throw std::runtime_error(
+        "Step 1 packed PGEN block could not be preprocessed by the selected backend");
+    Gblock.step1_pgen_packed_hardcalls.clear();
+    Gblock.step1_pgen_packed_stride_bytes = 0;
+  } else {
+    backend_processed =
+      step1_compute_backend->preprocess_genotypes(
+        Gblock.Gmat, pheno_data.new_cov, sample_weights,
+        params.n_analyzed - params.ncov, params.numtol,
+        row_multipliers, copy_preprocessed_genotypes_to_host, scale_G,
+        params.profile_step1 ? &timings : nullptr);
+  }
 
   if(!backend_processed) {
     // mask missing individuals
@@ -402,6 +432,12 @@ void Data::residualize_genotypes() {
       timings.pinned_staging_upload_count;
     step1_profile.preprocess_pinned_staging_upload_bytes +=
       timings.pinned_staging_upload_bytes;
+    step1_profile.preprocess_packed_hardcall_blocks +=
+      timings.packed_hardcall_upload_count;
+    step1_profile.preprocess_packed_hardcall_upload_bytes +=
+      timings.packed_hardcall_upload_bytes;
+    step1_profile.preprocess_packed_hardcall_expand_ms +=
+      timings.packed_hardcall_expand_ms;
     if(backend_processed)
       step1_profile.preprocess_backend_blocks++;
     else
@@ -824,9 +860,31 @@ void Data::level_0_calculations() {
 
   const bool pgen_cuda_backend = params.file_type == "pgen" &&
     std::string(step1_compute_backend->name()) == "cuda";
+  const bool pgen_packed_requested =
+    step1_pgen_packed_hardcalls_enabled();
+  const bool pgen_packed_hardcalls = pgen_cuda_backend &&
+    pgen_packed_requested && !params.dosage_mode && !params.use_loocv &&
+    !params.test_l0 && params.alpha_prior == -1 &&
+    step1_compute_backend->can_preprocess_packed_hardcalls(
+      params.block_size, params.n_samples);
+  if(pgen_cuda_backend) {
+    sout << " - Step 1 PGEN packed hardcalls : [" <<
+      (pgen_packed_hardcalls ? "enabled" : "disabled") << "]";
+    if(!pgen_packed_hardcalls) {
+      if(!pgen_packed_requested) sout << " reason=runtime_opt_out";
+      else if(params.dosage_mode) sout << " reason=dosage_mode";
+      else if(params.use_loocv) sout << " reason=loocv";
+      else if(params.test_l0) sout << " reason=test_l0";
+      else if(params.alpha_prior != -1) sout << " reason=maf_prior";
+      else sout << " reason=resident_capacity";
+    }
+    sout << "\n";
+  }
   const uint64_t pgen_prefetch_limit = pgen_cuda_backend ?
     step1_pgen_prefetch_max_bytes() : 0;
-  const uint64_t pgen_block_bytes =
+  const uint64_t pgen_block_bytes = pgen_packed_hardcalls ?
+    static_cast<uint64_t>(params.block_size) *
+      ((static_cast<uint64_t>(params.n_samples) + 3) / 4) :
     static_cast<uint64_t>(params.block_size) * params.n_samples *
       sizeof(double);
   const bool pgen_prefetch_enabled = pgen_cuda_backend &&
@@ -870,14 +928,25 @@ void Data::level_0_calculations() {
         &step1_pgen_read_profile : nullptr;
       ProfileClock::time_point stage_start;
       if(params.profile_step1) stage_start = ProfileClock::now();
+      Gblock.step1_pgen_packed_block = false;
       if(pgen_prefetch_pending) {
         const ProfileClock::time_point wait_start = ProfileClock::now();
         Step1PgenPrefetchResult result = pgen_prefetch_future.get();
         const double wait_ms = elapsed_ms(wait_start);
         pgen_prefetch_pending = false;
-        Gblock.Gmat.swap(pgen_prefetch_buffer.genotypes);
-        if(params.alpha_prior != -1)
-          Gblock.snp_afs.swap(pgen_prefetch_buffer.allele_frequencies);
+        if(pgen_packed_hardcalls) {
+          Gblock.Gmat.resize(bs, 0);
+          Gblock.step1_pgen_packed_hardcalls.swap(
+            pgen_prefetch_buffer.packed_hardcalls);
+          Gblock.step1_pgen_packed_stride_bytes =
+            pgen_prefetch_buffer.packed_stride_bytes;
+          pgen_prefetch_buffer.packed_stride_bytes = 0;
+          Gblock.step1_pgen_packed_block = true;
+        } else {
+          Gblock.Gmat.swap(pgen_prefetch_buffer.genotypes);
+          if(params.alpha_prior != -1)
+            Gblock.snp_afs.swap(pgen_prefetch_buffer.allele_frequencies);
+        }
         if(pgen_profile)
           accumulate_step1_pgen_profile(*pgen_profile, result.profile);
         if(params.profile_step1) {
@@ -891,7 +960,10 @@ void Data::level_0_calculations() {
           "ms prefetched; " << static_cast<long long>(wait_ms) <<
           "ms wait)" << endl;
       } else {
-        if(params.file_type == "pgen")
+        if(pgen_packed_hardcalls) {
+          Gblock.Gmat.resize(bs, 0);
+          Gblock.step1_pgen_packed_block = true;
+        } else if(params.file_type == "pgen")
           Gblock.Gmat.resize(bs, params.n_samples);
         else
           Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
@@ -903,10 +975,23 @@ void Data::level_0_calculations() {
         }
         const ProcessIoCounters io_before = pgen_profile ?
           read_process_io_counters() : ProcessIoCounters();
-        get_G(block, bs, chrom, in_filters.step1_snp_count, snpinfo,
-          &params, &files, &Gblock, &in_filters,
-          pheno_data.masked_indivs, pheno_data.phenotypes_raw, sout,
-          pgen_profile);
+        if(pgen_packed_hardcalls) {
+          sout << " block [" << block + 1 << "] : " << flush;
+          readChunkFromPGENFileToPackedHardcalls(
+            bs, in_filters.step1_snp_count, snpinfo, &params,
+            Gblock.pgr, Gblock.step1_pgen_packed_hardcalls,
+            Gblock.step1_pgen_packed_stride_bytes, pgen_profile);
+          sout << bs << " snps";
+          if(params.profile_step1)
+            sout << " (" << static_cast<long long>(elapsed_ms(stage_start)) <<
+              "ms packed)";
+          sout << endl;
+        } else {
+          get_G(block, bs, chrom, in_filters.step1_snp_count, snpinfo,
+            &params, &files, &Gblock, &in_filters,
+            pheno_data.masked_indivs, pheno_data.phenotypes_raw, sout,
+            pgen_profile);
+        }
         if(params.profile_step1)
           step1_profile.decode_ms += elapsed_ms(stage_start);
         if(pgen_profile)
@@ -936,22 +1021,31 @@ void Data::level_0_calculations() {
       if(pgen_prefetch_enabled && has_next_block) {
         const uint32_t next_snpcount = in_filters.step1_snp_count + bs;
         pgen_prefetch_future = std::async(std::launch::async,
-          [this, next_bs, next_snpcount, &pgen_prefetch_buffer]() {
+          [this, next_bs, next_snpcount, pgen_packed_hardcalls,
+           &pgen_prefetch_buffer]() {
             Step1PgenPrefetchResult result;
             const ProfileClock::time_point service_start =
               ProfileClock::now();
-            pgen_prefetch_buffer.genotypes.resize(
-              next_bs, params.n_samples);
-            if(params.alpha_prior != -1)
-              pgen_prefetch_buffer.allele_frequencies.resize(next_bs, 1);
             Step1PgenReadProfile* local_profile = params.profile_step1 ?
               &result.profile : nullptr;
             const ProcessIoCounters io_before = local_profile ?
               read_process_io_counters() : ProcessIoCounters();
-            readChunkFromPGENFileToG(next_bs, next_snpcount, snpinfo,
-              &params, pgen_prefetch_buffer.genotypes,
-              pgen_prefetch_buffer.allele_frequencies, Gblock.pgr,
-              &in_filters, &Gblock.step1_pgen_worker_tiles, local_profile);
+            if(pgen_packed_hardcalls) {
+              readChunkFromPGENFileToPackedHardcalls(
+                next_bs, next_snpcount, snpinfo, &params, Gblock.pgr,
+                pgen_prefetch_buffer.packed_hardcalls,
+                pgen_prefetch_buffer.packed_stride_bytes, local_profile);
+            } else {
+              pgen_prefetch_buffer.genotypes.resize(
+                next_bs, params.n_samples);
+              if(params.alpha_prior != -1)
+                pgen_prefetch_buffer.allele_frequencies.resize(next_bs, 1);
+              readChunkFromPGENFileToG(next_bs, next_snpcount, snpinfo,
+                &params, pgen_prefetch_buffer.genotypes,
+                pgen_prefetch_buffer.allele_frequencies, Gblock.pgr,
+                &in_filters, &Gblock.step1_pgen_worker_tiles,
+                local_profile);
+            }
             if(local_profile)
               accumulate_process_io_delta(io_before,
                 read_process_io_counters(), local_profile);
@@ -1088,6 +1182,9 @@ void Data::level_0_calculations() {
 
   // free up memory not used anymore
   Gblock.Gmat.resize(0,0);
+  std::vector<unsigned char>().swap(Gblock.step1_pgen_packed_hardcalls);
+  Gblock.step1_pgen_packed_stride_bytes = 0;
+  Gblock.step1_pgen_packed_block = false;
   if(params.write_l0_pred && (params.n_pheno > 1) ){
     // free level 0 predictions for (P-1) indices in test_mat
     for(int ph = 1; ph < params.n_pheno; ++ph ) {
@@ -1116,20 +1213,31 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
     uint32_t cum_size_folds = 0;
 
     for( int i = 0; i < params.cv_folds; ++i ) {
-      MapMatXd Gmat (&(Gblock.Gmat(0,cum_size_folds)), bs, params.cv_sizes(i));
       Step1ComputeTimings timings;
-      if(params.test_l0)
+      if(Gblock.step1_pgen_packed_block) {
+        step1_compute_backend->compute_preprocessed_products(
+          cum_size_folds, params.cv_sizes(i),
+          pheno_data.phenotypes.middleRows(
+            cum_size_folds, params.cv_sizes(i)),
+          l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
+          params.profile_step1 ? &timings : nullptr);
+      } else if(params.test_l0) {
+        MapMatXd Gmat (&(Gblock.Gmat(0,cum_size_folds)), bs,
+          params.cv_sizes(i));
         step1_compute_backend->compute_products(
           Gmat,
           l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i)),
           l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
           params.profile_step1 ? &timings : nullptr);
-      else
+      } else {
+        MapMatXd Gmat (&(Gblock.Gmat(0,cum_size_folds)), bs,
+          params.cv_sizes(i));
         step1_compute_backend->compute_products(
           Gmat,
           pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i)),
           l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
           params.profile_step1 ? &timings : nullptr);
+      }
       l0->GTY += l0->GtY[i];
       l0->GGt += l0->G_folds[i];
       if(params.profile_step1) {
@@ -1186,7 +1294,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=4 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=5 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -1220,6 +1328,8 @@ void Data::print_step1_profile() {
     out << "STEP1_PROFILE scope=pgen_ingest"
         << " variants=" << step1_pgen_read_profile.variants
         << " fused_variants=" << step1_pgen_read_profile.fused_variants
+        << " packed_variants=" << step1_pgen_read_profile.packed_variants
+        << " packed_bytes=" << step1_pgen_read_profile.packed_bytes
         << " materialization_tile_variants=" <<
           step1_pgen_read_profile.materialization_tile_variants
         << " worker_buffer_allocations=" <<
@@ -1266,6 +1376,12 @@ void Data::print_step1_profile() {
         step1_profile.preprocess_pinned_staging_upload_count
       << " pinned_staging_bytes=" <<
         step1_profile.preprocess_pinned_staging_upload_bytes
+      << " packed_hardcall_blocks=" <<
+        step1_profile.preprocess_packed_hardcall_blocks
+      << " packed_hardcall_upload_bytes=" <<
+        step1_profile.preprocess_packed_hardcall_upload_bytes
+      << " packed_hardcall_expand_ms=" <<
+        step1_profile.preprocess_packed_hardcall_expand_ms
       << " host_orchestration_ms=" <<
         step1_profile.preprocess_host_orchestration_ms
       << "\n";

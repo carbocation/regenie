@@ -71,6 +71,8 @@ struct tally {
 struct Step1PgenReadProfile {
   uint64_t variants = 0;
   uint64_t fused_variants = 0;
+  uint64_t packed_variants = 0;
+  uint64_t packed_bytes = 0;
   uint64_t materialization_tile_variants = 0;
   uint64_t worker_buffer_allocations = 0;
   uint64_t missing_values = 0;
@@ -116,6 +118,9 @@ struct geno_block {
   Eigen::MatrixXd Gmat;
   Eigen::MatrixXd snp_afs;
   std::vector<std::vector<double>> step1_pgen_worker_tiles;
+  std::vector<unsigned char> step1_pgen_packed_hardcalls;
+  size_t step1_pgen_packed_stride_bytes = 0;
+  bool step1_pgen_packed_block = false;
   std::vector<data_thread> thread_data;
 };
 
@@ -197,6 +202,9 @@ void readChunkFromBGENFileToG_fast(const int&,const int&,const uint32_t&,std::ve
 void readChunkFromBedFileToG(const int&,const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct in_files*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,mstream&);
 void readChunkFromPGENFileToG(const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,mstream&,Step1PgenReadProfile* = nullptr);
 void readChunkFromPGENFileToG(const int&,const uint32_t&,std::vector<snp> const&,struct param const*,Eigen::MatrixXd&,Eigen::MatrixXd&,PgenReader&,struct filter const*,std::vector<std::vector<double>>*,Step1PgenReadProfile* = nullptr);
+void readChunkFromPGENFileToPackedHardcalls(const int&,const uint32_t&,
+  std::vector<snp> const&,struct param const*,PgenReader&,
+  std::vector<unsigned char>&,size_t&,Step1PgenReadProfile* = nullptr);
 
 void readChunkFromBGENFileToG(std::vector<uint64> const&,const int&,std::vector<snp> const&,struct param const*,Eigen::Ref<Eigen::MatrixXd>,BgenParser&,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<variant_block>&,mstream&);
 void readChunkFromBGEN(std::istream*,std::vector<uint32_t>&,std::vector<uint32_t>&,std::vector<std::vector<uchar>>&,std::vector<uint64>&);

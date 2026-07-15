@@ -27,6 +27,7 @@
 #ifndef STEP1_COMPUTE_H
 #define STEP1_COMPUTE_H
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -49,6 +50,9 @@ struct Step1ComputeTimings {
   uint64_t resident_reuse_count = 0;
   uint64_t pinned_staging_upload_count = 0;
   uint64_t pinned_staging_upload_bytes = 0;
+  uint64_t packed_hardcall_upload_count = 0;
+  uint64_t packed_hardcall_upload_bytes = 0;
+  double packed_hardcall_expand_ms = 0;
 };
 
 class Step1ComputeBackend {
@@ -68,6 +72,40 @@ class Step1ComputeBackend {
       const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
       bool copy_to_host,
       Eigen::VectorXd& row_scales,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool can_preprocess_packed_hardcalls(
+      Eigen::Index variants,
+      Eigen::Index samples) const;
+
+    virtual bool preprocess_packed_hardcalls(
+      const unsigned char* packed_hardcalls,
+      size_t packed_bytes,
+      size_t packed_stride_bytes,
+      Eigen::Index variants,
+      Eigen::Index samples,
+      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale,
+      Eigen::VectorXd& row_scales,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void compute_preprocessed_products(
+      Eigen::Index start_column,
+      Eigen::Index column_count,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1GramMode mode,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void ridge_predict_preprocessed(
+      Eigen::Index start_column,
+      Eigen::Index column_count,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      Eigen::MatrixXd& predictions,
+      Eigen::MatrixXd& coefficients,
       Step1ComputeTimings* timings = nullptr);
 
     virtual void release_preprocessed_genotypes();
@@ -192,6 +230,18 @@ class Step1ComputeBackend {
       const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
       Eigen::MatrixXd& predictions,
       Step1ComputeTimings* timings = nullptr);
+
+  protected:
+    static void validate_packed_hardcall_preprocessing_inputs(
+      const unsigned char* packed_hardcalls,
+      size_t packed_bytes,
+      size_t packed_stride_bytes,
+      Eigen::Index variants,
+      Eigen::Index samples,
+      const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+      const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale);
 };
 
 std::unique_ptr<Step1ComputeBackend> make_cpu_step1_compute_backend();

@@ -28,6 +28,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #ifdef WITH_CUDA
@@ -78,6 +79,114 @@ bool Step1ComputeBackend::preprocess_genotypes(
       "Step 1 genotype preprocessing requires finite, non-negative weights and multipliers");
   row_scales.resize(genotypes.rows());
   return false;
+}
+
+bool Step1ComputeBackend::can_preprocess_packed_hardcalls(
+  Eigen::Index variants,
+  Eigen::Index samples) const {
+  (void)variants;
+  (void)samples;
+  return false;
+}
+
+void Step1ComputeBackend::validate_packed_hardcall_preprocessing_inputs(
+  const unsigned char* packed_hardcalls,
+  size_t packed_bytes,
+  size_t packed_stride_bytes,
+  Eigen::Index variants,
+  Eigen::Index samples,
+  const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+  const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+  double degrees_of_freedom,
+  double minimum_scale) {
+
+  if(variants < 0 || samples < 0 || covariates.rows() != samples ||
+     sample_weights.size() != samples)
+    throw std::invalid_argument(
+      "Step 1 packed hardcall preprocessing received incompatible dimensions");
+  if(!std::isfinite(degrees_of_freedom) || degrees_of_freedom <= 0)
+    throw std::invalid_argument(
+      "Step 1 packed hardcall preprocessing requires positive degrees of freedom");
+  if(!std::isfinite(minimum_scale) || minimum_scale < 0)
+    throw std::invalid_argument(
+      "Step 1 packed hardcall preprocessing requires a non-negative minimum scale");
+  if((sample_weights.array() < 0).any() ||
+     !sample_weights.allFinite() || !covariates.allFinite())
+    throw std::invalid_argument(
+      "Step 1 packed hardcall preprocessing requires finite, non-negative weights");
+  const size_t minimum_stride =
+    (static_cast<size_t>(samples) + 3) / 4;
+  if(packed_stride_bytes < minimum_stride ||
+     (variants > 0 && packed_stride_bytes >
+       std::numeric_limits<size_t>::max() /
+         static_cast<size_t>(variants)) ||
+     packed_bytes < static_cast<size_t>(variants) *
+       packed_stride_bytes ||
+     (variants > 0 && !packed_hardcalls))
+    throw std::invalid_argument(
+      "Step 1 packed hardcall preprocessing received an invalid packed buffer");
+}
+
+bool Step1ComputeBackend::preprocess_packed_hardcalls(
+  const unsigned char* packed_hardcalls,
+  size_t packed_bytes,
+  size_t packed_stride_bytes,
+  Eigen::Index variants,
+  Eigen::Index samples,
+  const Eigen::Ref<const Eigen::MatrixXd>& covariates,
+  const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
+  double degrees_of_freedom,
+  double minimum_scale,
+  Eigen::VectorXd& row_scales,
+  Step1ComputeTimings* timings) {
+  (void)packed_hardcalls;
+  (void)packed_bytes;
+  (void)packed_stride_bytes;
+  (void)variants;
+  (void)samples;
+  (void)covariates;
+  (void)sample_weights;
+  (void)degrees_of_freedom;
+  (void)minimum_scale;
+  (void)row_scales;
+  (void)timings;
+  return false;
+}
+
+void Step1ComputeBackend::compute_preprocessed_products(
+  Eigen::Index start_column,
+  Eigen::Index column_count,
+  const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+  Eigen::MatrixXd& gram,
+  Eigen::MatrixXd& crossproduct,
+  Step1GramMode mode,
+  Step1ComputeTimings* timings) {
+  (void)start_column;
+  (void)column_count;
+  (void)phenotypes;
+  (void)gram;
+  (void)crossproduct;
+  (void)mode;
+  (void)timings;
+  throw std::runtime_error(
+    "Step 1 backend has no resident preprocessed genotype block");
+}
+
+void Step1ComputeBackend::ridge_predict_preprocessed(
+  Eigen::Index start_column,
+  Eigen::Index column_count,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  Eigen::MatrixXd& predictions,
+  Eigen::MatrixXd& coefficients,
+  Step1ComputeTimings* timings) {
+  (void)start_column;
+  (void)column_count;
+  (void)ridge_parameters;
+  (void)predictions;
+  (void)coefficients;
+  (void)timings;
+  throw std::runtime_error(
+    "Step 1 backend has no resident preprocessed genotype block");
 }
 
 void Step1ComputeBackend::release_preprocessed_genotypes() {

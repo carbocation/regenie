@@ -31,6 +31,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 
@@ -1978,6 +1979,60 @@ void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount,
   if(oob_err.any())
     throw "there is a variant in the block that has a value not in [0,2] or missing";
 
+}
+
+// Preserve pgenlib's native two-bit, variant-major representation for the
+// CUDA hardcall fast path.  Expansion, masking, mean imputation, covariate
+// projection, and scaling are deliberately deferred to the device.
+void readChunkFromPGENFileToPackedHardcalls(const int& bs,
+  const uint32_t& snpcount, vector<snp> const& snpinfo,
+  struct param const* params, PgenReader& pgr,
+  vector<unsigned char>& packed_hardcalls, size_t& packed_stride_bytes,
+  Step1PgenReadProfile* profile) {
+
+  packed_stride_bytes = (static_cast<size_t>(params->n_samples) + 3) / 4;
+  if(packed_stride_bytes > 0 && static_cast<size_t>(bs) >
+      std::numeric_limits<size_t>::max() / packed_stride_bytes)
+    throw std::runtime_error("Step 1 packed PGEN block size overflow");
+  const size_t packed_bytes = static_cast<size_t>(bs) *
+    packed_stride_bytes;
+  packed_hardcalls.resize(packed_bytes);
+
+  const int worker_count = std::max(1, params->neff_threads);
+  vector<double> thread_work_ms(profile ? worker_count : 0, 0);
+  vector<double> reader_call_thread_ms(profile ? worker_count : 0, 0);
+
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(worker_count) schedule(dynamic)
+#endif
+  for(int variant = 0; variant < bs; ++variant) {
+#if defined(_OPENMP)
+    const int thread_num = omp_get_thread_num();
+#else
+    const int thread_num = 0;
+#endif
+    ScopedThreadWorkTimer work_timer(
+      profile ? &thread_work_ms[thread_num] : nullptr);
+    {
+      ScopedThreadWorkTimer reader_timer(
+        profile ? &reader_call_thread_ms[thread_num] : nullptr);
+      pgr.ReadHardcallsPacked(
+        packed_hardcalls.data() +
+          static_cast<size_t>(variant) * packed_stride_bytes,
+        packed_stride_bytes, params->n_samples, thread_num,
+        snpinfo[snpcount + variant].offset, 1);
+    }
+  }
+
+  if(profile) {
+    profile->variants += bs;
+    profile->packed_variants += bs;
+    profile->packed_bytes += packed_bytes;
+    profile->thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    profile->reader_call_thread_ms += std::accumulate(
+      reader_call_thread_ms.begin(), reader_call_thread_ms.end(), 0.0);
+  }
 }
 
 
