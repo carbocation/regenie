@@ -172,6 +172,77 @@ fi
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
+# complete-sample BGEN dosage decoding in both allele orientations
+for ref_mode in default ref_first; do
+  ref_arg=""
+  if [ "$ref_mode" = "ref_first" ]; then
+    ref_arg="--ref-first"
+  fi
+
+  rgcmd="--step 2 \
+    --bed ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype.txt \
+    --bsize 200 \
+    --ignore-pred \
+    $ref_arg \
+    --out ${mntpt}test/test_bin_out_bgen_qt_${ref_mode}_bed"
+  ./$regenie_bin $rgcmd
+
+  rgcmd="--step 2 \
+    --bgen ${mntpt}example/example.bgen \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype.txt \
+    --bsize 200 \
+    --ignore-pred \
+    $ref_arg \
+    --out ${mntpt}test/test_bin_out_bgen_qt_${ref_mode}_bgen"
+  ./$regenie_bin $rgcmd
+
+  for phenotype in Y1 Y2; do
+    if ! cmp --silent \
+      ${REGENIE_PATH}test/test_bin_out_bgen_qt_${ref_mode}_bed_${phenotype}.regenie \
+      ${REGENIE_PATH}test/test_bin_out_bgen_qt_${ref_mode}_bgen_${phenotype}.regenie
+    then
+      print_err
+    fi
+  done
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# phenotype missingness retains the general BGEN decoder
+for file_type in bed bgen; do
+  if [ "$file_type" = "bed" ]; then
+    genotype_arg="--bed ${mntpt}example/example"
+  else
+    genotype_arg="--bgen ${mntpt}example/example.bgen"
+  fi
+
+  rgcmd="--step 2 \
+    $genotype_arg \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+    --bsize 200 \
+    --force-qt \
+    --ignore-pred \
+    --out ${mntpt}test/test_bin_out_bgen_qt_missing_${file_type}"
+  ./$regenie_bin $rgcmd
+done
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    ${REGENIE_PATH}test/test_bin_out_bgen_qt_missing_bed_${phenotype}.regenie \
+    ${REGENIE_PATH}test/test_bin_out_bgen_qt_missing_bgen_${phenotype}.regenie
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
 # interaction tests
 rgcmd="--step 2 \
   --bed ${mntpt}example/example \
@@ -469,4 +540,3 @@ fi
 echo "SUCCESS: REGENIE build passed the tests!"
 # file cleanup
 rm -f ${REGENIE_PATH}test/fit_bin_* ${REGENIE_PATH}test/test_bin_out* ${REGENIE_PATH}test/test_out* ${REGENIE_PATH}test/tmp[12].txt
-
