@@ -157,7 +157,17 @@ if("${UNAME_S}" STREQUAL "Linux")
     target_link_options(regenie BEFORE PRIVATE -static-libgcc PRIVATE -static-libstdc++)
   endif()
 elseif("${UNAME_S}" STREQUAL "Darwin")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+  # Apple Clang does not ship an OpenMP runtime, but CMake can use an external
+  # libomp installation when one is available. Keep ordinary macOS builds
+  # functional without it while allowing release builds to require it.
+  find_package(OpenMP QUIET)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(regenie PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "Building with OpenMP support on macOS")
+  else()
+    message(STATUS "Building without OpenMP support on macOS")
+  endif()
 endif()
 
 set(EXTERN_LIBS_PATH "${CMAKE_SOURCE_DIR}/external_libs")
@@ -283,9 +293,10 @@ elseif(EXISTS ${OPENBLAS_ROOT}) # OpenBLAS
   add_definitions(-DWITH_OPENBLAS -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
   set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS ${OPENBLAS_ROOT}/include/)
   find_library(LAPACK_LIB lapack REQUIRED)
+  find_library(LAPACKE_LIB lapacke REQUIRED)
   find_library(BLAS_LIB openblas HINTS "${OPENBLAS_ROOT}/lib/" REQUIRED)
   set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
-    ${LAPACK_LIB} -llapacke ${BLAS_LIB})
+    ${LAPACK_LIB} ${LAPACKE_LIB} ${BLAS_LIB})
 endif()
 
 if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
@@ -365,15 +376,39 @@ endif()
 find_library(ZLIB_LIBRARY libz.a z REQUIRED)
 find_library(M_LIB m REQUIRED)
 find_library(DL_LIB dl REQUIRED)
+set(GFORTRAN_LIBRARIES "")
 if("${UNAME_S}" STREQUAL "Linux")
-  set(GFORTRAN_LIBRARY "-lgfortran")
+  set(GFORTRAN_LIBRARIES "-lgfortran")
 elseif("${UNAME_S}" STREQUAL "Darwin")
-  find_library(GFORTRAN_LIBRARY gfortran REQUIRED)
+  find_program(GFORTRAN_EXECUTABLE gfortran)
+  if(NOT GFORTRAN_EXECUTABLE)
+    message(FATAL_ERROR "A gfortran compiler is required on macOS")
+  endif()
+  if(BUILD_STATIC)
+    set(GFORTRAN_RUNTIME_NAMES libgfortran.a libquadmath.a libgcc.a)
+  else()
+    set(GFORTRAN_RUNTIME_NAMES libgfortran.dylib)
+  endif()
+  foreach(runtime_name IN LISTS GFORTRAN_RUNTIME_NAMES)
+    execute_process(
+      COMMAND ${GFORTRAN_EXECUTABLE} -print-file-name=${runtime_name}
+      OUTPUT_VARIABLE runtime_path
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE runtime_status)
+    if(NOT runtime_status EQUAL 0 OR
+       runtime_path STREQUAL runtime_name OR
+       NOT EXISTS ${runtime_path})
+      message(FATAL_ERROR
+        "gfortran could not locate its ${runtime_name} runtime library")
+    endif()
+    get_filename_component(runtime_path ${runtime_path} REALPATH)
+    list(APPEND GFORTRAN_LIBRARIES ${runtime_path})
+  endforeach()
 endif()
 target_link_libraries(
   regenie PRIVATE
   ${ZLIB_LIBRARY} ${M_LIB} ${DL_LIB} ${PTHREAD_LIB}
-  ${GFORTRAN_LIBRARY}
+  ${GFORTRAN_LIBRARIES}
 )
 
 install(TARGETS regenie RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

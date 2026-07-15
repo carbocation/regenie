@@ -1,9 +1,12 @@
 FLAG=-O2 -DNDEBUG -fPIC -std=legacy
 AR   ?= ar
-FC   ?= gfortran
+ifeq ($(origin FC), default)
+ FC := gfortran
+endif
 
 UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S)-$(UNAME_M),Darwin-x86_64)
  FLAG += -arch x86_64
 endif
 

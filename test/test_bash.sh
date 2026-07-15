@@ -14,6 +14,9 @@ print_simple_err () {
 print_custom_err () {
   echo "ERROR: ${1} $help_msg"; exit 1 
 }
+count_lines () {
+  awk 'END { print NR }' "$1"
+}
 
 
 ### READ OPTIONS
@@ -181,7 +184,7 @@ if [ -f ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie.gz ]; then
   ( zcat < ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie
 fi
 
-if [ "`cat ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie | wc -l`" != "1001" ]
+if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie")" != "1001" ]
 then
   print_err
 fi
@@ -229,7 +232,7 @@ rgcmd="--step 2 \
 ./$regenie_bin $rgcmd
 
 for phenotype in Y1 Y2; do
-  if [ "`cat ${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_${phenotype}.regenie | wc -l`" != "1001" ]; then
+  if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_${phenotype}.regenie")" != "1001" ]; then
     print_err
   fi
 done
@@ -278,7 +281,7 @@ rgcmd="--step 2 \
 ./$regenie_bin $rgcmd
 
 for phenotype in Y1 Y2; do
-  if [ "`cat ${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie | wc -l`" != "1001" ]; then
+  if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie")" != "1001" ]; then
     print_err
   fi
 done
@@ -304,7 +307,7 @@ for ref_mode in default ref_first; do
   ./$regenie_bin $rgcmd
 
   for phenotype in Y1 Y2; do
-    if [ "`cat ${REGENIE_PATH}test/test_bin_out_bgen_qt_${ref_mode}_bgen_${phenotype}.regenie | wc -l`" != "1001" ]
+    if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_bgen_qt_${ref_mode}_bgen_${phenotype}.regenie")" != "1001" ]
     then
       print_err
     fi
@@ -326,7 +329,7 @@ rgcmd="--step 2 \
 ./$regenie_bin $rgcmd
 
 for phenotype in Y1 Y2; do
-  if [ "`cat ${REGENIE_PATH}test/test_bin_out_bgen_qt_missing_${phenotype}.regenie | wc -l`" != "1001" ]
+  if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_bgen_qt_missing_${phenotype}.regenie")" != "1001" ]
   then
     print_err
   fi
@@ -356,7 +359,7 @@ if [ -f ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie.gz ]; then
   ( zcat < ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie
 fi
 
-if [ "`cat ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie | wc -l`" != "1001" ]; then
+if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie")" != "1001" ]; then
   print_err
 elif ! grep -Eq '^Number of tests with SPA correction : [1-9][0-9]*$' ${REGENIE_PATH}test/test_bin_out_spa.log; then
   print_err
@@ -521,9 +524,9 @@ rgcmd="--step 2 \
 # run regenie
 ./$regenie_bin $rgcmd 
 
-head ${REGENIE_PATH}test/test_out_masks_V2_Y1.regenie -n 3 | tail -n 2 | cut --complement -f4,5 > ${REGENIE_PATH}test/tmp1.txt
-tail -n 1 ${REGENIE_PATH}test/test_out_masks_V2_Y1.regenie | cut --complement -f4,5 >> ${REGENIE_PATH}test/tmp1.txt
-cat ${REGENIE_PATH}test/test_out_masks_V1_Y1.regenie | cut --complement -f4,5 > ${REGENIE_PATH}test/tmp2.txt
+head -n 3 ${REGENIE_PATH}test/test_out_masks_V2_Y1.regenie | tail -n 2 | cut -f1-3,6- > ${REGENIE_PATH}test/tmp1.txt
+tail -n 1 ${REGENIE_PATH}test/test_out_masks_V2_Y1.regenie | cut -f1-3,6- >> ${REGENIE_PATH}test/tmp1.txt
+cut -f1-3,6- ${REGENIE_PATH}test/test_out_masks_V1_Y1.regenie > ${REGENIE_PATH}test/tmp2.txt
 
 if ! cmp --silent \
   ${REGENIE_PATH}test/tmp1.txt \
@@ -533,11 +536,11 @@ elif [ ! -f ${REGENIE_PATH}test/test_out_masks_V2_masks.bed ]; then
   print_err
 elif [ "$(hexdump -e \"%07_ax\ \"\ 16/1\ \"\ %02x\"\ \"\\n\"  -n 3 ${REGENIE_PATH}test/test_out_masks_V2_masks.bed | head -n 1 | awk '{print $2,$3,$4}' | tr ' ' ',')" != "6c,1b,01" ]; then
   print_err
-elif [ "`wc -l ${REGENIE_PATH}test/test_out_masks_V2_masks.{bim,fam} | awk '{print $1}' | head -n 2| paste -sd','`" != "4,494" ]; then
+elif [ "$(count_lines "${REGENIE_PATH}test/test_out_masks_V2_masks.bim"),$(count_lines "${REGENIE_PATH}test/test_out_masks_V2_masks.fam")" != "4,494" ]; then
   print_err
 elif [ ! -f ${REGENIE_PATH}test/test_out_masks_V2_masks.snplist ]; then
   print_err
-elif [ "`cat ${REGENIE_PATH}test/test_out_masks_V2_tmp2.setlist | head -n 1 | tr ',' '\n' | wc -l`" != "2" ]; then
+elif [ "$(awk -F, 'NR == 1 { print NF; exit }' "${REGENIE_PATH}test/test_out_masks_V2_tmp2.setlist")" != "2" ]; then
   print_err
 fi
 

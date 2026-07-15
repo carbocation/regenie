@@ -77,7 +77,7 @@
 #pragma GCC diagnostic pop
 #endif
 
-#ifdef __linux__
+#if defined(_OPENMP)
 #include <omp.h>
 #endif
 
