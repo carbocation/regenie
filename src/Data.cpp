@@ -3333,6 +3333,24 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   
   size_t const bs = indices.size();
   ArrayXb err_caught = ArrayXb::Constant(bs, false);
+  const bool qt_phenotypes_have_complete_masks =
+    (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
+  const bool use_unscaled_dense_qt =
+    (params.file_type == "pgen") &&
+    (params.trait_mode == 0) &&
+    (params.test_type == 0) &&
+    !params.skip_cov_res &&
+    !params.skip_scaleG &&
+    !params.mcc_test &&
+    !params.w_interaction &&
+    !params.build_mask &&
+    !params.snp_set &&
+    !params.joint_test &&
+    !params.trait_set &&
+    !params.multiphen &&
+    !params.htp_out &&
+    !params.getCorMat &&
+    (pheno_data.new_cov.cols() == params.ncov_analyzed);
 
     // start openmp for loop
 #if defined(_OPENMP)
@@ -3366,8 +3384,18 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       }
 
       // for QTs with non-sparse G: residualize and re-scale
-      if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse)
-        residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp), block_info, params);
+      if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse) {
+        if(use_unscaled_dense_qt) {
+          residualize_geno_unscaled(pheno_data.new_cov,
+            Gblock.Gmat.col(isnp), block_info, params);
+          Gblock.thread_data[thread_num].qt_unscaled = true;
+          Gblock.thread_data[thread_num].qt_complete_masks =
+            qt_phenotypes_have_complete_masks;
+        } else {
+          residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp),
+            block_info, params);
+        }
+      }
       else block_info->scale_fac = 1;
 
       // skip SNP if fails filters
@@ -5057,6 +5085,7 @@ void Data::print_ld(MatrixXd& LDmat, ArrayXi& indices_ld, ArrayXb& is_absent, Fi
   exit_early();
 
 }
+
 
 
 void Data::compute_ld_hardcalls(Files* ofile){

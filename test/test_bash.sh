@@ -216,6 +216,27 @@ done
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
+# PGEN quantitative traits with complete phenotype data
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype.txt \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --ignore-pred \
+  --out ${mntpt}test/test_bin_out_pgen_qt_complete"
+
+./$regenie_bin $rgcmd
+
+for phenotype in Y1 Y2; do
+  if [ "`cat ${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_${phenotype}.regenie | wc -l`" != "1001" ]; then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
 # PGEN binary traits with phenotype-specific missingness
 for file_type in bed pgen; do
   rgcmd="--step 2 \
@@ -236,6 +257,28 @@ for phenotype in Y1 Y2; do
     ${REGENIE_PATH}test/test_bin_out_pgen_bt_missing_bed_${phenotype}.regenie \
     ${REGENIE_PATH}test/test_bin_out_pgen_bt_missing_pgen_${phenotype}.regenie
   then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# PGEN quantitative traits with phenotype-specific missingness
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --force-qt \
+  --ignore-pred \
+  --out ${mntpt}test/test_bin_out_pgen_qt_missing"
+
+./$regenie_bin $rgcmd
+
+for phenotype in Y1 Y2; do
+  if [ "`cat ${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie | wc -l`" != "1001" ]; then
     print_err
   fi
 done
