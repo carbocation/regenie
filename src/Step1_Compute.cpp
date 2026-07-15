@@ -52,9 +52,11 @@ bool Step1ComputeBackend::preprocess_genotypes(
   double degrees_of_freedom,
   double minimum_scale,
   const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+  bool copy_to_host,
   Eigen::VectorXd& row_scales,
   Step1ComputeTimings* timings) {
 
+  (void)copy_to_host;
   (void)timings;
   if(genotypes.cols() != covariates.rows() ||
      genotypes.cols() != sample_weights.size() ||
@@ -76,6 +78,9 @@ bool Step1ComputeBackend::preprocess_genotypes(
       "Step 1 genotype preprocessing requires finite, non-negative weights and multipliers");
   row_scales.resize(genotypes.rows());
   return false;
+}
+
+void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 
 void Step1ComputeBackend::diagonal_penalty_predict(

@@ -254,11 +254,13 @@ void Data::residualize_genotypes() {
       0.5 * (params.alpha_prior + 1)).matrix();
 
   Step1ComputeTimings timings;
+  const bool copy_preprocessed_genotypes_to_host =
+    params.use_loocv || params.test_l0;
   const bool backend_processed =
     step1_compute_backend->preprocess_genotypes(
       Gblock.Gmat, pheno_data.new_cov, sample_weights,
       params.n_analyzed - params.ncov, params.numtol,
-      row_multipliers, scale_G,
+      row_multipliers, copy_preprocessed_genotypes_to_host, scale_G,
       params.profile_step1 ? &timings : nullptr);
 
   if(!backend_processed) {
@@ -738,7 +740,10 @@ void Data::level_0_calculations() {
       ProfileClock::time_point block_start;
       if(params.profile_step1) block_start = ProfileClock::now();
 
-      Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
+      // Every Step 1 decoder writes all retained samples for every variant
+      // before missing-value imputation, so zero-filling this potentially
+      // multi-gigabyte block only adds redundant memory bandwidth.
+      Gblock.Gmat.resize(bs, params.n_samples);
       if(params.alpha_prior != -1) Gblock.snp_afs = MatrixXd::Zero(bs, 1);
 
       ProfileClock::time_point stage_start;
@@ -832,6 +837,7 @@ void Data::level_0_calculations() {
       if(params.print_block_betas && params.use_loocv) // keep on raw scale
         l1_ests.beta_snp_step1.middleRows(in_filters.step1_snp_count, bs).array().colwise() /= scale_G.array() / pheno_data.scale_Y(0);
 
+      step1_compute_backend->release_preprocessed_genotypes();
       block++; in_filters.step1_snp_count += bs;
     }
   }

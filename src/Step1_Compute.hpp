@@ -27,6 +27,7 @@
 #ifndef STEP1_COMPUTE_H
 #define STEP1_COMPUTE_H
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <Eigen/Dense>
@@ -45,6 +46,7 @@ struct Step1ComputeTimings {
   double transform_ms = 0;
   double ridge_ms = 0;
   double download_ms = 0;
+  uint64_t resident_reuse_count = 0;
 };
 
 class Step1ComputeBackend {
@@ -62,8 +64,11 @@ class Step1ComputeBackend {
       double degrees_of_freedom,
       double minimum_scale,
       const Eigen::Ref<const Eigen::VectorXd>& row_multipliers,
+      bool copy_to_host,
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings = nullptr);
+
+    virtual void release_preprocessed_genotypes();
 
     virtual void compute_products(
       const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
