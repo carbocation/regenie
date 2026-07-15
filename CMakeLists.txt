@@ -24,6 +24,11 @@ project(regenie
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
+include(CTest)
+
+option(REGENIE_WITH_CUDA "Build the experimental CUDA Step 1 compute backend" OFF)
+set(REGENIE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
+  "CUDA architectures to compile for when REGENIE_WITH_CUDA=ON")
 
 # specify the C++ standard
 set(CMAKE_CXX_STANDARD 11)
@@ -47,6 +52,18 @@ endif()
 if($ENV{STATIC})
   set(BUILD_STATIC ON CACHE INTERNAL "Static compilation")
   message( STATUS "Static compilation mode")
+endif()
+
+if(REGENIE_WITH_CUDA)
+  if(CMAKE_VERSION VERSION_LESS 3.18)
+    message(FATAL_ERROR "REGENIE_WITH_CUDA requires CMake 3.18 or newer")
+  endif()
+  if(BUILD_STATIC)
+    message(FATAL_ERROR "REGENIE_WITH_CUDA currently requires a dynamic build (do not set STATIC=1)")
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "Building experimental CUDA Step 1 backend for architectures: ${REGENIE_CUDA_ARCHITECTURES}")
 endif()
 
 # check Boost IOStreams
@@ -118,6 +135,20 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
   )
 target_include_directories(regenie PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+function(configure_step1_cuda target_name)
+  if(REGENIE_WITH_CUDA)
+    target_sources(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
+    target_compile_definitions(${target_name} PRIVATE WITH_CUDA)
+    target_link_libraries(${target_name} PRIVATE CUDA::cublas CUDA::cusolver CUDA::cudart)
+    set_target_properties(${target_name} PROPERTIES
+      CUDA_STANDARD 11
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_ARCHITECTURES "${REGENIE_CUDA_ARCHITECTURES}")
+  endif()
+endfunction()
+
+configure_step1_cuda(regenie)
 
 set(CMAKE_CXX_FLAGS "-O3 -Wall -pedantic -ffast-math -Wno-unused-local-typedefs -Wno-deprecated-declarations -Wno-long-long -Wno-c11-extensions -fPIC")
 add_definitions(-DVERSION_NUMBER="${RG_VERSION}")
@@ -258,6 +289,20 @@ target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/LBFGSpp/include/)
 
 # Eigen (header-only)
 target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+
+if(BUILD_TESTING)
+  add_executable(step1_compute_test
+    ${CMAKE_SOURCE_DIR}/test/test_step1_compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp)
+  target_include_directories(step1_compute_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+  configure_step1_cuda(step1_compute_test)
+  add_test(NAME step1_compute_cpu
+    COMMAND step1_compute_test --backend cpu)
+  add_test(NAME step1_compute_auto
+    COMMAND step1_compute_test --backend auto)
+endif()
 
 # Boost IO
 if(${HAS_BOOST_IOSTREAM})

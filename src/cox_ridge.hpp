@@ -2,6 +2,8 @@
 #define COXL2_H
 #include "Regenie.hpp"
 
+class Step1ComputeBackend;
+
 class cox_ridge_path {
     public:
         // coefficients
@@ -15,7 +17,7 @@ class cox_ridge_path {
         Eigen::VectorXd deviance;
         Eigen::VectorXd dev_ratio;
         Eigen::Array<bool, Eigen::Dynamic, 1> converge;
-        cox_ridge_path(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const int& nlambda = 100, const double& lambda_min_max_ratio = -1, const Eigen::VectorXd& lambda = Eigen::VectorXd(), const int& max_iter = 100, const int& max_inner_iter = 30, const double& tolerance = 1e-6, const bool& verbose_fit = false);
+        cox_ridge_path(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const int& nlambda = 100, const double& lambda_min_max_ratio = -1, const Eigen::VectorXd& lambda = Eigen::VectorXd(), const int& max_iter = 100, const int& max_inner_iter = 30, const double& tolerance = 1e-6, const bool& verbose_fit = false, Step1ComputeBackend* compute_backend = nullptr);
         void fit(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask);
         
         // fitting info
@@ -27,6 +29,7 @@ class cox_ridge_path {
         double _getCoxLambdaMax(const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& gradient);
         int _lambda_len;
         bool _user_define_lambda = false;
+        Step1ComputeBackend* _compute_backend = nullptr;
 };
 
 class cox_ridge {
@@ -39,7 +42,7 @@ class cox_ridge {
         bool converge;
         double dev_ratio;
 
-        cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const double& lambda_val, const int& max_iter = 100, const int& max_inner_iter = 30, const double& tolerance = 1e-6, const bool& verbose_obj = false, const Eigen::VectorXd& beta_init = Eigen::VectorXd(), const double& null_deviance = -999);
+        cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const double& lambda_val, const int& max_iter = 100, const int& max_inner_iter = 30, const double& tolerance = 1e-6, const bool& verbose_obj = false, const Eigen::VectorXd& beta_init = Eigen::VectorXd(), const double& null_deviance = -999, Step1ComputeBackend* compute_backend = nullptr);
         void fit(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask);
         void reset(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const double& lambda_val, const Eigen::VectorXd& beta_init = Eigen::VectorXd(), const double& null_deviance = -999);
         void coxGrad(const survival_data& survivalData);
@@ -56,6 +59,7 @@ class cox_ridge {
         int _niter, _mxitnr;
         double _tol;
         bool _verbose;
+        Step1ComputeBackend* _compute_backend = nullptr;
         // objective value
         Eigen::VectorXd _object;
         Eigen::VectorXd _deviance;

@@ -57,6 +57,52 @@ To use with Boost Iostreams and/or Intel MKL library,
 add the corresponding flags before the `cmake` command on line 3
 (e.g. `BGEN_PATH=<path_to_bgen_lib> HAS_BOOST_IOSTREAM=1 cmake ..`).
 
+### Experimental CUDA Step 1 backend
+
+The CUDA backend accelerates the FP64 matrix work in Step 1, including Gram
+and phenotype crossproducts, symmetric eigensystems, batched ridge prediction,
+weighted logistic/Poisson/Cox updates, diagonal-penalty Cholesky solves, and
+chunked final-model influence solves. Level 0 products, design Gram matrices,
+weighted Hessians, score crossproducts, linear predictors, and
+chromosome-grouped LOCO predictions are streamed through bounded device
+buffers; reusable eigensystems and Cholesky factorizations remain
+device-resident across prediction chunks. The backend is disabled by default,
+requires CMake 3.18 or newer and the CUDA toolkit, and currently requires a
+dynamic build.
+Build for an NVIDIA A100 (compute capability 8.0) with:
+
+```
+BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
+  -DREGENIE_WITH_CUDA=ON \
+  -DREGENIE_CUDA_ARCHITECTURES=80
+cmake --build build-cuda -j
+```
+
+Select it in Step 1 with `--compute-backend cuda`; use `--gpu-device` when
+more than one CUDA device is visible. `--compute-backend auto` uses CUDA when
+the binary contains the backend and the requested device is available,
+otherwise it uses the CPU backend.
+
+Sample-major device buffers are limited to approximately 1 GB by default.
+Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer
+streaming limit; this is primarily useful for validation or sharing a GPU with
+other jobs.
+
+For development, the repository includes a single A100 validation command.
+It builds both backends, checks matrix shapes and failure paths, benchmarks
+both the Level 0 eigensystem and nonlinear Level 1 workloads, runs quantitative,
+binary, count, time-to-event, top-SNP, k-fold, and LOOCV Step 1 jobs, and
+compares the CPU and CUDA LOCO files. It also records peak device-memory use
+for the CUDA benchmark and each end-to-end case:
+
+```
+BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh
+```
+
+The normal build remains CUDA-free, so CPU development and regression testing
+can continue on macOS. CUDA compilation is also checked in CI without running
+GPU code.
+
 ### With Docker
 Alternatively, you can use a Docker image to run **regenie**. 
 A guide to using docker is available on 

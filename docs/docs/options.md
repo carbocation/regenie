@@ -287,6 +287,8 @@ Samples with missing LOCO predictions must have their corresponding phenotype va
 |`--force-qt`| FLAG | Optional | force QT run for binary traits|
 |`--threads`| INT | Optional| number of computational threads to use [default=all-1]|
 |`--step1-profile`| FLAG | Optional| output structured timing data for Step 1 Level 0|
+|`--compute-backend`| STRING | Optional| Step 1 compute backend: `cpu`, `cuda`, or `auto` [default=cpu]|
+|`--gpu-device`| INT | Optional| CUDA device index for the Step 1 compute backend [default=0]|
 |`--debug`| FLAG | Optional | debug flag (for use by developers)|
 |`--verbose`| FLAG | Optional| verbose screen output|
 |`--version`| FLAG | Optional| print version number and exit|

@@ -78,6 +78,41 @@ double elapsed_ms(const ProfileClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
 }
 
+void build_step1_prediction_groups(
+  const std::vector<int>& chromosomes,
+  const std::map<int, std::vector<int>>& chromosome_map,
+  int ridge_count,
+  const Eigen::ArrayXi& chromosome_column_reductions,
+  Eigen::VectorXi& group_offsets,
+  Eigen::VectorXi& group_sizes,
+  std::vector<int>& group_chromosomes) {
+
+  std::vector<int> offsets;
+  std::vector<int> sizes;
+  group_chromosomes.clear();
+  int offset = 0;
+  for(size_t index = 0; index < chromosomes.size(); ++index) {
+    const int chromosome = chromosomes[index];
+    const std::map<int, std::vector<int>>::const_iterator entry =
+      chromosome_map.find(chromosome);
+    if(entry == chromosome_map.end()) continue;
+    const int size = entry->second[1] * ridge_count -
+      chromosome_column_reductions(chromosome - 1);
+    if(size <= 0) continue;
+    offsets.push_back(offset);
+    sizes.push_back(size);
+    group_chromosomes.push_back(chromosome);
+    offset += size;
+  }
+
+  group_offsets.resize(offsets.size());
+  group_sizes.resize(sizes.size());
+  for(size_t group = 0; group < offsets.size(); ++group) {
+    group_offsets(group) = offsets[group];
+    group_sizes(group) = sizes[group];
+  }
+}
+
 }
 
 Data::Data() : step1_compute_backend(make_cpu_step1_compute_backend()) { // @suppress("Class members should be properly initialized")
@@ -92,6 +127,12 @@ void Data::run() {
 
   // set number of threads
   set_threads(&params);
+
+  if(!params.test_mode) {
+    step1_compute_backend = make_step1_compute_backend(params.compute_backend, params.gpu_device);
+    sout << " * Step 1 compute backend : [" << step1_compute_backend->name() << "] "
+         << step1_compute_backend->description() << "\n";
+  }
 
   if(params.streamBGEN) check_bgen(files.bgen_file, params.file_type, params.zlib_compress, params.streamBGEN, params.BGENbits, params.nChrom);
 
@@ -127,16 +168,16 @@ void Data::run_step1(){
   prep_l1_models();
   // level 1 ridge
   if(params.trait_mode == 0){ // QT
-    if(params.use_loocv) ridge_level_1_loocv(&files, &params, &pheno_data, &l1_ests, sout);
-    else ridge_level_1(&files, &params, &pheno_data, &l1_ests, sout);
+    if(params.use_loocv) ridge_level_1_loocv(&files, &params, &pheno_data, &l1_ests, step1_compute_backend.get(), sout);
+    else ridge_level_1(&files, &params, &pheno_data, &l1_ests, step1_compute_backend.get(), sout);
   } else if(params.trait_mode == 1){ // BT
-    if(params.use_loocv) ridge_logistic_level_1_loocv(&files, &params, &pheno_data, &m_ests, &l1_ests, sout);
-    else ridge_logistic_level_1(&files, &params, &pheno_data, &l1_ests, masked_in_folds, sout);
+    if(params.use_loocv) ridge_logistic_level_1_loocv(&files, &params, &pheno_data, &m_ests, &l1_ests, step1_compute_backend.get(), sout);
+    else ridge_logistic_level_1(&files, &params, &pheno_data, &l1_ests, masked_in_folds, step1_compute_backend.get(), sout);
   } else if(params.trait_mode == 2){ // CT
-    if(params.use_loocv) ridge_poisson_level_1_loocv(&files, &params, &pheno_data, &m_ests, &l1_ests, sout);
-    else ridge_poisson_level_1(&files, &params, &pheno_data, &l1_ests, masked_in_folds, sout);
+    if(params.use_loocv) ridge_poisson_level_1_loocv(&files, &params, &pheno_data, &m_ests, &l1_ests, step1_compute_backend.get(), sout);
+    else ridge_poisson_level_1(&files, &params, &pheno_data, &l1_ests, masked_in_folds, step1_compute_backend.get(), sout);
   } else if(params.trait_mode == 3){ // T2E
-    ridge_cox_level_1(&files, &params, &pheno_data, &l1_ests, &m_ests, sout);
+    ridge_cox_level_1(&files, &params, &pheno_data, &l1_ests, &m_ests, step1_compute_backend.get(), sout);
   }
   // output results
   output();
@@ -681,22 +722,29 @@ void Data::level_0_calculations() {
       // test association for block
       if(params.test_l0) {
         if(params.profile_step1) stage_start = ProfileClock::now();
-        test_assoc_block(chrom, block, l0, l1_ests, &Gblock, &pheno_data, &snpinfo[in_filters.step1_snp_count], params, sout);
+        test_assoc_block(chrom, block, l0, l1_ests, &Gblock, &pheno_data, &snpinfo[in_filters.step1_snp_count], params, step1_compute_backend.get(), sout);
         if(params.profile_step1) step1_profile.association_ms += elapsed_ms(stage_start);
       }
 
       // calc level 0 ridge regressions
       if(params.profile_step1) stage_start = ProfileClock::now();
       const double eigensolve_before_ms = params.profile_step1 ? l0.profile_eigensolve_ms : 0;
+      const double upload_before_ms = params.profile_step1 ? l0.profile_backend_upload_ms : 0;
+      const double download_before_ms = params.profile_step1 ? l0.profile_backend_download_ms : 0;
       if(params.use_loocv)
-        ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, sout);
+        ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, step1_compute_backend.get(), sout);
       else
-        ridge_level_0(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, masked_in_folds, sout);
+        ridge_level_0(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, masked_in_folds, step1_compute_backend.get(), sout);
       if(params.profile_step1) {
         const double ridge_total_ms = elapsed_ms(stage_start);
         const double eigensolve_ms = l0.profile_eigensolve_ms - eigensolve_before_ms;
+        const double upload_ms = l0.profile_backend_upload_ms - upload_before_ms;
+        const double download_ms = l0.profile_backend_download_ms - download_before_ms;
         step1_profile.eigensolve_ms += eigensolve_ms;
-        step1_profile.ridge_ms += std::max(0.0, ridge_total_ms - eigensolve_ms);
+        step1_profile.backend_upload_ms += upload_ms;
+        step1_profile.backend_download_ms += download_ms;
+        step1_profile.ridge_ms += std::max(0.0,
+          ridge_total_ms - eigensolve_ms - upload_ms - download_ms);
         step1_profile.total_ms += elapsed_ms(block_start);
         step1_profile.blocks++;
         step1_profile.variants += bs;
@@ -774,42 +822,52 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
 
     for( int i = 0; i < params.cv_folds; ++i ) {
       MapMatXd Gmat (&(Gblock.Gmat(0,cum_size_folds)), bs, params.cv_sizes(i));
-      ProfileClock::time_point profile_start;
-      if(params.profile_step1) profile_start = ProfileClock::now();
+      Step1ComputeTimings timings;
       if(params.test_l0)
-        step1_compute_backend->compute_crossproduct(Gmat, l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i)), l0->GtY[i]);
+        step1_compute_backend->compute_products(
+          Gmat,
+          l0->ymat_res.middleRows(cum_size_folds, params.cv_sizes(i)),
+          l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
+          params.profile_step1 ? &timings : nullptr);
       else
-        step1_compute_backend->compute_crossproduct(Gmat, pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i)), l0->GtY[i]);
+        step1_compute_backend->compute_products(
+          Gmat,
+          pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i)),
+          l0->G_folds[i], l0->GtY[i], Step1GramMode::full_product,
+          params.profile_step1 ? &timings : nullptr);
       l0->GTY += l0->GtY[i];
-      if(params.profile_step1) step1_profile.gty_ms += elapsed_ms(profile_start);
-
-      if(params.profile_step1) profile_start = ProfileClock::now();
-      step1_compute_backend->compute_gram(Gmat, l0->G_folds[i], Step1GramMode::full_product);
       l0->GGt += l0->G_folds[i];
-      if(params.profile_step1) step1_profile.gram_ms += elapsed_ms(profile_start);
+      if(params.profile_step1) {
+        step1_profile.gty_ms += timings.crossproduct_ms;
+        step1_profile.gram_ms += timings.gram_ms;
+        step1_profile.backend_upload_ms += timings.upload_ms;
+        step1_profile.backend_download_ms += timings.download_ms;
+      }
       cum_size_folds += params.cv_sizes(i);
     }
     
   } else { // loocv
 
-    ProfileClock::time_point profile_start;
-    if(params.profile_step1) profile_start = ProfileClock::now();
-    step1_compute_backend->compute_gram(Gblock.Gmat, l0->GGt, Step1GramMode::selfadjoint_rank_update);
-    if(params.profile_step1) step1_profile.gram_ms += elapsed_ms(profile_start);
-
-    if(params.profile_step1) profile_start = ProfileClock::now();
-    if(params.test_l0)
-      step1_compute_backend->compute_crossproduct(Gblock.Gmat, l0->ymat_res, l0->GTY);
-    else
-      step1_compute_backend->compute_crossproduct(Gblock.Gmat, pheno_data.phenotypes, l0->GTY);
-    if(params.profile_step1) step1_profile.gty_ms += elapsed_ms(profile_start);
-    if(!params.test_l0){
-      if(params.profile_step1) profile_start = ProfileClock::now();
-      SelfAdjointEigenSolver<MatrixXd> esG(l0->GGt);
-      l0->GGt_eig_vec = esG.eigenvectors();
-      l0->GGt_eig_val = esG.eigenvalues();
-      l0->Wmat = l0->GGt_eig_vec.transpose() * l0->GTY;
-      if(params.profile_step1) step1_profile.eigensolve_ms += elapsed_ms(profile_start);
+    Step1ComputeTimings timings;
+    if(params.test_l0) {
+      step1_compute_backend->compute_products(
+        Gblock.Gmat, l0->ymat_res, l0->GGt, l0->GTY,
+        Step1GramMode::selfadjoint_rank_update,
+        params.profile_step1 ? &timings : nullptr);
+    } else {
+      step1_compute_backend->compute_products_and_factorize_ridge(
+        Gblock.Gmat, pheno_data.phenotypes,
+        Step1GramMode::selfadjoint_rank_update,
+        params.profile_step1 ? &timings : nullptr);
+    }
+    if(params.profile_step1) {
+      step1_profile.gty_ms += timings.crossproduct_ms;
+      step1_profile.gram_ms += timings.gram_ms;
+      step1_profile.backend_upload_ms += timings.upload_ms;
+      step1_profile.backend_download_ms += timings.download_ms;
+    }
+    if(!params.test_l0 && params.profile_step1) {
+      step1_profile.eigensolve_ms += timings.eigensolve_ms + timings.transform_ms;
     }
 
   }
@@ -824,13 +882,14 @@ void Data::print_step1_profile() {
 
   const double measured_ms = step1_profile.decode_ms + step1_profile.residualize_ms +
     step1_profile.gram_ms + step1_profile.gty_ms + step1_profile.eigensolve_ms +
+    step1_profile.backend_upload_ms + step1_profile.backend_download_ms +
     step1_profile.association_ms + step1_profile.ridge_ms;
   const double other_ms = std::max(0.0, step1_profile.total_ms - measured_ms);
   const double denominator = step1_profile.total_ms > 0 ? step1_profile.total_ms : 1;
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=1 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=2 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -847,6 +906,8 @@ void Data::print_step1_profile() {
   print_stage("residualize", step1_profile.residualize_ms);
   print_stage("gram", step1_profile.gram_ms);
   print_stage("phenotype_crossproduct", step1_profile.gty_ms);
+  print_stage("backend_upload", step1_profile.backend_upload_ms);
+  print_stage("backend_download", step1_profile.backend_download_ms);
   print_stage("eigensolve_transform", step1_profile.eigensolve_ms);
   print_stage("association", step1_profile.association_ms);
   print_stage("ridge", step1_profile.ridge_ms);
@@ -1286,19 +1347,25 @@ void Data::make_predictions(int const& ph, int const& val) {
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
 
   int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
-  MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
   MatrixXd X1, X2, beta_l1, beta_avg;
   string outname;
   ofstream ofile;
 
   if(params.within_sample_l0){ // DEPRECATED
-    X1 = l1_ests.test_mat[ph_eff][0].transpose() * l1_ests.test_mat[ph_eff][0];
-    X2 = l1_ests.test_mat[ph_eff][0].transpose() * l1_ests.test_pheno[ph][0];
-    for(int i = 1; i < params.cv_folds; ++i ) {
-      X1 += l1_ests.test_mat[ph_eff][i].transpose() * l1_ests.test_mat[ph_eff][i];
-      X2 += l1_ests.test_mat[ph_eff][i].transpose() * l1_ests.test_pheno[ph][i];
+    X1 = MatrixXd::Zero(bs_l1, bs_l1);
+    X2 = MatrixXd::Zero(bs_l1, 1);
+    for(int i = 0; i < params.cv_folds; ++i ) {
+      MatrixXd fold_gram, fold_rhs;
+      step1_compute_backend->compute_design_products(
+        l1_ests.test_mat[ph_eff][i], l1_ests.test_pheno[ph][i],
+        fold_gram, fold_rhs);
+      X1 += fold_gram;
+      X2 += fold_rhs;
     }
-    beta_l1 = (X1 + params.tau[ph](val) * ident_l1).llt().solve(X2);
+    const VectorXd penalty_multipliers = VectorXd::Ones(bs_l1);
+    step1_compute_backend->factorize_diagonal_penalty(
+      X1, params.tau[ph](val), penalty_multipliers);
+    step1_compute_backend->solve_factorized(X2, beta_l1);
   } else if(params.print_block_betas) {
     beta_avg = MatrixXd::Zero(bs_l1, 1);
     for(int i = 0; i < params.cv_folds; ++i ) {
@@ -1317,26 +1384,27 @@ void Data::make_predictions(int const& ph, int const& val) {
   }
 
   // sout << "\nFor tau[" << val <<"] = " << params.tau[ph](val) << endl <<  beta_l1 << endl ;
-  int ctr = 0, chr_ctr = 0;
-  int nn, cum_size_folds;
-
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-    int chrom = files.chr_read[itr];
-    if( !in_map(chrom, chr_map) ) continue;
-
-    nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-    if(nn > 0) {
-      cum_size_folds = 0;
-      for(int i = 0; i < params.cv_folds; ++i ) {
-        if(!params.within_sample_l0) beta_l1 = l1_ests.beta_hat_level_1[ph][i].col(val);
-        predictions[0].block(cum_size_folds, chr_ctr, params.cv_sizes(i), 1) = l1_ests.test_mat[ph_eff][i].block(0, ctr, params.cv_sizes(i), nn) * beta_l1.block(ctr, 0, nn, 1);
-        cum_size_folds += params.cv_sizes(i);
-      }
-      if(params.test_l0) predictions[0].col(chr_ctr) += l1_ests.top_snp_pgs[chrom].col(ph);
-      chr_ctr++;
-      ctr += nn;
-    }
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
+  MatrixXd grouped_predictions;
+  int cum_size_folds = 0;
+  for(int i = 0; i < params.cv_folds; ++i ) {
+    const VectorXd fold_coefficients = params.within_sample_l0 ?
+      beta_l1.col(0) : l1_ests.beta_hat_level_1[ph][i].col(val);
+    step1_compute_backend->grouped_predict(
+      l1_ests.test_mat[ph_eff][i], fold_coefficients,
+      group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
+      group_offsets.size()) = grouped_predictions;
+    cum_size_folds += params.cv_sizes(i);
   }
+  if(params.test_l0)
+    for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
+      predictions[0].col(group) +=
+        l1_ests.top_snp_pgs[group_chromosomes[group]].col(ph);
 
   write_predictions(ph);
 
@@ -1359,9 +1427,9 @@ void Data::make_predictions_loocv(int const& ph, int const& val) {
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
 
   int bs_l1 = l1_ests.test_mat_conc[ph_eff].cols();
-  MatrixXd b0, xtx, tmpMat, HX_chunk;
-  VectorXd zvec, bvec, Yvec;
-  ArrayXd calFactor, yres;
+  MatrixXd b0, xtx, zmat, grouped_predictions;
+  VectorXd bvec, Yvec;
+  ArrayXd yres;
 
   uint64 max_bytes = params.chunk_mb * 1e6;
   // amount of RAM used < max_mb [ creating (target_size * bs_l1) matrix ]
@@ -1374,39 +1442,48 @@ void Data::make_predictions_loocv(int const& ph, int const& val) {
   else
     Yvec = pheno_data.phenotypes.col(ph);
 
-  xtx = l1_ests.test_mat_conc[ph_eff].transpose() * l1_ests.test_mat_conc[ph_eff];
-  xtx.diagonal().array() += params.tau[ph](val) * l1_ests.ridge_param_mult;
-  zvec = l1_ests.test_mat_conc[ph_eff].transpose() * Yvec;
+  const MatrixXd outcomes = Yvec;
+  step1_compute_backend->compute_design_products(
+    l1_ests.test_mat_conc[ph_eff], outcomes, xtx, zmat);
 
-  // fit model on whole data again for optimal ridge param
-  SelfAdjointEigenSolver<MatrixXd> eigMat(xtx);
-  tmpMat = eigMat.eigenvectors() * (1/eigMat.eigenvalues().array()).matrix().asDiagonal() * eigMat.eigenvectors().transpose();
-  bvec = tmpMat * zvec;
-  yres = (Yvec - l1_ests.test_mat_conc[ph_eff] * bvec).array();
+  // fit model on whole data again for optimal ridge param and reuse the
+  // factorization for chunked leave-one-out influence solves.
+  step1_compute_backend->factorize_diagonal_penalty(
+    xtx, params.tau[ph](val), l1_ests.ridge_param_mult.matrix());
+  step1_compute_backend->solve_factorized(zmat, b0);
+  bvec = b0.col(0);
+  VectorXi full_group_offset(1), full_group_size(1);
+  full_group_offset(0) = 0;
+  full_group_size(0) = bs_l1;
+  step1_compute_backend->grouped_predict(
+    l1_ests.test_mat_conc[ph_eff], bvec,
+    full_group_offset, full_group_size, grouped_predictions);
+  yres = (Yvec - grouped_predictions.col(0)).array();
+
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
 
   for(chunk = 0; chunk < nchunk; ++chunk ) {
     size_chunk = chunk == nchunk - 1? params.cv_folds - target_size * chunk : target_size;
     j_start = chunk * target_size;
 
-    HX_chunk = tmpMat * l1_ests.test_mat_conc[ph_eff].middleRows(j_start, size_chunk).transpose(); // k x Nc
-    calFactor = (l1_ests.test_mat_conc[ph_eff].middleRows(j_start, size_chunk).array() * HX_chunk.transpose().array()).matrix().rowwise().sum().array();
-    b0 = bvec.rowwise().replicate(size_chunk) - HX_chunk * (yres.segment(j_start, size_chunk)/(1-calFactor)).matrix().asDiagonal() ;
-
-    int ctr = 0, chr_ctr = 0;
-    int nn;
-
-    for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-      int chrom = files.chr_read[itr];
-      if( !in_map(chrom, chr_map) ) continue;
-
-      nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-      if(nn > 0) {
-        predictions[0].block(j_start, chr_ctr, size_chunk, 1) = (l1_ests.test_mat_conc[ph_eff].block(j_start, ctr, size_chunk, nn).array() * b0.block(ctr, 0, nn, size_chunk).transpose().array()).rowwise().sum();
-        if(params.test_l0) predictions[0].block(j_start, chr_ctr, size_chunk, 1) += l1_ests.top_snp_pgs[chrom].block(j_start, ph, size_chunk, 1);
-        chr_ctr++;
-        ctr += nn;
-      }
-    }
+    const MatrixXd design_chunk =
+      l1_ests.test_mat_conc[ph_eff].middleRows(j_start, size_chunk);
+    const VectorXd residual_chunk = yres.segment(j_start, size_chunk).matrix();
+    const VectorXd leverage_weights = VectorXd::Ones(size_chunk);
+    step1_compute_backend->grouped_leave_one_out_predict_factorized(
+      design_chunk, bvec, residual_chunk, leverage_weights,
+      group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(j_start, 0, size_chunk, group_offsets.size()) =
+      grouped_predictions;
+    if(params.test_l0)
+      for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
+        predictions[0].block(j_start, group, size_chunk, 1) +=
+          l1_ests.top_snp_pgs[group_chromosomes[group]].block(
+            j_start, ph, size_chunk, 1);
   }
 
   if(params.print_block_betas) {
@@ -1437,8 +1514,11 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
 
   int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
   ArrayXd etavec, pivec, wvec, zvec, score;
-  MatrixXd betaold, betanew, XtW, XtWX, XtWZ;
-  MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+  MatrixXd betaold, betanew, XtWX, XtWZ;
+  VectorXi full_group_offset(1), full_group_size(1);
+  full_group_offset(0) = 0;
+  full_group_size(0) = bs_l1;
+  MatrixXd linear_prediction;
 
   // fit model using out-of-sample level 0 predictions from whole data
   if(params.within_sample_l0){
@@ -1451,23 +1531,42 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
       XtWZ = MatrixXd::Zero(bs_l1, 1);
 
       for(int i = 0; i < params.cv_folds; ++i ) {
-        etavec = (l1_ests.test_offset[ph][i] + l1_ests.test_mat[ph_eff][i] * betaold).array();
+        step1_compute_backend->grouped_predict(
+          l1_ests.test_mat[ph_eff][i], betaold.col(0),
+          full_group_offset, full_group_size, linear_prediction);
+        etavec = l1_ests.test_offset[ph][i].array() +
+          linear_prediction.col(0).array();
         pivec = 1 - 1/(etavec.exp() + 1);
         wvec =  pivec * (1 - pivec);
         zvec = (etavec - l1_ests.test_offset[ph][i].array()) + (l1_ests.test_pheno_raw[ph][i].array() - pivec) / wvec;
 
-        XtW = l1_ests.test_mat[ph_eff][i].transpose() * wvec.matrix().asDiagonal();
-        XtWX += XtW * l1_ests.test_mat[ph_eff][i];
-        XtWZ += XtW * zvec.matrix();
+        MatrixXd fold_gram, fold_rhs;
+        const MatrixXd working_response = zvec.matrix();
+        step1_compute_backend->compute_weighted_design_products(
+          l1_ests.test_mat[ph_eff][i], wvec.matrix(), working_response,
+          fold_gram, fold_rhs);
+        XtWX += fold_gram;
+        XtWZ += fold_rhs;
       }
-      XtWX.diagonal() += (params.tau[ph](val) * l1_ests.ridge_param_mult).matrix();
-      betanew = XtWX.llt().solve(XtWZ);
+      VectorXd current_tau(1);
+      current_tau(0) = params.tau[ph](val);
+      step1_compute_backend->diagonal_penalty_solve(
+        XtWX, XtWZ, current_tau, l1_ests.ridge_param_mult.matrix(), betanew);
       // compute score
       score = ArrayXd::Zero(betanew.rows());
       for(int i = 0; i < params.cv_folds; ++i ) {
-        etavec = (l1_ests.test_offset[ph][i] + l1_ests.test_mat[ph_eff][i] * betanew).array();
+        step1_compute_backend->grouped_predict(
+          l1_ests.test_mat[ph_eff][i], betanew.col(0),
+          full_group_offset, full_group_size, linear_prediction);
+        etavec = l1_ests.test_offset[ph][i].array() +
+          linear_prediction.col(0).array();
         pivec = 1 - 1/(etavec.exp() + 1);
-        score += (l1_ests.test_mat[ph_eff][i].transpose() * (l1_ests.test_pheno_raw[ph][i].array() - pivec).matrix()).array();
+        const MatrixXd residual =
+          (l1_ests.test_pheno_raw[ph][i].array() - pivec).matrix();
+        MatrixXd fold_score;
+        step1_compute_backend->compute_design_crossproduct(
+          l1_ests.test_mat[ph_eff][i], residual, fold_score);
+        score += fold_score.col(0).array();
       }
       score -= params.tau[ph](val) * l1_ests.ridge_param_mult * betanew.array();
 
@@ -1478,25 +1577,23 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
     }
   }
 
-  // compute predictor for each chr
-  int ctr = 0, chr_ctr = 0;
-  int nn, cum_size_folds;
-
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-    int chrom = files.chr_read[itr];
-    if( !in_map(chrom, chr_map) ) continue;
-
-    nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-    if(nn > 0) {
-      cum_size_folds = 0;
-      for(int i = 0; i < params.cv_folds; ++i ) {
-        if(!params.within_sample_l0) betanew = l1_ests.beta_hat_level_1[ph][i].col(val);
-        predictions[0].block(cum_size_folds, chr_ctr, params.cv_sizes(i), 1) = l1_ests.test_mat[ph_eff][i].block(0, ctr, params.cv_sizes(i), nn) * betanew.block(ctr, 0, nn, 1);
-        cum_size_folds += params.cv_sizes(i);
-      }
-      chr_ctr++;
-      ctr += nn;
-    }
+  // compute predictor for each chromosome group
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
+  MatrixXd grouped_predictions;
+  int cum_size_folds = 0;
+  for(int i = 0; i < params.cv_folds; ++i ) {
+    if(!params.within_sample_l0)
+      betanew = l1_ests.beta_hat_level_1[ph][i].col(val);
+    step1_compute_backend->grouped_predict(
+      l1_ests.test_mat[ph_eff][i], betanew.col(0),
+      group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
+      group_offsets.size()) = grouped_predictions;
+    cum_size_folds += params.cv_sizes(i);
   }
 
   write_predictions(ph);
@@ -1520,7 +1617,6 @@ void Data::make_predictions_binary_loocv_full(int const& ph, int const& val) {
 
   int bs_l1 = l1_ests.test_mat_conc[ph_eff].cols();
   ArrayXd beta, pivec, wvec;
-  MatrixXd XtWX, V1;
 
   uint64 max_bytes = params.chunk_mb * 1e6;
   // amount of RAM used < max_mb [ creating (bs_l1 * target_size) matrix ]
@@ -1534,25 +1630,19 @@ void Data::make_predictions_binary_loocv_full(int const& ph, int const& val) {
 
   // fit logistic on whole data again for optimal ridge param
   beta = ArrayXd::Zero(bs_l1);
-  run_log_ridge_loocv(params.tau[ph](val), l1_ests.ridge_param_mult, target_size, nchunk, beta, pivec, wvec, Y, X, offset, mask, &params, sout);
+  run_log_ridge_loocv(params.tau[ph](val), l1_ests.ridge_param_mult, target_size, nchunk, beta, pivec, wvec, Y, X, offset, mask, &params, step1_compute_backend.get(), sout);
 
   // use estimates from this model directly
-  // compute predictor for each chr
-  int ctr = 0, chr_ctr = 0;
-  int nn;
-
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-    int chrom = files.chr_read[itr];
-    if( !in_map(chrom, chr_map) ) continue;
-
-    nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-
-    if(nn > 0) {
-      predictions[0].col(chr_ctr) = l1_ests.test_mat_conc[ph_eff].middleCols(ctr, nn) * beta.segment(ctr, nn).matrix();
-      chr_ctr++;
-      ctr += nn;
-    }
-  }
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
+  MatrixXd grouped_predictions;
+  step1_compute_backend->grouped_predict(
+    l1_ests.test_mat_conc[ph_eff], beta.matrix(),
+    group_offsets, group_sizes, grouped_predictions);
+  predictions[0].leftCols(group_offsets.size()) = grouped_predictions;
 
   write_predictions(ph);
 
@@ -1574,9 +1664,8 @@ void Data::make_predictions_binary_loocv(int const& ph, int const& val) {
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
 
   int bs_l1 = l1_ests.test_mat_conc[ph_eff].cols();
-  ArrayXd beta, pivec, wvec, v2;
-  MatrixXd XtWX, V1, beta_final;
-  LLT<MatrixXd> Hinv;
+  ArrayXd beta, pivec, wvec;
+  MatrixXd XtWX, grouped_predictions;
 
   uint64 max_bytes = params.chunk_mb * 1e6;
   // amount of RAM used < max_mb [ creating (bs_l1 * target_size) matrix ]
@@ -1591,11 +1680,11 @@ void Data::make_predictions_binary_loocv(int const& ph, int const& val) {
 
   // fit logistic on whole data again for optimal ridge param
   beta = ArrayXd::Zero(bs_l1);
-  run_log_ridge_loocv(params.tau[ph](val), l1_ests.ridge_param_mult, target_size, nchunk, beta, pivec, wvec, Y, X, offset, mask, &params, sout);
+  run_log_ridge_loocv(params.tau[ph](val), l1_ests.ridge_param_mult, target_size, nchunk, beta, pivec, wvec, Y, X, offset, mask, &params, step1_compute_backend.get(), sout);
 
   // compute Hinv
   //zvec = (etavec - m_ests.offset_nullreg.col(ph).array()) + (pheno_data.phenotypes_raw.col(ph).array() - pivec) / wvec;
-  XtWX = (params.tau[ph](val) * l1_ests.ridge_param_mult).matrix().asDiagonal(); // compute XtWX in chunks
+  XtWX = MatrixXd::Zero(bs_l1, bs_l1); // compute XtWX in chunks
   for(chunk = 0; chunk < nchunk; ++chunk){
     size_chunk = ( chunk == nchunk - 1 ? params.cv_folds - target_size * chunk : target_size );
     j_start = chunk * target_size;
@@ -1604,43 +1693,37 @@ void Data::make_predictions_binary_loocv(int const& ph, int const& val) {
     Ref<ArrayXd> w_chunk = wvec.segment(j_start, size_chunk);
     Ref<ArrayXb> mask_chunk = mask.segment(j_start, size_chunk);
 
-    XtWX.noalias() += Xmat_chunk.transpose() * mask_chunk.select(w_chunk,0).matrix().asDiagonal() * Xmat_chunk;
+    const VectorXd weights = mask_chunk.select(w_chunk, 0).matrix();
+    const MatrixXd no_outcomes(size_chunk, 0);
+    MatrixXd chunk_gram, unused_rhs;
+    step1_compute_backend->compute_weighted_design_products(
+      Xmat_chunk, weights, no_outcomes, chunk_gram, unused_rhs);
+    XtWX += chunk_gram;
   }
-  Hinv.compute( XtWX );
+  step1_compute_backend->factorize_diagonal_penalty(
+    XtWX, params.tau[ph](val), l1_ests.ridge_param_mult.matrix());
+
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
 
   // loo estimates
-  beta_final = MatrixXd::Zero(bs_l1, target_size);
   for(chunk = 0; chunk < nchunk; ++chunk ) {
     size_chunk = chunk == nchunk - 1? params.cv_folds - target_size * chunk : target_size;
     j_start = chunk * target_size;
-    if( chunk == (nchunk - 1) ) beta_final = MatrixXd::Zero(bs_l1, size_chunk);
 
     Ref<MatrixXd> Xmat_chunk = X.middleRows(j_start, size_chunk); // n x k
     Ref<ArrayXd> Yvec_chunk = Y.segment(j_start, size_chunk);
     Ref<ArrayXd> p_chunk = pivec.segment(j_start, size_chunk);
     Ref<ArrayXd> w_chunk = wvec.segment(j_start, size_chunk);
-
-    V1 = Hinv.solve( Xmat_chunk.transpose() ); // k x n
-    v2 = (Xmat_chunk.array() * V1.transpose().array()).rowwise().sum() * w_chunk;
-    beta_final.array().colwise() = beta;
-    beta_final -= V1 * ((Yvec_chunk - p_chunk)/(1-v2)).matrix().asDiagonal();
-
-    // compute predictor for each chr
-    int ctr = 0, chr_ctr = 0;
-    int nn;
-
-    for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-      int chrom = files.chr_read[itr];
-      if( !in_map(chrom, chr_map) ) continue;
-
-      nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-
-      if(nn > 0) {
-        predictions[0].block(j_start, chr_ctr, size_chunk, 1) = ( X.block(j_start, ctr, size_chunk, nn).array() * beta_final.middleRows(ctr, nn).transpose().array() ).matrix().rowwise().sum();
-        chr_ctr++;
-        ctr += nn;
-      }
-    }
+    const VectorXd residual_chunk = (Yvec_chunk - p_chunk).matrix();
+    step1_compute_backend->grouped_leave_one_out_predict_factorized(
+      Xmat_chunk, beta.matrix(), residual_chunk, w_chunk.matrix(),
+      group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(j_start, 0, size_chunk, group_offsets.size()) =
+      grouped_predictions;
   }
 
   write_predictions(ph);
@@ -1673,25 +1756,22 @@ void Data::make_predictions_count(int const& ph, int const& val) {
   if(params.within_sample_l0)
     throw "--within is not supported for count phenotypes";
 
-  // compute predictor for each chr
-  int ctr = 0, chr_ctr = 0;
-  int nn, cum_size_folds;
-
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-    int chrom = files.chr_read[itr];
-    if( !in_map(chrom, chr_map) ) continue;
-
-    nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-    if(nn > 0) {
-      cum_size_folds = 0;
-      for(int i = 0; i < params.cv_folds; ++i ) {
-        betanew = l1_ests.beta_hat_level_1[ph][i].col(val);
-        predictions[0].block(cum_size_folds, chr_ctr, params.cv_sizes(i), 1) = l1_ests.test_mat[ph_eff][i].block(0, ctr, params.cv_sizes(i), nn) * betanew.block(ctr, 0, nn, 1);
-        cum_size_folds += params.cv_sizes(i);
-      }
-      chr_ctr++;
-      ctr += nn;
-    }
+  // compute predictor for each chromosome group
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
+  MatrixXd grouped_predictions;
+  int cum_size_folds = 0;
+  for(int i = 0; i < params.cv_folds; ++i ) {
+    betanew = l1_ests.beta_hat_level_1[ph][i].col(val);
+    step1_compute_backend->grouped_predict(
+      l1_ests.test_mat[ph_eff][i], betanew.col(0),
+      group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
+      group_offsets.size()) = grouped_predictions;
+    cum_size_folds += params.cv_sizes(i);
   }
 
   write_predictions(ph);
@@ -1714,11 +1794,8 @@ void Data::make_predictions_count_loocv(int const& ph, int const& val) {
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
 
   int bs_l1 = l1_ests.test_mat_conc[ph_eff].cols();
-  double v2;
   ArrayXd beta, pivec;
-  MatrixXd XtWX, V1, beta_final;
-  LLT<MatrixXd> Hinv;
-  MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+  MatrixXd XtWX, grouped_predictions;
 
   uint64 max_bytes = params.chunk_mb * 1e6;
   // amount of RAM used < max_mb [ creating (bs_l1 * target_size) matrix ]
@@ -1734,54 +1811,48 @@ void Data::make_predictions_count_loocv(int const& ph, int const& val) {
 
   // fit logistic on whole data again for optimal ridge param
   beta = ArrayXd::Zero(bs_l1);
-  run_ct_ridge_loocv(params.tau[ph](val), l1_ests.ridge_param_mult, target_size, nchunk, beta, pivec, Y, X, offset, mask, &params, sout);
+  run_ct_ridge_loocv(params.tau[ph](val), l1_ests.ridge_param_mult, target_size, nchunk, beta, pivec, Y, X, offset, mask, &params, step1_compute_backend.get(), sout);
 
   // compute Hinv
   //zvec = (etavec - m_ests.offset_nullreg.col(ph).array()) + (pheno_data.phenotypes_raw.col(ph).array() - pivec) / wvec;
-  XtWX = (params.tau[ph](val) * l1_ests.ridge_param_mult).matrix().asDiagonal();
+  XtWX = MatrixXd::Zero(bs_l1, bs_l1);
   for(chunk = 0; chunk < nchunk; ++chunk){
     size_chunk = ( chunk == nchunk - 1 ? params.cv_folds - target_size * chunk : target_size );
     j_start = chunk * target_size;
 
     Ref<MatrixXd> Xmat_chunk = X.block(j_start, 0, size_chunk, bs_l1); // n x k
-    Ref<MatrixXd> w_chunk = pivec.matrix().block(j_start, 0, size_chunk,1);
-
-    XtWX += Xmat_chunk.transpose() * w_chunk.asDiagonal() * Xmat_chunk;
+    const VectorXd weights = pivec.matrix().block(j_start, 0, size_chunk, 1);
+    const MatrixXd no_outcomes(size_chunk, 0);
+    MatrixXd chunk_gram, unused_rhs;
+    step1_compute_backend->compute_weighted_design_products(
+      Xmat_chunk, weights, no_outcomes, chunk_gram, unused_rhs);
+    XtWX += chunk_gram;
   }
-  Hinv.compute( XtWX );
+  step1_compute_backend->factorize_diagonal_penalty(
+    XtWX, params.tau[ph](val), l1_ests.ridge_param_mult.matrix());
+
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
 
   // loo estimates
   for(chunk = 0; chunk < nchunk; ++chunk ) {
     size_chunk = chunk == nchunk - 1? params.cv_folds - target_size * chunk : target_size;
     j_start = chunk * target_size;
-    if( (chunk == 0) || (chunk == nchunk - 1) ) beta_final = MatrixXd::Zero(bs_l1, size_chunk);
 
     Ref<MatrixXd> Xmat_chunk = l1_ests.test_mat_conc[ph_eff].block(j_start, 0, size_chunk, bs_l1); // n x k
     Ref<MatrixXd> Yvec_chunk = pheno_data.phenotypes_raw.block(j_start, ph, size_chunk, 1);
-
-    V1 = Hinv.solve( Xmat_chunk.transpose() ); // k x n
-    for(int i = 0; i < size_chunk; ++i ) {
-      v2 = Xmat_chunk.row(i) * V1.col(i);
-      v2 *= pivec(j_start + i);
-      beta_final.col(i) = (beta - V1.col(i).array() * (Yvec_chunk(i,0) - pivec(j_start + i)) / (1 - v2)).matrix();
-    }
-
-    // compute predictor for each chr
-    int ctr = 0, chr_ctr = 0;
-    int nn;
-
-    for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-      int chrom = files.chr_read[itr];
-      if( !in_map(chrom, chr_map) ) continue;
-
-      nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-
-      if(nn > 0) {
-        predictions[0].block(j_start, chr_ctr, size_chunk, 1) = ( l1_ests.test_mat_conc[ph_eff].block(j_start, ctr, size_chunk, nn).array() * beta_final.block(ctr, 0, nn, size_chunk).transpose().array() ).matrix().rowwise().sum();
-        chr_ctr++;
-        ctr += nn;
-      }
-    }
+    const VectorXd residual_chunk =
+      Yvec_chunk.col(0) - pivec.segment(j_start, size_chunk).matrix();
+    const VectorXd leverage_weights =
+      pivec.segment(j_start, size_chunk).matrix();
+    step1_compute_backend->grouped_leave_one_out_predict_factorized(
+      Xmat_chunk, beta.matrix(), residual_chunk, leverage_weights,
+      group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(j_start, 0, size_chunk, group_offsets.size()) =
+      grouped_predictions;
   }
 
   write_predictions(ph);
@@ -1804,26 +1875,23 @@ void Data::make_predictions_cox(int const& ph, int const& val) {
     read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
 
-  // compute predictor for each chr
-  int ctr = 0, chr_ctr = 0;
-  int nn, cum_size_folds;
-  MatrixXd beta;
-
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
-    int chrom = files.chr_read[itr];
-    if( !in_map(chrom, chr_map) ) continue;
-
-    nn = chr_map[chrom][1] * params.n_ridge_l0 - l1_ests.chrom_map_ndiff(chrom-1);
-    if(nn > 0) {
-      cum_size_folds = 0;
-      for(int i = 0; i < params.cv_folds; ++i ) {
-        beta = l1_ests.beta_hat_level_1[ph][i].col(val);
-        predictions[0].block(cum_size_folds, chr_ctr, params.cv_sizes(i), 1) = l1_ests.test_mat_conc[ph_eff].block(cum_size_folds, ctr, params.cv_sizes(i), nn) * beta.block(ctr, 0, nn, 1);
-        cum_size_folds += params.cv_sizes(i);
-      }
-      chr_ctr++;
-      ctr += nn;
-    }
+  // compute predictor for each chromosome group
+  VectorXi group_offsets, group_sizes;
+  vector<int> group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    group_offsets, group_sizes, group_chromosomes);
+  MatrixXd grouped_predictions;
+  int cum_size_folds = 0;
+  for(int i = 0; i < params.cv_folds; ++i ) {
+    const VectorXd beta = l1_ests.beta_hat_level_1[ph][i].col(val);
+    step1_compute_backend->grouped_predict(
+      l1_ests.test_mat_conc[ph_eff].middleRows(
+        cum_size_folds, params.cv_sizes(i)),
+      beta, group_offsets, group_sizes, grouped_predictions);
+    predictions[0].block(cum_size_folds, 0, params.cv_sizes(i),
+      group_offsets.size()) = grouped_predictions;
+    cum_size_folds += params.cv_sizes(i);
   }
 
   write_predictions(ph);

@@ -37,6 +37,8 @@ struct Step1Profile {
   double residualize_ms = 0;
   double gram_ms = 0;
   double gty_ms = 0;
+  double backend_upload_ms = 0;
+  double backend_download_ms = 0;
   double eigensolve_ms = 0;
   double association_ms = 0;
   double ridge_ms = 0;

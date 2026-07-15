@@ -234,6 +234,8 @@ struct param {
   bool cox_nofirth = false;
   bool coxscore_exact = false;
   bool verbose = false, debug = false, profile_step1 = false;
+  std::string compute_backend = "cpu";
+  int gpu_device = 0;
   bool early_exit = false, l1_full_samples = false, rint = false, rerint = false, rerintcov = false;
   bool split_l0 = false, run_l0_only = false, run_l1_only = false; // run level 0 in parallel across different jobs
   std::map<std::string, bool> select_pheno_l1;
