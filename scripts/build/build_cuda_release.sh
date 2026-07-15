@@ -216,8 +216,17 @@ if [[ -n "${nvcc_supported}" ]]; then
   done
 fi
 
+deps_dir="${XDG_CACHE_HOME:-$HOME/.cache}/regenie-build-deps"
+bgen_compatibility_patch=0
 if [[ -z "${BGEN_PATH:-}" ]]; then
-  deps_dir="${XDG_CACHE_HOME:-$HOME/.cache}/regenie-build-deps"
+  for candidate in "${deps_dir}/v1.1.7" "${HOME}/src/v1.1.7"; do
+    if [[ -f "${candidate}/build/libbgen.a" ]]; then
+      BGEN_PATH="${candidate}"
+      break
+    fi
+  done
+fi
+if [[ -z "${BGEN_PATH:-}" ]]; then
   BGEN_PATH="${deps_dir}/v1.1.7"
   bgen_archive="${deps_dir}/v1.1.7.tgz"
   mkdir -p "${deps_dir}"
@@ -234,6 +243,14 @@ if [[ -z "${BGEN_PATH:-}" ]]; then
       fi
     fi
     tar -xzf "${bgen_archive}" -C "${deps_dir}"
+    bgen_view="${BGEN_PATH}/src/View.cpp"
+    if [[ -f "${bgen_view}" ]] &&
+       grep -q 'std::ios::streampos origin' "${bgen_view}"; then
+      # BGEN 1.1.7 predates current libstdc++ releases. streampos belongs to
+      # namespace std, not the std::ios class; correct only that exact token.
+      sed -i 's/std::ios::streampos origin/std::streampos origin/' "${bgen_view}"
+      bgen_compatibility_patch=1
+    fi
     (
       cd "${BGEN_PATH}"
       python3 waf configure
@@ -276,6 +293,7 @@ echo "CUDA_RELEASE_BUILD_CPU architecture=${cpu_architecture} tune=${cpu_tune}"
 echo "CUDA_RELEASE_BUILD_TOOLKIT=$(nvcc --version | tail -n 1)"
 echo "CUDA_RELEASE_BUILD_COMPILER=$(g++ --version | head -n 1)"
 echo "CUDA_RELEASE_BUILD_BGEN=${BGEN_PATH}"
+echo "CUDA_RELEASE_BUILD_BGEN_COMPATIBILITY_PATCH=${bgen_compatibility_patch}"
 echo "CUDA_RELEASE_BUILD_MKL=${MKLROOT}"
 
 export STATIC=1

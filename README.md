@@ -81,6 +81,9 @@ if [ ! -f "$bgen_dir/build/libbgen.a" ]; then
   wget -O "$deps_dir/v1.1.7.tgz" \
     http://code.enkre.net/bgen/tarball/release/v1.1.7
   tar -xzf "$deps_dir/v1.1.7.tgz" -C "$deps_dir"
+  sed -i \
+    's/std::ios::streampos origin/std::streampos origin/' \
+    "$bgen_dir/src/View.cpp"
   (cd "$bgen_dir" && python3 waf configure && python3 waf)
 fi
 
@@ -180,6 +183,9 @@ if [ ! -f "$bgen_dir/build/libbgen.a" ]; then
   wget -O "$deps_dir/v1.1.7.tgz" \
     http://code.enkre.net/bgen/tarball/release/v1.1.7
   tar -xzf "$deps_dir/v1.1.7.tgz" -C "$deps_dir"
+  sed -i \
+    's/std::ios::streampos origin/std::streampos origin/' \
+    "$bgen_dir/src/View.cpp"
   (cd "$bgen_dir" && python3 waf configure && python3 waf)
 fi
 

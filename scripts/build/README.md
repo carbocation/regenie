@@ -8,6 +8,11 @@ Artifact names contain the source commit, and the builder refuses tracked source
 changes that have not been committed. Untracked compiler products are allowed so
 an existing remote build checkout can be reused.
 
+When `BGEN_PATH` is unset, the builder reuses a completed BGEN v1.1.7 build from
+the dependency cache or `$HOME/src/v1.1.7`. For a fresh download it applies the
+narrow `std::ios::streampos` to `std::streampos` compatibility correction needed
+by current libstdc++ releases before invoking Waf.
+
 The default `datacenter` profile produces one CUDA fat binary for these compute
 capabilities:
 
