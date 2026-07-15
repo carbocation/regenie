@@ -66,9 +66,8 @@ chunked final-model influence solves. Level 0 products, design Gram matrices,
 weighted Hessians, score crossproducts, linear predictors, and
 chromosome-grouped LOCO predictions are streamed through bounded device
 buffers; reusable eigensystems and Cholesky factorizations remain
-device-resident across prediction chunks. The backend is disabled by default,
-requires CMake 3.18 or newer and the CUDA toolkit, and currently requires a
-dynamic build.
+device-resident across prediction chunks. The backend is disabled by default
+and requires CMake 3.18 or newer and the CUDA toolkit.
 Build for an NVIDIA A100 (compute capability 8.0) with:
 
 ```
@@ -78,10 +77,23 @@ BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
 cmake --build build-cuda -j
 ```
 
-Select it in Step 1 with `--compute-backend cuda`; use `--gpu-device` when
-more than one CUDA device is visible. `--compute-backend auto` uses CUDA when
-the binary contains the backend and the requested device is available,
-otherwise it uses the CPU backend.
+The existing `STATIC=1` mode remains available for CUDA-enabled builds. It
+retains its usual behavior for oneMKL and the supported host dependencies,
+while the CUDA libraries remain dynamically linked:
+
+```
+BGEN_PATH=<path_to_bgen_lib> MKLROOT=<path_to_oneMKL> STATIC=1 \
+cmake -S . -B build-cuda-mkl \
+  -DREGENIE_WITH_CUDA=ON \
+  -DREGENIE_CUDA_ARCHITECTURES=80
+cmake --build build-cuda-mkl -j
+```
+
+CUDA-enabled builds default to `--compute-backend auto`: Step 1 uses device 0
+when it is available and otherwise falls back to the CPU backend. Use
+`--gpu-device` to select a different visible device, `--compute-backend cpu` to
+prevent GPU use, or `--compute-backend cuda` to require CUDA rather than fall
+back.
 
 Sample-major device buffers are limited to approximately 1 GB by default.
 Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer

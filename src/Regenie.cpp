@@ -258,7 +258,7 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
   AllOptions.add_options("Additional")
     ("v,verbose", "verbose screen output")
     ("step1-profile", "output structured timing data for step 1 level 0")
-    ("compute-backend", "Step 1 compute backend: cpu, cuda, or auto", cxxopts::value<std::string>(params->compute_backend),"STRING(=cpu)")
+    ("compute-backend", "Step 1 compute backend: cpu, cuda, or auto", cxxopts::value<std::string>(params->compute_backend), "STRING(=" + params->compute_backend + ")")
     ("gpu-device", "CUDA device index for the Step 1 compute backend", cxxopts::value<int>(params->gpu_device),"INT(=0)")
     ("version", "print version number and exit")
     ("minCaseCount", "minimum number of cases per trait", cxxopts::value<int>(params->mcc),"INT=10")
@@ -912,11 +912,16 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
       throw "--compute-backend must be one of: cpu, cuda, auto";
     if(params->gpu_device < 0)
       throw "--gpu-device must be non-negative";
-    if(params->test_mode && (params->compute_backend != "cpu" || vm.count("gpu-device"))) {
-      sout << "WARNING: options --compute-backend/--gpu-device currently only apply to step 1.\n";
+    if(params->test_mode) {
+      bool const invalid_step2_backend =
+        (vm.count("compute-backend") && params->compute_backend != "cpu") ||
+        vm.count("gpu-device");
+      if(invalid_step2_backend) {
+        sout << "WARNING: options --compute-backend/--gpu-device currently only apply to step 1.\n";
+        valid_args[ "compute-backend" ] = valid_args[ "gpu-device" ] = false;
+      }
       params->compute_backend = "cpu";
       params->gpu_device = 0;
-      valid_args[ "compute-backend" ] = valid_args[ "gpu-device" ] = false;
     }
 
     if( (vm.count("write-samples") || vm.count("write-mask")) && vm.count("bgen") && !vm.count("sample") )

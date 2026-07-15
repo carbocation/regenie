@@ -1,3 +1,260 @@
+<!-- BEGIN FORK README PREAMBLE -->
+# REGENIE acceleration fork
+
+This repository is an ***unofficial***, performance-oriented fork of the [official
+REGENIE project](https://github.com/rgcgithub/regenie). This is ***not*** an
+official Regeneron Genetics Center distribution. The goal is to preserve the
+upstream command-line interface and statistical behavior while improving
+performance and adding GPU acceleration for Step 1.
+
+## What this fork adds
+
+- An optional NVIDIA CUDA backend for the compute-intensive parts of Step 1.
+  (Note that Step 2 does not use CUDA.)
+- Faster Step 1 host I/O, PGEN ingestion, profiling, and LOCO prediction output,
+  even for CPU-only runs.
+- Step 2 CPU fast paths for PGEN hardcalls, BGEN dosages, and dense
+  quantitative-trait scoring, even for CPU-only runs.
+- Faster saddlepoint approximation and Cox Firth correction paths, even for
+  CPU-only runs.
+- Structured performance profiles and CPU/CUDA conformance tests used to
+  validate optimized paths against reference results.
+
+Normal CPU-only builds will build and run without CUDA. To enable CUDA, build
+with `-DREGENIE_WITH_CUDA=ON`. CUDA-enabled builds use `--compute-backend auto`
+by default, selecting an available GPU for Step 1 and falling back to the CPU
+when necessary; see the [CUDA build and runtime
+documentation](docs/docs/install.md#experimental-cuda-step-1-backend) for
+details. The CUDA path has been exercised on NVIDIA T4 and A100 GPUs.
+Floating-point implementations can differ in their final printed digits, so
+validation includes numerical comparisons in addition to regression tests.
+
+Please report fork-specific problems to the [carbocation/regenie issue
+tracker](https://github.com/carbocation/regenie/issues).
+
+## Example optimized builds for x86-64 Ubuntu
+
+> [!IMPORTANT] These example commands are specifically for **x86-64 Ubuntu Linux
+> systems** using the APT package manager. Other systems require
+> platform-appropriate dependencies and package-manager commands.
+
+Both examples install `regenie` in `$HOME/.local/bin` and use Intel oneMKL. The
+resulting binary is optimized for the machine that builds it.
+
+### Performance-optimized CPU build
+
+This example installs the build dependencies and oneMKL, fetches this fork and
+the required BGEN library, builds a CPU-only binary, and installs it for the
+current user:
+
+```bash
+set -eo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+sudo apt-get update
+sudo apt-get install -y \
+  ca-certificates cmake g++ gfortran git gnupg make python3 wget zlib1g-dev
+
+# Add Intel's official oneAPI APT repository and install oneMKL.
+wget -O- \
+  https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+  | gpg --dearmor \
+  | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+echo \
+  "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+  | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+sudo apt-get update
+sudo apt-get install -y intel-oneapi-mkl-devel
+
+source /opt/intel/oneapi/setvars.sh
+export MKL_THREADING_LAYER=GNU
+
+git clone --branch master --single-branch \
+  https://github.com/carbocation/regenie.git regenie-acceleration
+cd regenie-acceleration
+
+# Build REGENIE's BGEN dependency once in a reusable cache directory.
+deps_dir="${XDG_CACHE_HOME:-$HOME/.cache}/regenie-build-deps"
+bgen_dir="$deps_dir/v1.1.7"
+mkdir -p "$deps_dir"
+if [ ! -f "$bgen_dir/build/libbgen.a" ]; then
+  wget -O "$deps_dir/v1.1.7.tgz" \
+    http://code.enkre.net/bgen/tarball/release/v1.1.7
+  tar -xzf "$deps_dir/v1.1.7.tgz" -C "$deps_dir"
+  (cd "$bgen_dir" && python3 waf configure && python3 waf)
+fi
+
+BGEN_PATH="$bgen_dir" \
+MKLROOT="$MKLROOT" \
+STATIC=1 \
+cmake -S . -B build-cpu-mkl \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native -mtune=native"
+
+cmake --build build-cpu-mkl --target regenie -j "$(nproc)"
+cmake --install build-cpu-mkl --prefix "$HOME/.local"
+
+regenie --version
+```
+
+The CPU recipe uses static oneMKL linkage so the installed executable does not
+require the oneAPI environment to be sourced at runtime.
+
+### Performance-optimized CUDA build
+
+This example assumes that the NVIDIA driver and CUDA toolkit are already
+installed. It checks both, reports each GPU's compute capability, and builds
+only for architectures that are present. See NVIDIA's [CUDA installation
+guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) if either
+check fails.
+
+The resulting executable includes both CUDA and CPU backends. This recipe uses
+REGENIE's existing `STATIC=1` build mode, which statically links oneMKL and the
+supported host dependencies. CUDA remains dynamically linked. The executable
+can use its CPU backend on a machine where the required CUDA shared libraries
+are installed but no usable GPU is available. It will not start on a genuinely
+CUDA-free machine where those libraries are absent; use the CPU-only build
+above in that situation. The CUDA-enabled binary retains the same oneMKL and
+native-host optimizations for Step 2 and for Step 1 CPU fallbacks.
+
+```bash
+set -eo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+command -v nvidia-smi >/dev/null || {
+  echo "The NVIDIA driver and nvidia-smi are required." >&2
+  exit 1
+}
+command -v nvcc >/dev/null || {
+  echo "The CUDA toolkit and nvcc are required." >&2
+  exit 1
+}
+
+nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+nvcc --version
+
+cuda_architectures="$(
+  nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
+    | sed 's/[[:space:].]//g' \
+    | sort -u \
+    | paste -sd';' -
+)"
+if [[ -z "$cuda_architectures" || "$cuda_architectures" == *[!0-9\;]* ]]; then
+  echo "Could not derive CUDA architectures from nvidia-smi." >&2
+  exit 1
+fi
+echo "Building for CUDA architectures: $cuda_architectures"
+
+sudo apt-get update
+sudo apt-get install -y \
+  ca-certificates cmake g++ gfortran git gnupg make python3 wget zlib1g-dev
+
+# Install oneMKL for maximum performance in CPU code paths.
+wget -O- \
+  https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+  | gpg --dearmor \
+  | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+echo \
+  "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+  | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+sudo apt-get update
+sudo apt-get install -y intel-oneapi-mkl-devel
+
+source /opt/intel/oneapi/setvars.sh
+export MKL_THREADING_LAYER=GNU
+
+git clone --branch master --single-branch \
+  https://github.com/carbocation/regenie.git regenie-acceleration-cuda
+cd regenie-acceleration-cuda
+
+deps_dir="${XDG_CACHE_HOME:-$HOME/.cache}/regenie-build-deps"
+bgen_dir="$deps_dir/v1.1.7"
+mkdir -p "$deps_dir"
+if [ ! -f "$bgen_dir/build/libbgen.a" ]; then
+  wget -O "$deps_dir/v1.1.7.tgz" \
+    http://code.enkre.net/bgen/tarball/release/v1.1.7
+  tar -xzf "$deps_dir/v1.1.7.tgz" -C "$deps_dir"
+  (cd "$bgen_dir" && python3 waf configure && python3 waf)
+fi
+
+BGEN_PATH="$bgen_dir" \
+MKLROOT="$MKLROOT" \
+STATIC=1 \
+cmake -S . -B build-cuda-mkl \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF \
+  -DREGENIE_WITH_CUDA=ON \
+  "-DREGENIE_CUDA_ARCHITECTURES=${cuda_architectures}" \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native -mtune=native"
+
+cmake --build build-cuda-mkl --target regenie -j "$(nproc)"
+cmake --install build-cuda-mkl --prefix "$HOME/.local"
+
+if ldd "$(command -v regenie)" | grep -q 'libmkl'; then
+  echo "Unexpected dynamic oneMKL dependency." >&2
+  exit 1
+fi
+regenie --version
+```
+
+The oneAPI environment is needed while configuring and linking this build, but
+not at runtime because oneMKL is linked statically. CUDA runtime libraries are
+still required.
+
+### CUDA Usage: Selecting the Step 1 backend when running regenie
+
+Note that CUDA is only relevant for Step 1. If regenie is compiled with CUDA
+support and run on a machine with CUDA, the default backend and device options
+will attempt to use CUDA and will fall back to CPU if not successful. I.e., in
+the most common one-GPU case, the standard REGENIE commands can be used without
+requiring any additional arguments:
+
+```bash
+mkdir -p results
+regenie \
+  --step 1 \
+  --pgen data/cohort \
+  --phenoFile data/phenotypes.tsv \
+  --covarFile data/covariates.tsv \
+  --qt \
+  --bsize 1000 \
+  --threads "$(nproc)" \
+  --out results/step1-auto
+```
+
+CUDA-enabled builds default to `--compute-backend auto`, in which Step 1 tries
+the selected GPU device (default 0) and falls back to the CPU backend when the
+executable starts successfully but no usable CUDA device is available. Use
+`--gpu-device` to select a different visible device, `--compute-backend cpu` to
+prevent GPU use, or `--compute-backend cuda` when the run should fail instead of
+falling back. For example, this quantitative-trait run explicitly requires CUDA
+and specifies GPU 0:
+
+```bash
+mkdir -p results
+regenie \
+  --step 1 \
+  --pgen data/cohort \
+  --phenoFile data/phenotypes.tsv \
+  --covarFile data/covariates.tsv \
+  --qt \
+  --bsize 1000 \
+  --threads "$(nproc)" \
+  --compute-backend cuda \
+  --gpu-device 0 \
+  --out results/step1-cuda
+```
+
+The paths and `--qt` option are illustrative; replace them with the normal
+Step 1 arguments for the dataset and trait type being analyzed. Add
+`--compute-backend cpu` to such a command when GPU use is not wanted.
+
+The upstream README is preserved below.
+
+---
+
+<!-- END FORK README PREAMBLE -->
 [![build](https://github.com/rgcgithub/regenie/actions/workflows/test.yml/badge.svg)](https://github.com/rgcgithub/regenie/actions/workflows/test.yml)
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/rgcgithub/regenie?logo=Github)
 [![install with conda](https://img.shields.io/badge/install%20with-conda-brightgreen.svg)](https://anaconda.org/bioconda/regenie)

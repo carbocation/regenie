@@ -234,7 +234,11 @@ struct param {
   bool cox_nofirth = false;
   bool coxscore_exact = false;
   bool verbose = false, debug = false, profile_step1 = false;
+#ifdef WITH_CUDA
+  std::string compute_backend = "auto";
+#else
   std::string compute_backend = "cpu";
+#endif
   int gpu_device = 0;
   bool early_exit = false, l1_full_samples = false, rint = false, rerint = false, rerintcov = false;
   bool split_l0 = false, run_l0_only = false, run_l1_only = false; // run level 0 in parallel across different jobs
