@@ -13,9 +13,20 @@ benchmark_phenotypes="${BENCHMARK_PHENOTYPES:-10}"
 benchmark_repeats="${BENCHMARK_REPEATS:-3}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
+pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
+pgen_prefetch_mb="${STEP1_PGEN_PREFETCH_MB:-${REGENIE_STEP1_PGEN_PREFETCH_MB:-4096}}"
+pgen_tile_variants="${STEP1_PGEN_TILE_VARIANTS:-${REGENIE_STEP1_PGEN_TILE_VARIANTS:-8}}"
 validation_dir="${build_dir}/a100-validation"
-if [[ ! "${resident_mb}" =~ ^[0-9]+$ ]]; then
-  echo "resident_mb must be a non-negative integer (received '${resident_mb}')" >&2
+for setting in resident_mb pinned_staging_mb pgen_prefetch_mb; do
+  value="${!setting}"
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${setting} must be a non-negative integer (received '${value}')" >&2
+    exit 2
+  fi
+done
+if [[ ! "${pgen_tile_variants}" =~ ^[1-9][0-9]*$ ]] ||
+   (( pgen_tile_variants > 64 )); then
+  echo "pgen_tile_variants must be an integer in [1,64] (received '${pgen_tile_variants}')" >&2
   exit 2
 fi
 
@@ -68,6 +79,9 @@ run_with_memory_log() {
 
 nvcc --version
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
+export REGENIE_CUDA_PINNED_STAGING_MB="${pinned_staging_mb}"
+export REGENIE_STEP1_PGEN_PREFETCH_MB="${pgen_prefetch_mb}"
+export REGENIE_STEP1_PGEN_TILE_VARIANTS="${pgen_tile_variants}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   if ! nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version \
     --format=csv,noheader; then

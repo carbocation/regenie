@@ -59,6 +59,11 @@ struct Step1Profile {
   double preprocess_upload_ms = 0;
   double preprocess_download_ms = 0;
   double preprocess_host_orchestration_ms = 0;
+  uint64_t preprocess_pinned_staging_upload_count = 0;
+  uint64_t preprocess_pinned_staging_upload_bytes = 0;
+  uint64_t pgen_prefetched_blocks = 0;
+  double pgen_prefetch_service_ms = 0;
+  double pgen_prefetch_wait_ms = 0;
 };
 
 class Data {
@@ -98,6 +103,7 @@ class Data {
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
     MultiPhen mphen;
     Step1Profile step1_profile;
+    Step1PgenReadProfile step1_pgen_read_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions

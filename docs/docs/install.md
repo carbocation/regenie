@@ -99,6 +99,25 @@ preprocessing, or raise it deliberately when a larger block fits comfortably
 in device memory. The validation harness exposes the same setting as
 `CUDA_RESIDENT_MB`.
 
+Large resident uploads use two reusable pinned host chunks so host packing can
+overlap transfer to the device. `REGENIE_CUDA_PINNED_STAGING_MB` controls the
+size of each chunk (64 MB by default); set it to `0` to restore direct pageable
+uploads. Pinned staging adds only twice the configured chunk size to host
+memory, independent of the genotype block size.
+
+For CUDA Step 1 runs on PGEN input, the next genotype block is decoded into a
+reusable second host matrix while the current block is processed on the GPU.
+Prefetching is enabled when the additional matrix is no larger than
+`REGENIE_STEP1_PGEN_PREFETCH_MB` (4,096 MB by default). Set the value to `0` to
+disable prefetching or lower it to cap the additional host-memory allowance.
+The PGEN decoder itself reuses one sample tile per worker and fuses
+validation, masking, allele-frequency accumulation, and missing-value
+imputation into a single scatter pass. It materializes eight variants at a
+time by default so each sample-major destination write is contiguous; set
+`REGENIE_STEP1_PGEN_TILE_VARIANTS` to an integer from 1 through 64 to tune the
+memory-bandwidth tradeoff. Each worker retains one tile buffer, so its host
+memory cost is `tile variants * samples * 8` bytes per worker.
+
 For development, the repository includes a single A100 validation command.
 It builds both backends, checks matrix shapes and failure paths, benchmarks
 both the Level 0 eigensystem and nonlinear Level 1 workloads, runs quantitative,
@@ -109,6 +128,16 @@ for the CUDA benchmark and each end-to-end case:
 ```
 BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh
 ```
+
+Application runs using `--step1-profile` report how many blocks used CUDA
+genotype preprocessing, along with pinned-staging upload counts and bytes.
+PGEN-prefetched runs add a `pgen_pipeline` scope containing decoder service,
+foreground wait, and estimated overlap time. A `pgen_ingest` scope separates
+aggregate worker time inside pgenlib from fused validation, masking,
+allele-frequency calculation, missing-value imputation, and matrix
+materialization. On Linux it also reports process I/O deltas sampled around
+each PGEN block; these distinguish logical reads, which may be page-cached,
+from storage-backed reads reported by `/proc/self/io`.
 
 The normal build remains CUDA-free, so CPU development and regression testing
 can continue on macOS. CUDA compilation is also checked in CI without running
