@@ -203,7 +203,8 @@ cmake -S . -B build-cuda-mkl \
   -DBUILD_TESTING=OFF \
   -DREGENIE_WITH_CUDA=ON \
   "-DREGENIE_CUDA_ARCHITECTURES=${cuda_architectures}" \
-  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native -mtune=native"
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native -mtune=native" \
+  -DCMAKE_CUDA_FLAGS_RELEASE="-O3 -DNDEBUG -Xcompiler=-march=native,-mtune=native"
 
 cmake --build build-cuda-mkl --target regenie -j "$(nproc)"
 cmake --install build-cuda-mkl --prefix "$HOME/.local"

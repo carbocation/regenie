@@ -315,7 +315,8 @@ cmake -S "${repo_root}" -B "${build_dir}" \
   "-DBUILD_TESTING=${cmake_build_testing}" \
   -DREGENIE_WITH_CUDA=ON \
   "-DREGENIE_CUDA_ARCHITECTURES=${cuda_architectures}" \
-  "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=${cpu_architecture} -mtune=${cpu_tune}"
+  "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=${cpu_architecture} -mtune=${cpu_tune}" \
+  "-DCMAKE_CUDA_FLAGS_RELEASE=-O3 -DNDEBUG -Xcompiler=-march=${cpu_architecture},-mtune=${cpu_tune}"
 build_targets=(regenie)
 if (( run_tests == 1 )); then
   build_targets+=(step1_compute_test cox_firth_test)

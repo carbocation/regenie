@@ -37,7 +37,9 @@ The packaged host code defaults to `-march=x86-64-v3 -mtune=generic` so that a
 single artifact can run across modern x86-64 GPU hosts. Use `--native-cpu` for a
 machine-specific build, or select another CPU floor explicitly. GPU targets can
 also be supplied directly, which is useful for newer architectures supported by
-the installed toolkit:
+the installed toolkit. The builder passes the same CPU target to the ordinary
+C++ compiler and NVCC's host compiler so Eigen retains one ABI across C++ and
+CUDA translation units:
 
 ```bash
 # Portable fat binary for common NVIDIA data-center GPU families.
