@@ -2539,6 +2539,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 
   int const bs = indices.size();
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
+  const bool all_samples_in_analysis = filters->ind_in_analysis.all();
+  const bool has_trait_missingness = filters->has_missing.any();
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -2564,6 +2566,19 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 
     mac = 0, nmales = 0;
     bool non_par = in_non_par(chrom, snp_info->physpos, params);
+    const bool use_fast_hardcall_path =
+      !params->build_mask &&
+      !params->dosage_mode &&
+      (params->test_type == 0) &&
+      !non_par &&
+      !params->af_cc &&
+      params->split_by_pheno &&
+      !params->htp_out &&
+      !params->w_interaction &&
+      !params->snp_set &&
+      !params->trait_set &&
+      !params->multiphen;
+    bool requires_mean_imputation = true;
     if( params->dosage_mode ) eij2 = 0;
 
     // read genotype data
@@ -2573,50 +2588,105 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     else
       pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
 
-    oob_err(j) = ((Geno < -3) || (Geno > 2)).any();
-    if(oob_err(j)) continue;
+    if(use_fast_hardcall_path) {
+      total = 0;
+      snp_data->ns1 = 0;
+      snp_data->n_zero = filters->ind_in_analysis.size() -
+        params->n_samples;
+      requires_mean_imputation = false;
 
-    keep_index = filters->ind_in_analysis && (Geno != -3.0);
-    total = keep_index.select(Geno,0).sum();
-    snp_data->ns1 = keep_index.count();
-    if(params->test_mode && !params->build_mask) snp_data->n_zero = filters->ind_in_analysis.size() - params->n_samples;
-    //cerr << "ID: " << snp_info->ID << "\nG bounds: " << 
-    //  (Geno * keep_index.cast<double>()).minCoeff() << " - " << (Geno * keep_index.cast<double>()).maxCoeff() << "\n\n";
-
-    for (int index = 0; index < filters->ind_in_analysis.size(); index++) {
-
-      if( keep_index(index) ){
-        // compute MAC using 0.5*g for males for variants on sex chr non-PAR (males coded as diploid)
-        // sex is 1 for males and 0 o.w.
-        ival = 0, lval = 0, mval = Geno(index);
-        //cerr << "index (" << params->sex(index)<<") " << index << " : " << mval << "\n";
-        if(params->test_mode){
-          if(!params->build_mask && (mval == 0)) snp_data->n_zero++;
-          if (mval >= 0.5) ncarriers++;
-
-          if(non_par) {
-            lval = (params->sex(index) == 1);
-            mval *= 0.5 * (2 - lval);
-            // check if not 0/2
-            if( !params->dosage_mode && (lval == 1) && (Geno(index) == 1) )
-              het_male_X(j) = true;
+      if(all_samples_in_analysis && !has_trait_missingness) {
+        for(int index = 0; index < Geno.size(); index++) {
+          const double genotype = Geno(index);
+          if(genotype < -3 || genotype > 2) {
+            oob_err(j) = true;
+            break;
           }
+          if(genotype == -3) {
+            requires_mean_imputation = true;
+            continue;
+          }
+          total += genotype;
+          snp_data->ns1++;
+          if(genotype == 0) snp_data->n_zero++;
         }
+      } else {
+        for(int index = 0;
+            index < filters->ind_in_analysis.size(); index++) {
+          const double genotype = Geno(index);
+          if(genotype < -3 || genotype > 2) {
+            oob_err(j) = true;
+            break;
+          }
+          if(!filters->ind_in_analysis(index)) {
+            requires_mean_imputation = true;
+            continue;
+          }
+          if(genotype == -3) {
+            requires_mean_imputation = true;
+            continue;
+          }
 
-        if( params->dosage_mode ) ival = Geno(index) * Geno(index);
-
-        if (params->test_mode && non_par && params->skip_dosage_comp && lval){
-          Geno(index) /= 2.0; // divide by 2 for males in non-par X
-          if (params->af_cc && masked_indivs.row(index).any()) // n_males_cases
-            snp_data->ns_case_adj += masked_indivs.row(index).array().cast<int>() * phenotypes_raw.row(index).array().cast<int>();
+          total += genotype;
+          snp_data->ns1++;
+          if(genotype == 0) snp_data->n_zero++;
+          if(has_trait_missingness && filters->has_missing(index))
+            update_trait_counts(index, genotype, genotype, 0, 0,
+              snp_data, masked_indivs);
         }
+      }
+      if(oob_err(j)) continue;
+    } else {
+      oob_err(j) = ((Geno < -3) || (Geno > 2)).any();
+      if(oob_err(j)) continue;
 
-        mac += mval;
-        nmales += lval;
-        eij2 += ival;
+      keep_index = filters->ind_in_analysis && (Geno != -3.0);
+      total = keep_index.select(Geno,0).sum();
+      snp_data->ns1 = keep_index.count();
+      if(params->test_mode && !params->build_mask) snp_data->n_zero = filters->ind_in_analysis.size() - params->n_samples;
+      //cerr << "ID: " << snp_info->ID << "\nG bounds: " <<
+      //  (Geno * keep_index.cast<double>()).minCoeff() << " - " << (Geno * keep_index.cast<double>()).maxCoeff() << "\n\n";
 
-        // counts by trait
-        if(filters->has_missing(index)) update_trait_counts(index, Geno(index), mval, lval, ival, snp_data, masked_indivs);
+      for (int index = 0; index < filters->ind_in_analysis.size(); index++) {
+
+        if( keep_index(index) ){
+          // compute MAC using 0.5*g for males for variants on sex chr
+          // non-PAR (males coded as diploid); sex is 1 for males and 0 o.w.
+          ival = 0, lval = 0, mval = Geno(index);
+        //cerr << "index (" << params->sex(index)<<") " << index << " : " << mval << "\n";
+          if(params->test_mode){
+            if(!params->build_mask && (mval == 0)) snp_data->n_zero++;
+            if (mval >= 0.5) ncarriers++;
+
+            if(non_par) {
+              lval = (params->sex(index) == 1);
+              mval *= 0.5 * (2 - lval);
+              // check if not 0/2
+              if( !params->dosage_mode && (lval == 1) &&
+                  (Geno(index) == 1) )
+                het_male_X(j) = true;
+            }
+          }
+
+          if( params->dosage_mode ) ival = Geno(index) * Geno(index);
+
+          if (params->test_mode && non_par && params->skip_dosage_comp &&
+              lval){
+            Geno(index) /= 2.0; // divide by 2 for males in non-par X
+            if (params->af_cc && masked_indivs.row(index).any())
+              snp_data->ns_case_adj +=
+                masked_indivs.row(index).array().cast<int>() *
+                phenotypes_raw.row(index).array().cast<int>();
+          }
+
+          mac += mval;
+          nmales += lval;
+          eij2 += ival;
+
+          // counts by trait
+          if(filters->has_missing(index))
+            update_trait_counts(index, Geno(index), mval, lval, ival,
+              snp_data, masked_indivs);
 
        /* // get genotype counts
         if( params->htp_out ) {
@@ -2627,17 +2697,20 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
             hc = (int) (Geno(index) + 0.5); // round to nearest integer 0/1/2
           update_genocounts(params->trait_mode==1, index, hc, snp_data->genocounts, masked_indivs, phenotypes_raw);
         } else */
-        if( params->af_cc )
-        update_af_cc(index, Geno(index), snp_data, masked_indivs, phenotypes_raw);
-        if (!params->split_by_pheno){
-          if(Geno(index) >= 1.5) snp_data->n_aa++;
-          else if(Geno(index) < 0.5) snp_data->n_rr++;
-          else if(non_par && lval && !(params->test_mode && params->skip_dosage_comp)){
-            if (Geno(index) < 1) snp_data->n_rr++;
-            else snp_data->n_aa++;
+          if( params->af_cc )
+            update_af_cc(index, Geno(index), snp_data, masked_indivs,
+              phenotypes_raw);
+          if (!params->split_by_pheno){
+            if(Geno(index) >= 1.5) snp_data->n_aa++;
+            else if(Geno(index) < 0.5) snp_data->n_rr++;
+            else if(non_par && lval &&
+                    !(params->test_mode && params->skip_dosage_comp)){
+              if (Geno(index) < 1) snp_data->n_rr++;
+              else snp_data->n_aa++;
+            }
           }
-        }
 
+        }
       }
     }
 
@@ -2692,7 +2765,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     }
 
     // impute missing
-    if(!params->build_mask)
+    if(!params->build_mask &&
+       (!use_fast_hardcall_path || requires_mean_imputation))
       mean_impute_g(total, Geno, filters->ind_in_analysis);
 
   }
