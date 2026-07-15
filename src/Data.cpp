@@ -717,7 +717,39 @@ void Data::level_0_calculations() {
       if(params.profile_step1) step1_profile.residualize_ms += elapsed_ms(stage_start);
 
       // calc working matrices for ridge regressions across folds
+      ProfileClock::time_point cv_start;
+      double cv_gram_before_ms = 0;
+      double cv_gty_before_ms = 0;
+      double cv_eigensolve_before_ms = 0;
+      double cv_upload_before_ms = 0;
+      double cv_download_before_ms = 0;
+      double cv_ridge_before_ms = 0;
+      if(params.profile_step1) {
+        cv_start = ProfileClock::now();
+        cv_gram_before_ms = step1_profile.gram_ms;
+        cv_gty_before_ms = step1_profile.gty_ms;
+        cv_eigensolve_before_ms = step1_profile.eigensolve_ms;
+        cv_upload_before_ms = step1_profile.backend_upload_ms;
+        cv_download_before_ms = step1_profile.backend_download_ms;
+        cv_ridge_before_ms = step1_profile.backend_ridge_compute_ms;
+      }
       calc_cv_matrices(&l0);
+      if(params.profile_step1) {
+        const double cv_wall_ms = elapsed_ms(cv_start);
+        const double cv_backend_compute_ms =
+          step1_profile.gram_ms - cv_gram_before_ms +
+          step1_profile.gty_ms - cv_gty_before_ms +
+          step1_profile.eigensolve_ms - cv_eigensolve_before_ms +
+          step1_profile.backend_ridge_compute_ms - cv_ridge_before_ms;
+        const double cv_transfer_ms =
+          step1_profile.backend_upload_ms - cv_upload_before_ms +
+          step1_profile.backend_download_ms - cv_download_before_ms;
+        step1_profile.cv_wall_ms += cv_wall_ms;
+        step1_profile.cv_backend_compute_ms += cv_backend_compute_ms;
+        step1_profile.cv_transfer_ms += cv_transfer_ms;
+        step1_profile.cv_host_orchestration_ms += std::max(
+          0.0, cv_wall_ms - cv_backend_compute_ms - cv_transfer_ms);
+      }
 
       // test association for block
       if(params.test_l0) {
@@ -731,6 +763,8 @@ void Data::level_0_calculations() {
       const double eigensolve_before_ms = params.profile_step1 ? l0.profile_eigensolve_ms : 0;
       const double upload_before_ms = params.profile_step1 ? l0.profile_backend_upload_ms : 0;
       const double download_before_ms = params.profile_step1 ? l0.profile_backend_download_ms : 0;
+      const double backend_ridge_before_ms = params.profile_step1 ?
+        l0.profile_backend_ridge_compute_ms : 0;
       if(params.use_loocv)
         ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, step1_compute_backend.get(), sout);
       else
@@ -740,11 +774,21 @@ void Data::level_0_calculations() {
         const double eigensolve_ms = l0.profile_eigensolve_ms - eigensolve_before_ms;
         const double upload_ms = l0.profile_backend_upload_ms - upload_before_ms;
         const double download_ms = l0.profile_backend_download_ms - download_before_ms;
+        const double backend_ridge_ms =
+          l0.profile_backend_ridge_compute_ms - backend_ridge_before_ms;
         step1_profile.eigensolve_ms += eigensolve_ms;
         step1_profile.backend_upload_ms += upload_ms;
         step1_profile.backend_download_ms += download_ms;
+        step1_profile.backend_ridge_compute_ms += backend_ridge_ms;
         step1_profile.ridge_ms += std::max(0.0,
           ridge_total_ms - eigensolve_ms - upload_ms - download_ms);
+        step1_profile.ridge_wall_ms += ridge_total_ms;
+        step1_profile.ridge_eigensolve_ms += eigensolve_ms;
+        step1_profile.ridge_transfer_ms += upload_ms + download_ms;
+        step1_profile.ridge_backend_compute_ms += backend_ridge_ms;
+        step1_profile.ridge_host_orchestration_ms += std::max(0.0,
+          ridge_total_ms - eigensolve_ms - upload_ms - download_ms -
+            backend_ridge_ms);
         step1_profile.total_ms += elapsed_ms(block_start);
         step1_profile.blocks++;
         step1_profile.variants += bs;
@@ -842,6 +886,7 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
         step1_profile.gram_ms += timings.gram_ms;
         step1_profile.backend_upload_ms += timings.upload_ms;
         step1_profile.backend_download_ms += timings.download_ms;
+        step1_profile.backend_ridge_compute_ms += timings.ridge_ms;
       }
       cum_size_folds += params.cv_sizes(i);
     }
@@ -865,6 +910,7 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
       step1_profile.gram_ms += timings.gram_ms;
       step1_profile.backend_upload_ms += timings.upload_ms;
       step1_profile.backend_download_ms += timings.download_ms;
+      step1_profile.backend_ridge_compute_ms += timings.ridge_ms;
     }
     if(!params.test_l0 && params.profile_step1) {
       step1_profile.eigensolve_ms += timings.eigensolve_ms + timings.transform_ms;
@@ -889,7 +935,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=2 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=3 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -913,6 +959,20 @@ void Data::print_step1_profile() {
   print_stage("ridge", step1_profile.ridge_ms);
   print_stage("other", other_ms);
   print_stage("block_total", step1_profile.total_ms);
+  out << "STEP1_PROFILE scope=cv_matrices"
+      << " wall_ms=" << step1_profile.cv_wall_ms
+      << " backend_compute_ms=" << step1_profile.cv_backend_compute_ms
+      << " transfer_ms=" << step1_profile.cv_transfer_ms
+      << " host_orchestration_ms=" << step1_profile.cv_host_orchestration_ms
+      << "\n";
+  out << "STEP1_PROFILE scope=level0_ridge"
+      << " wall_ms=" << step1_profile.ridge_wall_ms
+      << " eigensolve_transform_ms=" << step1_profile.ridge_eigensolve_ms
+      << " backend_compute_ms=" << step1_profile.ridge_backend_compute_ms
+      << " transfer_ms=" << step1_profile.ridge_transfer_ms
+      << " host_orchestration_ms=" <<
+        step1_profile.ridge_host_orchestration_ms
+      << "\n";
   sout << out.str();
 }
 

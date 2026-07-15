@@ -183,7 +183,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=2 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=3 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
 
   shopt -s nullglob
   local cpu_loco_files=("${cpu_prefix}"_*.loco)
