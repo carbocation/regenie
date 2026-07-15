@@ -285,7 +285,8 @@ openblas_sha256="6761af1d9f5d353ab4f0b7497be2643313b36c8f31caec0144bfef198e71e6a
 openblas_archive="${cache_root}/OpenBLAS-${openblas_version}.tar.gz"
 openblas_source="${cache_root}/OpenBLAS-${openblas_version}-source-${target_label}"
 openblas_root="${cache_root}/OpenBLAS-${openblas_version}-macos-${target_label}"
-openblas_stamp="${openblas_root}/.regenie-${openblas_sha256}-macos-${target_label}-threads-${openblas_threads}"
+openblas_target="VORTEX"
+openblas_stamp="${openblas_root}/.regenie-${openblas_sha256}-macos-${target_label}-target-${openblas_target}-threads-${openblas_threads}-sequential-goals-v2"
 ensure_archive "${openblas_url}" "${openblas_archive}" "${openblas_sha256}"
 openblas_provenance="verified-managed-cache"
 if [[ ! -f "${openblas_root}/lib/libopenblas.a" || ! -f "${openblas_stamp}" ]]; then
@@ -304,17 +305,23 @@ if [[ ! -f "${openblas_root}/lib/libopenblas.a" || ! -f "${openblas_stamp}" ]]; 
     CC=/usr/bin/clang
     HOSTCC=/usr/bin/clang
     "FC=${gfortran_root}/bin/gfortran"
-    DYNAMIC_ARCH=1
-    TARGET=VORTEX
+    DYNAMIC_ARCH=0
+    "TARGET=${openblas_target}"
     NO_SVE=1
+    NO_SHARED=1
     USE_OPENMP=0
     USE_THREAD=1
     "NUM_THREADS=${openblas_threads}"
   )
   (
     export MACOSX_DEPLOYMENT_TARGET="${deployment_target}"
+    # OpenBLAS's `libs` and `netlib` top-level goals can concurrently update
+    # the same static archive when named in one parallel make invocation.
+    # Build the goals separately while retaining parallelism within each goal.
     make -C "${openblas_source}" -j "${jobs}" \
-      "${openblas_args[@]}" libs netlib
+      "${openblas_args[@]}" libs
+    make -C "${openblas_source}" -j "${jobs}" \
+      "${openblas_args[@]}" netlib
     make -C "${openblas_source}" \
       "${openblas_args[@]}" "PREFIX=${openblas_root}" install
   )
@@ -322,6 +329,45 @@ if [[ ! -f "${openblas_root}/lib/libopenblas.a" || ! -f "${openblas_stamp}" ]]; 
     die "OpenBLAS static archive was not installed"
   cmake -E touch "${openblas_stamp}"
 fi
+
+# Force the static archive's BLAS entry point and its transitive Fortran
+# runtime dependencies through the linker before accepting a new or cached
+# dependency. This catches incomplete archives at dependency-validation time
+# instead of much later while linking REGENIE.
+openblas_link_test_dir="${cache_root}/openblas-link-test-${target_label}"
+cmake -E remove_directory "${openblas_link_test_dir}"
+mkdir -p "${openblas_link_test_dir}"
+cat > "${openblas_link_test_dir}/main.cpp" <<'OPENBLAS_LINK_TEST'
+#include <cblas.h>
+#include <lapacke.h>
+
+int main() {
+  double lhs[1] = {2.0};
+  double rhs[1] = {3.0};
+  double output[1] = {0.0};
+  cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+              1, 1, 1, 1.0, lhs, 1, rhs, 1, 0.0, output, 1);
+  double coefficient[1] = {2.0};
+  double dependent[1] = {6.0};
+  lapack_int pivot[1] = {0};
+  int solve_status = LAPACKE_dgesv(
+      LAPACK_COL_MAJOR, 1, 1, coefficient, 1, pivot, dependent, 1);
+  return output[0] == 6.0 && solve_status == 0 && dependent[0] == 3.0
+             ? 0
+             : 1;
+}
+OPENBLAS_LINK_TEST
+/usr/bin/clang++ \
+  "-mmacosx-version-min=${deployment_target}" \
+  -I"${openblas_root}/include" \
+  "${openblas_link_test_dir}/main.cpp" \
+  "${openblas_root}/lib/libopenblas.a" \
+  "${gfortran_root}/lib/libgfortran.a" \
+  "${gfortran_root}/lib/libquadmath.a" \
+  -o "${openblas_link_test_dir}/openblas-link-test"
+"${openblas_link_test_dir}/openblas-link-test" ||
+  die "managed OpenBLAS static archive failed its link and runtime smoke test"
+cmake -E remove_directory "${openblas_link_test_dir}"
 
 llvm_version="22.1.6"
 llvm_url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvm_version}/llvm-project-${llvm_version}.src.tar.xz"
@@ -377,6 +423,7 @@ echo "MACOS_ARM64_RELEASE_BUILD_GFORTRAN_PROVENANCE=${gfortran_provenance}"
 echo "MACOS_ARM64_RELEASE_BUILD_GFORTRAN_SOURCE_SHA256=${gfortran_sha256}"
 echo "MACOS_ARM64_RELEASE_BUILD_OPENBLAS_PROVENANCE=${openblas_provenance}"
 echo "MACOS_ARM64_RELEASE_BUILD_OPENBLAS_SOURCE_SHA256=${openblas_sha256}"
+echo "MACOS_ARM64_RELEASE_BUILD_OPENBLAS_TARGET=${openblas_target}"
 echo "MACOS_ARM64_RELEASE_BUILD_LIBOMP_PROVENANCE=${libomp_provenance}"
 echo "MACOS_ARM64_RELEASE_BUILD_LIBOMP_SOURCE_SHA256=${llvm_sha256}"
 
@@ -474,6 +521,7 @@ codesign --force --sign - "${stage_dir}/bin/regenie"
   printf 'OPENBLAS_VERSION=%s\n' "${openblas_version}"
   printf 'OPENBLAS_SOURCE_URL=%s\n' "${openblas_url}"
   printf 'OPENBLAS_SOURCE_SHA256=%s\n' "${openblas_sha256}"
+  printf 'OPENBLAS_TARGET=%s\n' "${openblas_target}"
   printf 'OPENBLAS_NUM_THREADS=%s\n' "${openblas_threads}"
   printf 'LIBOMP_VERSION=%s\n' "${llvm_version}"
   printf 'LIBOMP_SOURCE_URL=%s\n' "${llvm_url}"

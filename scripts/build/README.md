@@ -55,11 +55,12 @@ environment overrides, and validation controls.
 
 The macOS builder defaults to an Apple M1 CPU floor and macOS 13.0 deployment
 target, so one arm64 artifact can run on M1 and newer Apple Silicon Macs. It
-builds BGEN, OpenBLAS, and LLVM OpenMP from pinned, checksum-verified inputs and
-extracts a pinned Ventura-compatible Apple Silicon gfortran toolchain. OpenBLAS
-and the GNU Fortran runtimes are linked statically. `libomp.dylib` is bundled
-under `lib/`, and the packaged executable uses a relative loader path rather
-than requiring Homebrew on the destination machine.
+builds BGEN, a deterministic Apple M1-floor OpenBLAS target, and LLVM OpenMP
+from pinned, checksum-verified inputs and extracts a pinned Ventura-compatible
+Apple Silicon gfortran toolchain. OpenBLAS and the GNU Fortran runtimes are
+linked statically. `libomp.dylib` is bundled under `lib/`, and the packaged
+executable uses a relative loader path rather than requiring Homebrew on the
+destination machine.
 
 The build itself is made from `git archive HEAD` in an isolated directory, so
 untracked objects in the repository cannot enter the artifact. Validation
