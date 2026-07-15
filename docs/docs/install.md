@@ -100,6 +100,18 @@ CPU. Larger blocks fall back to CPU preprocessing. Set the limit to `0` to
 disable GPU preprocessing. The validation harness exposes the same setting as
 `CUDA_RESIDENT_MB`.
 
+For k-fold binary-trait Level 1 fitting, CUDA can keep the complete Level 1
+design resident across folds, ridge parameters, and IRLS iterations. This
+eliminates repeated uploads of the same predictions and accumulates each
+weighted Gram matrix and score crossproduct on the device. The automatic
+limit allows one design copy to use at most 40% of currently available device
+memory (capped at 16 GB), because IRLS also needs an equally sized weighted
+design workspace. If the two buffers plus a 512 MB reserve do not fit, REGENIE
+uses the existing streamed fold path. Set `REGENIE_CUDA_LEVEL1_RESIDENT_MB` to
+a non-negative integer to override the maximum size of one design copy; `0`
+disables this specialization. The validation harness exposes the override as
+`CUDA_LEVEL1_RESIDENT_MB`.
+
 Ordinary k-fold PGEN hardcall runs can avoid materializing and uploading the
 host FP64 genotype matrix entirely. When the resident block fits, the reader
 passes PGEN's native two-bit hardcalls to CUDA; the device then expands,

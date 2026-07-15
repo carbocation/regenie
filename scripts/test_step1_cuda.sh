@@ -15,6 +15,7 @@ stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
 level0_cholesky="${CUDA_LEVEL0_CHOLESKY:-${REGENIE_CUDA_LEVEL0_CHOLESKY:-1}}"
 level0_fold_batch="${CUDA_LEVEL0_FOLD_BATCH:-${REGENIE_CUDA_LEVEL0_FOLD_BATCH:-1}}"
+level1_resident_mb="${CUDA_LEVEL1_RESIDENT_MB:-${REGENIE_CUDA_LEVEL1_RESIDENT_MB:-}}"
 pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
 pgen_prefetch_mb="${STEP1_PGEN_PREFETCH_MB:-${REGENIE_STEP1_PGEN_PREFETCH_MB:-4096}}"
 pgen_tile_variants="${STEP1_PGEN_TILE_VARIANTS:-${REGENIE_STEP1_PGEN_TILE_VARIANTS:-8}}"
@@ -27,6 +28,10 @@ for setting in resident_mb pinned_staging_mb pgen_prefetch_mb; do
     exit 2
   fi
 done
+if [[ -n "${level1_resident_mb}" && ! "${level1_resident_mb}" =~ ^[0-9]+$ ]]; then
+  echo "level1_resident_mb must be a non-negative integer (received '${level1_resident_mb}')" >&2
+  exit 2
+fi
 if [[ ! "${pgen_tile_variants}" =~ ^[1-9][0-9]*$ ]] ||
    (( pgen_tile_variants > 64 )); then
   echo "pgen_tile_variants must be an integer in [1,64] (received '${pgen_tile_variants}')" >&2
@@ -96,6 +101,11 @@ nvcc --version
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 export REGENIE_CUDA_LEVEL0_CHOLESKY="${level0_cholesky}"
 export REGENIE_CUDA_LEVEL0_FOLD_BATCH="${level0_fold_batch}"
+if [[ -n "${level1_resident_mb}" ]]; then
+  export REGENIE_CUDA_LEVEL1_RESIDENT_MB="${level1_resident_mb}"
+else
+  unset REGENIE_CUDA_LEVEL1_RESIDENT_MB
+fi
 export REGENIE_CUDA_PINNED_STAGING_MB="${pinned_staging_mb}"
 export REGENIE_STEP1_PGEN_PREFETCH_MB="${pgen_prefetch_mb}"
 export REGENIE_STEP1_PGEN_TILE_VARIANTS="${pgen_tile_variants}"

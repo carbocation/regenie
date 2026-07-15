@@ -60,6 +60,9 @@ struct Step1ComputeTimings {
   double packed_hardcall_backend_wall_ms = 0;
   uint64_t design_upload_count = 0;
   uint64_t design_upload_bytes = 0;
+  uint64_t resident_design_upload_count = 0;
+  uint64_t resident_design_upload_bytes = 0;
+  uint64_t resident_design_reuse_count = 0;
   double host_materialization_ms = 0;
 };
 
@@ -174,6 +177,29 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& gram,
       Eigen::MatrixXd& crossproduct,
       Step1ComputeTimings* timings = nullptr) = 0;
+
+    virtual bool cache_design_partitions(
+      const std::vector<Eigen::MatrixXd>& partitions,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void predict_cached_design(
+      const Eigen::Ref<const Eigen::VectorXd>& coefficients,
+      Eigen::VectorXd& predictions,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void compute_cached_weighted_design_products(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Eigen::MatrixXd& gram,
+      Eigen::MatrixXd& crossproduct,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void compute_cached_design_crossproduct(
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Eigen::MatrixXd& crossproduct,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual void release_cached_design();
 
     virtual void ridge_predict(
       const Eigen::Ref<const Eigen::MatrixXd>& eigenvectors,

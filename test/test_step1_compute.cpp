@@ -313,6 +313,12 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.packed_hardcall_backend_wall_ms;
   destination.design_upload_count += source.design_upload_count;
   destination.design_upload_bytes += source.design_upload_bytes;
+  destination.resident_design_upload_count +=
+    source.resident_design_upload_count;
+  destination.resident_design_upload_bytes +=
+    source.resident_design_upload_bytes;
+  destination.resident_design_reuse_count +=
+    source.resident_design_reuse_count;
   destination.host_materialization_ms += source.host_materialization_ms;
 }
 
@@ -1540,6 +1546,101 @@ void run_conformance(Step1ComputeBackend& candidate) {
   std::cout << "STEP1_BACKEND_TEST case=weighted_design_zero_outcomes"
             << " gram_relative_error=" << zero_outcome_weighted_gram_error
             << " status=PASS\n";
+
+  std::vector<Eigen::MatrixXd> resident_partitions;
+  resident_partitions.push_back(deterministic_matrix(7, 6, -0.3));
+  resident_partitions.push_back(deterministic_matrix(11, 6, 0.7));
+  resident_partitions.push_back(deterministic_matrix(5, 6, -1.1));
+  Step1ComputeTimings resident_design_timings;
+  const bool resident_design_supported = candidate.cache_design_partitions(
+    resident_partitions, &resident_design_timings);
+  if(resident_design_supported) {
+    Eigen::MatrixXd resident_design(23, 6);
+    Eigen::Index resident_start = 0;
+    for(const Eigen::MatrixXd& partition : resident_partitions) {
+      resident_design.middleRows(resident_start, partition.rows()) = partition;
+      resident_start += partition.rows();
+    }
+    const Eigen::VectorXd resident_coefficients =
+      deterministic_matrix(6, 1, 0.25).col(0);
+    Eigen::VectorXd resident_predictions;
+    candidate.predict_cached_design(resident_coefficients,
+      resident_predictions, &resident_design_timings);
+    const Eigen::VectorXd expected_resident_predictions =
+      resident_design * resident_coefficients;
+
+    Eigen::VectorXd resident_weights(23);
+    for(Eigen::Index row = 0; row < resident_weights.size(); ++row)
+      resident_weights(row) =
+        0.1 + std::fmod(0.19 * static_cast<double>(row + 1), 1.3);
+    const Eigen::MatrixXd resident_outcomes =
+      deterministic_matrix(23, 2, -0.8);
+    Eigen::MatrixXd resident_gram, resident_crossproduct;
+    candidate.compute_cached_weighted_design_products(
+      resident_weights, resident_outcomes, resident_gram,
+      resident_crossproduct, &resident_design_timings);
+    const Eigen::MatrixXd expected_resident_gram =
+      resident_design.transpose() *
+        (resident_design.array().colwise() *
+          resident_weights.array()).matrix();
+    const Eigen::MatrixXd expected_resident_crossproduct =
+      resident_design.transpose() *
+        (resident_outcomes.array().colwise() *
+          resident_weights.array()).matrix();
+
+    Eigen::MatrixXd resident_score;
+    candidate.compute_cached_design_crossproduct(
+      resident_outcomes, resident_score, &resident_design_timings);
+    const Eigen::MatrixXd expected_resident_score =
+      resident_design.transpose() * resident_outcomes;
+
+    const double resident_prediction_error = relative_error(
+      resident_predictions, expected_resident_predictions);
+    const double resident_gram_error = relative_error(
+      resident_gram, expected_resident_gram);
+    const double resident_crossproduct_error = relative_error(
+      resident_crossproduct, expected_resident_crossproduct);
+    const double resident_score_error = relative_error(
+      resident_score, expected_resident_score);
+    if(resident_prediction_error > 5e-12 ||
+       resident_gram_error > 5e-12 ||
+       resident_crossproduct_error > 5e-12 ||
+       resident_score_error > 5e-12 ||
+       resident_design_timings.resident_design_upload_count != 3 ||
+       resident_design_timings.resident_design_upload_bytes !=
+         static_cast<uint64_t>(resident_design.size()) * sizeof(double) ||
+       resident_design_timings.resident_design_reuse_count != 3)
+      throw std::runtime_error(
+        "resident design operation conformance tolerance exceeded");
+
+    candidate.release_cached_design();
+    bool rejected_released_design = false;
+    try {
+      candidate.predict_cached_design(
+        resident_coefficients, resident_predictions);
+    } catch(const std::invalid_argument&) {
+      rejected_released_design = true;
+    }
+    if(!rejected_released_design)
+      throw std::runtime_error(
+        "resident design remained reusable after release");
+
+    std::cout << "STEP1_BACKEND_TEST case=resident_design_operations"
+              << " supported=1"
+              << " prediction_relative_error=" << resident_prediction_error
+              << " gram_relative_error=" << resident_gram_error
+              << " weighted_crossproduct_relative_error=" <<
+                   resident_crossproduct_error
+              << " crossproduct_relative_error=" << resident_score_error
+              << " upload_bytes=" <<
+                   resident_design_timings.resident_design_upload_bytes
+              << " reuses=" <<
+                   resident_design_timings.resident_design_reuse_count
+              << " status=PASS\n";
+  } else {
+    std::cout << "STEP1_BACKEND_TEST case=resident_design_operations"
+              << " supported=0 status=PASS\n";
+  }
 
   Eigen::VectorXd fused_ridge_parameters(3);
   fused_ridge_parameters << 0.1, 1.0, 10.0;
