@@ -1,12 +1,14 @@
 # Release build scripts
 
-The sibling release builders produce performance-oriented Linux x86-64
-artifacts with static oneMKL and GNU C++ runtime linkage:
+The sibling release builders produce performance-oriented Linux x86-64 and
+Apple Silicon artifacts:
 
 - `build_cpu_release.sh` creates a CPU-only binary that has no CUDA runtime
   dependency.
 - `build_cuda_release.sh` creates a CUDA-enabled binary containing both the
   CUDA Step 1 backend and the CPU fallback backend.
+- `build_macos_arm64_release.sh` creates a CPU-only Apple Silicon binary with
+  static OpenBLAS and GNU Fortran runtimes plus a bundled LLVM OpenMP runtime.
 
 Both builders validate the executable and create a versioned tarball plus
 SHA-256 checksum under `dist/`.
@@ -15,13 +17,14 @@ Artifact names contain the source commit, and the builder refuses tracked source
 changes that have not been committed. Untracked compiler products are allowed so
 an existing remote build checkout can be reused.
 
-When `BGEN_PATH` is unset, the builder manages BGEN v1.1.7 in its dependency
-cache. It verifies the official source archive's pinned SHA-256 checksum and
-requires a matching build stamp before reusing that cache. For a clean build it
-applies the narrow `std::ios::streampos` to `std::streampos` compatibility
-correction needed by current libstdc++ releases before invoking Waf. Supplying
-`BGEN_PATH` explicitly is treated as an unverified external dependency and is
-recorded as such in the package metadata.
+The Linux builders manage BGEN v1.1.7 when `BGEN_PATH` is unset. They verify
+the official source archive's pinned SHA-256 checksum and require a matching
+build stamp before reusing that cache. For a clean build they apply the narrow
+`std::ios::streampos` to `std::streampos` compatibility correction needed by
+current compilers before invoking Waf. Supplying `BGEN_PATH` explicitly is
+treated as an unverified external dependency and is recorded as such in the
+package metadata. The Apple Silicon builder always uses its own platform- and
+deployment-target-specific managed dependency cache.
 
 ## CPU-only release
 
@@ -47,6 +50,44 @@ scripts/build/build_cpu_release.sh \
 
 Run `scripts/build/build_cpu_release.sh --help` for dependency expectations,
 environment overrides, and validation controls.
+
+## Apple Silicon release
+
+The macOS builder defaults to an Apple M1 CPU floor and macOS 13.0 deployment
+target, so one arm64 artifact can run on M1 and newer Apple Silicon Macs. It
+builds BGEN, OpenBLAS, and LLVM OpenMP from pinned, checksum-verified inputs and
+extracts a pinned Ventura-compatible Apple Silicon gfortran toolchain. OpenBLAS
+and the GNU Fortran runtimes are linked statically. `libomp.dylib` is bundled
+under `lib/`, and the packaged executable uses a relative loader path rather
+than requiring Homebrew on the destination machine.
+
+The build itself is made from `git archive HEAD` in an isolated directory, so
+untracked objects in the repository cannot enter the artifact. Validation
+includes CTest, the full regression suite before and after relocation, Mach-O
+deployment-target and dependency checks, ad-hoc code-signature verification,
+archive extraction, and a final runtime check:
+
+```bash
+# Install build-time tools; Xcode command-line tools must also be available.
+brew install cmake sevenzip
+
+# Portable optimized binary for Apple Silicon Macs running macOS 13 or newer.
+scripts/build/build_macos_arm64_release.sh --clean
+
+# Rebuild every managed dependency from its verified archive.
+scripts/build/build_macos_arm64_release.sh \
+  --clean \
+  --clean-dependencies
+
+# Machine-specific host optimization; do not redistribute indiscriminately.
+scripts/build/build_macos_arm64_release.sh --native-cpu --clean
+```
+
+The binary and bundled `libomp.dylib` are ad-hoc signed, not Developer-ID
+signed or Apple-notarized. A browser that adds a quarantine attribute may cause
+Gatekeeper to request explicit approval for the downloaded command-line tool.
+Run `scripts/build/build_macos_arm64_release.sh --help` for deployment-target,
+CPU-target, dependency-cache, and validation controls.
 
 ## CUDA release
 

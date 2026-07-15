@@ -274,6 +274,25 @@ The paths and `--qt` option are illustrative; replace them with the normal
 Step 1 arguments for the dataset and trait type being analyzed. Add
 `--compute-backend cpu` to such a command when GPU use is not wanted.
 
+## Redistributable Apple Silicon build
+
+On an Apple Silicon Mac with Xcode command-line tools and Homebrew, the sibling
+release builder creates a CPU-only arm64 archive that does not require Homebrew
+on the destination Mac. It defaults to an Apple M1 CPU floor and macOS 13.0,
+builds its native dependencies from pinned checksum-verified inputs, runs the
+focused and full regression tests, and packages a relative-path LLVM OpenMP
+runtime:
+
+```bash
+brew install cmake sevenzip
+scripts/build/build_macos_arm64_release.sh --clean
+```
+
+The versioned archive, build metadata, and SHA-256 checksum are written under
+`dist/`. See the [release builder documentation](scripts/build/README.md) for
+dependency provenance, validation details, deployment-target controls, and the
+ad-hoc code-signing/notarization caveat.
+
 The upstream README is preserved below.
 
 ---

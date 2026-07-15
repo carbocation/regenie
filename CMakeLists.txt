@@ -292,11 +292,23 @@ if(EXISTS ${MKLROOT})
 elseif(EXISTS ${OPENBLAS_ROOT}) # OpenBLAS
   add_definitions(-DWITH_OPENBLAS -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
   set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS ${OPENBLAS_ROOT}/include/)
-  find_library(LAPACK_LIB lapack REQUIRED)
-  find_library(LAPACKE_LIB lapacke REQUIRED)
-  find_library(BLAS_LIB openblas HINTS "${OPENBLAS_ROOT}/lib/" REQUIRED)
-  set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
-    ${LAPACK_LIB} ${LAPACKE_LIB} ${BLAS_LIB})
+  if(BUILD_STATIC)
+    # A complete OpenBLAS static archive contains its BLAS, LAPACK, and LAPACKE
+    # implementations. Linking that archive directly also prevents a release
+    # build from silently resolving Homebrew dylibs outside OPENBLAS_ROOT.
+    set(BLAS_LIB "${OPENBLAS_ROOT}/lib/libopenblas.a")
+    if(NOT EXISTS ${BLAS_LIB})
+      message(FATAL_ERROR
+        "Static OpenBLAS archive was not found at ${BLAS_LIB}")
+    endif()
+    set(REGENIE_LINEAR_ALGEBRA_LIBRARIES ${BLAS_LIB})
+  else()
+    find_library(LAPACK_LIB lapack REQUIRED)
+    find_library(LAPACKE_LIB lapacke REQUIRED)
+    find_library(BLAS_LIB openblas HINTS "${OPENBLAS_ROOT}/lib/" REQUIRED)
+    set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+      ${LAPACK_LIB} ${LAPACKE_LIB} ${BLAS_LIB})
+  endif()
 endif()
 
 if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
@@ -410,6 +422,13 @@ target_link_libraries(
   ${ZLIB_LIBRARY} ${M_LIB} ${DL_LIB} ${PTHREAD_LIB}
   ${GFORTRAN_LIBRARIES}
 )
+if(BUILD_TESTING)
+  # The tests consume the same Eigen/OpenBLAS definitions and static archive
+  # as the application, so a static OpenBLAS build must also expose its
+  # Fortran runtime dependencies to these targets.
+  target_link_libraries(step1_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
+  target_link_libraries(cox_firth_test PRIVATE ${GFORTRAN_LIBRARIES})
+endif()
 
 install(TARGETS regenie RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 message( STATUS "REGENIE v" ${RG_VERSION})
