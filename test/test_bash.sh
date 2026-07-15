@@ -172,6 +172,60 @@ fi
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
+# PGEN binary traits with complete phenotype data
+for file_type in bed pgen; do
+  rgcmd="--step 2 \
+    --${file_type} ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype_bin.txt${fsuf} \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --bt \
+    --ignore-pred \
+    --out ${mntpt}test/test_bin_out_pgen_bt_complete_${file_type}"
+
+  ./$regenie_bin $rgcmd
+done
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_complete_bed_${phenotype}.regenie \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_complete_pgen_${phenotype}.regenie
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# PGEN binary traits with phenotype-specific missingness
+for file_type in bed pgen; do
+  rgcmd="--step 2 \
+    --${file_type} ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --bt \
+    --ignore-pred \
+    --out ${mntpt}test/test_bin_out_pgen_bt_missing_${file_type}"
+
+  ./$regenie_bin $rgcmd
+done
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_missing_bed_${phenotype}.regenie \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_missing_pgen_${phenotype}.regenie
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
 # interaction tests
 rgcmd="--step 2 \
   --bed ${mntpt}example/example \
@@ -469,4 +523,3 @@ fi
 echo "SUCCESS: REGENIE build passed the tests!"
 # file cleanup
 rm -f ${REGENIE_PATH}test/fit_bin_* ${REGENIE_PATH}test/test_bin_out* ${REGENIE_PATH}test/test_out* ${REGENIE_PATH}test/tmp[12].txt
-
