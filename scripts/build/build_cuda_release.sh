@@ -183,8 +183,12 @@ else
 fi
 
 if [[ -z "${MKLROOT:-}" && -f /opt/intel/oneapi/setvars.sh ]]; then
+  # Intel's environment scripts inspect optional variables without guarding
+  # every expansion. Limit nounset relaxation to this third-party boundary.
+  set +u
   # shellcheck disable=SC1091
   source /opt/intel/oneapi/setvars.sh >/dev/null
+  set -u
 fi
 [[ -n "${MKLROOT:-}" ]] ||
   die "set MKLROOT or install oneMKL under /opt/intel/oneapi"
