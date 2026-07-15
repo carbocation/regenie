@@ -133,6 +133,14 @@ bool cuda_level0_cholesky_enabled() {
     "REGENIE_CUDA_LEVEL0_CHOLESKY must be '0' or '1'");
 }
 
+bool cuda_level0_fold_batch_enabled() {
+  const char* value = std::getenv("REGENIE_CUDA_LEVEL0_FOLD_BATCH");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_CUDA_LEVEL0_FOLD_BATCH must be '0' or '1'");
+}
+
 double elapsed_ms(const ComputeClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ComputeClock::now() - start).count();
 }
@@ -310,6 +318,13 @@ __global__ void add_diagonal_penalty(double* matrix,
     matrix[index + index * size] += ridge_parameter * penalty_multipliers[index];
 }
 
+__global__ void add_uniform_diagonal_penalty(double* matrix,
+  double ridge_parameter, int size) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < size)
+    matrix[index + index * size] += ridge_parameter;
+}
+
 __global__ void compute_weighted_leverage_diagonal(
   const double* design, const double* inverse_design,
   const double* weights, double* leverage, int size, int sample_count) {
@@ -392,12 +407,35 @@ class CudaEventPair {
     cudaEvent_t stop_;
 };
 
+struct CudaLevel0CholeskyLane {
+  cudaStream_t stream = nullptr;
+  cublasHandle_t blas = nullptr;
+  cusolverDnHandle_t solver = nullptr;
+  double* gram = nullptr;
+  double* factor = nullptr;
+  double* right_hand_sides = nullptr;
+  double* solve = nullptr;
+  double* coefficients = nullptr;
+  double* predictions = nullptr;
+  double* workspace = nullptr;
+  int* info = nullptr;
+  size_t gram_capacity = 0;
+  size_t factor_capacity = 0;
+  size_t right_hand_sides_capacity = 0;
+  size_t solve_capacity = 0;
+  size_t coefficients_capacity = 0;
+  size_t predictions_capacity = 0;
+  size_t workspace_capacity = 0;
+  size_t info_capacity = 0;
+};
+
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
       : device_(device), handle_(nullptr), solver_handle_(nullptr),
         pinned_staging_chunk_bytes_(cuda_pinned_staging_bytes()),
         level0_cholesky_enabled_(cuda_level0_cholesky_enabled()),
+        level0_fold_batch_enabled_(cuda_level0_fold_batch_enabled()),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
         d_factorized_(nullptr),
@@ -437,6 +475,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
     ~CudaStep1ComputeBackend() override {
       cudaSetDevice(device_);
+      for(auto& lane : level0_cholesky_lanes_)
+        release_level0_cholesky_lane(lane);
       for(int index = 0; index < 2; ++index) {
         if(upload_streams_[index])
           cudaStreamSynchronize(upload_streams_[index]);
@@ -489,6 +529,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           (pinned_staging_chunk_bytes_ / 1000000.0) << " MB";
       result << ", level0 solver " <<
         (level0_cholesky_enabled_ ? "cholesky" : "eigendecomposition");
+      if(level0_cholesky_enabled_)
+        result << ", level0 folds " <<
+          (level0_fold_batch_enabled_ ? "batched" : "sequential");
       result << ")";
       return result.str();
     }
@@ -1213,6 +1256,231 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         predictions.size() * sizeof(double), cudaMemcpyDeviceToHost),
         "copy resident Cholesky ridge predictions from CUDA device");
       if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      return true;
+    }
+
+    bool ridge_predict_preprocessed_systems(
+      const std::vector<Eigen::MatrixXd>& grams,
+      const std::vector<Eigen::MatrixXd>& right_hand_sides,
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      std::vector<Eigen::MatrixXd>& predictions,
+      std::vector<Eigen::MatrixXd>& coefficients,
+      Step1ComputeTimings* timings) override {
+
+      const size_t system_count = grams.size();
+      if(!level0_cholesky_enabled_ || !level0_fold_batch_enabled_ ||
+         system_count < 2)
+        return false;
+      if(!resident_valid_ || right_hand_sides.size() != system_count ||
+         start_columns.size() != static_cast<Eigen::Index>(system_count) ||
+         column_counts.size() != static_cast<Eigen::Index>(system_count))
+        throw std::invalid_argument(
+          "Step 1 resident batched Cholesky ridge prediction received incompatible systems");
+      if((ridge_parameters.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 resident batched Cholesky ridge parameters must be non-negative");
+      if((ridge_parameters.array() == 0).any()) return false;
+
+      const Eigen::Index size_index = resident_rows_;
+      const Eigen::Index right_hand_side_count_index =
+        right_hand_sides.empty() ? 0 : right_hand_sides.front().cols();
+      for(size_t system = 0; system < system_count; ++system) {
+        if(grams[system].rows() != size_index ||
+           grams[system].cols() != size_index ||
+           right_hand_sides[system].rows() != size_index ||
+           right_hand_sides[system].cols() != right_hand_side_count_index ||
+           start_columns(static_cast<Eigen::Index>(system)) < 0 ||
+           column_counts(static_cast<Eigen::Index>(system)) < 0 ||
+           start_columns(static_cast<Eigen::Index>(system)) >
+             resident_columns_ -
+               column_counts(static_cast<Eigen::Index>(system)))
+          throw std::invalid_argument(
+            "Step 1 resident batched Cholesky ridge prediction received incompatible dimensions");
+      }
+
+      const int size = checked_int(
+        size_index, "resident batched Cholesky ridge system size");
+      const int right_hand_side_count = checked_int(
+        right_hand_side_count_index,
+        "resident batched Cholesky ridge right-hand-side count");
+      const int parameter_count = checked_int(
+        ridge_parameters.size(),
+        "resident batched Cholesky ridge parameter count");
+      const long long combination_count_long =
+        static_cast<long long>(right_hand_side_count) * parameter_count;
+      if(combination_count_long > INT_MAX)
+        throw std::runtime_error(
+          "resident batched Cholesky ridge combination count exceeds integer limits");
+      const int combination_count =
+        static_cast<int>(combination_count_long);
+
+      predictions.resize(system_count);
+      coefficients.resize(system_count);
+      for(size_t system = 0; system < system_count; ++system) {
+        const Eigen::Index sample_count =
+          column_counts(static_cast<Eigen::Index>(system));
+        predictions[system].resize(sample_count, combination_count);
+        coefficients[system].resize(size_index, combination_count);
+      }
+      if(size == 0 || right_hand_side_count == 0 ||
+         parameter_count == 0) {
+        for(size_t system = 0; system < system_count; ++system) {
+          predictions[system].setZero();
+          coefficients[system].setZero();
+        }
+        return true;
+      }
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      ensure_level0_cholesky_lane_count(system_count);
+      const Eigen::Index gram_elements = size_index * size_index;
+      const Eigen::Index rhs_elements =
+        size_index * right_hand_side_count_index;
+      const Eigen::Index coefficient_elements =
+        size_index * combination_count;
+      std::vector<int> workspace_sizes(system_count, 0);
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        ensure_capacity(lane.gram, lane.gram_capacity, gram_elements,
+          "cudaMalloc(batched Cholesky Gram matrix)");
+        ensure_capacity(lane.factor, lane.factor_capacity, gram_elements,
+          "cudaMalloc(batched Cholesky factorization matrix)");
+        ensure_capacity(lane.right_hand_sides,
+          lane.right_hand_sides_capacity, rhs_elements,
+          "cudaMalloc(batched Cholesky right-hand sides)");
+        ensure_capacity(lane.solve, lane.solve_capacity, rhs_elements,
+          "cudaMalloc(batched Cholesky solve workspace)");
+        ensure_capacity(lane.coefficients, lane.coefficients_capacity,
+          coefficient_elements,
+          "cudaMalloc(batched Cholesky coefficients)");
+        ensure_capacity(lane.predictions, lane.predictions_capacity,
+          predictions[system].size(),
+          "cudaMalloc(batched Cholesky predictions)");
+        ensure_capacity(lane.info, lane.info_capacity,
+          2 * parameter_count,
+          "cudaMalloc(batched Cholesky solver status)");
+        check_cusolver(cusolverDnDpotrf_bufferSize(lane.solver,
+          CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
+          &workspace_sizes[system]),
+          "cusolverDnDpotrf_bufferSize(batched resident ridge)");
+        ensure_capacity(lane.workspace, lane.workspace_capacity,
+          workspace_sizes[system],
+          "cudaMalloc(batched Cholesky solver workspace)");
+      }
+
+      ComputeClock::time_point phase_start;
+      if(timings) phase_start = ComputeClock::now();
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cuda(cudaMemcpyAsync(lane.gram, grams[system].data(),
+          gram_elements * sizeof(double), cudaMemcpyHostToDevice,
+          lane.stream), "copy batched Cholesky Gram matrix to CUDA device");
+        check_cuda(cudaMemcpyAsync(lane.right_hand_sides,
+          right_hand_sides[system].data(), rhs_elements * sizeof(double),
+          cudaMemcpyHostToDevice, lane.stream),
+          "copy batched Cholesky right-hand sides to CUDA device");
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+      if(timings) timings->upload_ms += elapsed_ms(phase_start);
+
+      std::vector<std::vector<int>> solver_status(
+        system_count, std::vector<int>(2 * parameter_count));
+      if(timings) phase_start = ComputeClock::now();
+      const int threads = 256;
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        for(int parameter = 0; parameter < parameter_count; ++parameter) {
+          check_cuda(cudaMemcpyAsync(lane.factor, lane.gram,
+            gram_elements * sizeof(double), cudaMemcpyDeviceToDevice,
+            lane.stream),
+            "copy batched Cholesky factorization matrix");
+          check_cuda(cudaMemcpyAsync(lane.solve, lane.right_hand_sides,
+            rhs_elements * sizeof(double), cudaMemcpyDeviceToDevice,
+            lane.stream), "copy batched Cholesky solve right-hand sides");
+          add_uniform_diagonal_penalty<<<
+            (size + threads - 1) / threads, threads, 0, lane.stream>>>(
+              lane.factor, ridge_parameters(parameter), size);
+          check_cuda(cudaGetLastError(),
+            "add batched uniform diagonal penalty kernel");
+          check_cusolver(cusolverDnDpotrf(lane.solver,
+            CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
+            lane.workspace, workspace_sizes[system],
+            lane.info + 2 * parameter),
+            "cusolverDnDpotrf(batched resident ridge)");
+          check_cusolver(cusolverDnDpotrs(lane.solver,
+            CUBLAS_FILL_MODE_LOWER, size, right_hand_side_count,
+            lane.factor, size, lane.solve, size,
+            lane.info + 2 * parameter + 1),
+            "cusolverDnDpotrs(batched resident ridge)");
+          check_cuda(cudaMemcpyAsync(
+            lane.coefficients +
+              static_cast<Eigen::Index>(parameter) * rhs_elements,
+            lane.solve, rhs_elements * sizeof(double),
+            cudaMemcpyDeviceToDevice, lane.stream),
+            "store batched Cholesky coefficients");
+        }
+
+        const int sample_count = checked_int(
+          column_counts(static_cast<Eigen::Index>(system)),
+          "resident batched Cholesky ridge sample count");
+        if(sample_count > 0) {
+          const double* prediction_matrix = d_resident_genotypes_ +
+            static_cast<Eigen::Index>(
+              start_columns(static_cast<Eigen::Index>(system))) *
+              resident_rows_;
+          check_cublas(cublasDgemm(lane.blas, CUBLAS_OP_T, CUBLAS_OP_N,
+            sample_count, combination_count, size, &alpha,
+            prediction_matrix, size, lane.coefficients, size, &beta,
+            lane.predictions, sample_count),
+            "cublasDgemm(batched resident Cholesky predictions)");
+        }
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+      for(size_t system = 0; system < system_count; ++system)
+        check_cuda(cudaMemcpy(solver_status[system].data(),
+          level0_cholesky_lanes_[system].info,
+          solver_status[system].size() * sizeof(int),
+          cudaMemcpyDeviceToHost),
+          "copy batched Cholesky solver status to host");
+      if(timings) timings->ridge_ms += elapsed_ms(phase_start);
+
+      for(size_t system = 0; system < system_count; ++system) {
+        for(int parameter = 0; parameter < parameter_count; ++parameter) {
+          const int factor_status = solver_status[system][2 * parameter];
+          const int solve_status = solver_status[system][2 * parameter + 1];
+          if(factor_status != 0 || solve_status != 0) {
+            std::ostringstream message;
+            message << "cuSOLVER batched resident Cholesky failed for system="
+                    << system << " parameter=" << parameter
+                    << " factor_info=" << factor_status
+                    << " solve_info=" << solve_status;
+            throw std::runtime_error(message.str());
+          }
+        }
+      }
+
+      if(timings) phase_start = ComputeClock::now();
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cuda(cudaMemcpyAsync(coefficients[system].data(),
+          lane.coefficients, coefficients[system].size() * sizeof(double),
+          cudaMemcpyDeviceToHost, lane.stream),
+          "copy batched Cholesky coefficients from CUDA device");
+        if(predictions[system].size() > 0)
+          check_cuda(cudaMemcpyAsync(predictions[system].data(),
+            lane.predictions, predictions[system].size() * sizeof(double),
+            cudaMemcpyDeviceToHost, lane.stream),
+            "copy batched Cholesky predictions from CUDA device");
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+      if(timings) {
+        timings->download_ms += elapsed_ms(phase_start);
+        timings->resident_reuse_count += system_count;
+      }
       return true;
     }
 
@@ -3258,6 +3526,55 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    static void release_level0_cholesky_lane(
+      CudaLevel0CholeskyLane& lane) {
+      if(lane.stream) cudaStreamSynchronize(lane.stream);
+      if(lane.info) cudaFree(lane.info);
+      if(lane.workspace) cudaFree(lane.workspace);
+      if(lane.predictions) cudaFree(lane.predictions);
+      if(lane.coefficients) cudaFree(lane.coefficients);
+      if(lane.solve) cudaFree(lane.solve);
+      if(lane.right_hand_sides) cudaFree(lane.right_hand_sides);
+      if(lane.factor) cudaFree(lane.factor);
+      if(lane.gram) cudaFree(lane.gram);
+      if(lane.solver) cusolverDnDestroy(lane.solver);
+      if(lane.blas) cublasDestroy(lane.blas);
+      if(lane.stream) cudaStreamDestroy(lane.stream);
+      lane = CudaLevel0CholeskyLane();
+    }
+
+    void ensure_level0_cholesky_lane_count(size_t required) {
+      if(level0_cholesky_lanes_.size() >= required) return;
+      level0_cholesky_lanes_.reserve(required);
+      while(level0_cholesky_lanes_.size() < required) {
+        CudaLevel0CholeskyLane lane;
+        try {
+          check_cuda(cudaStreamCreateWithFlags(
+            &lane.stream, cudaStreamNonBlocking),
+            "create batched Cholesky stream");
+          check_cusolver(cusolverDnCreate(&lane.solver),
+            "create batched Cholesky cuSOLVER handle");
+          check_cusolver(cusolverDnSetStream(lane.solver, lane.stream),
+            "set batched Cholesky cuSOLVER stream");
+          check_cublas(cublasCreate(&lane.blas),
+            "create batched Cholesky cuBLAS handle");
+          check_cublas(cublasSetStream(lane.blas, lane.stream),
+            "set batched Cholesky cuBLAS stream");
+          level0_cholesky_lanes_.push_back(lane);
+        } catch(...) {
+          release_level0_cholesky_lane(lane);
+          throw;
+        }
+      }
+    }
+
+    void synchronize_level0_cholesky_lanes(size_t count) {
+      for(size_t lane = 0; lane < count; ++lane)
+        check_cuda(cudaStreamSynchronize(
+          level0_cholesky_lanes_[lane].stream),
+          "synchronize batched Cholesky stream");
+    }
+
     bool ensure_pinned_staging(size_t required_bytes) {
       if(pinned_staging_chunk_bytes_ == 0 || required_bytes < 65536 ||
          !pinned_staging_available_)
@@ -3487,12 +3804,33 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       capacity = required_size;
     }
 
+    static void ensure_capacity(int*& pointer, size_t& capacity,
+      Eigen::Index required, const char* label) {
+      if(required < 0)
+        throw std::runtime_error(
+          std::string("negative CUDA allocation size for ") + label);
+      const size_t required_size = static_cast<size_t>(required);
+      if(required_size <= capacity) return;
+      if(required_size >
+         std::numeric_limits<size_t>::max() / sizeof(int))
+        throw std::runtime_error(
+          std::string("CUDA allocation size overflow for ") + label);
+      if(pointer) check_cuda(cudaFree(pointer),
+        "cudaFree while growing integer buffer");
+      pointer = nullptr;
+      capacity = 0;
+      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
+        required_size * sizeof(int)), label);
+      capacity = required_size;
+    }
+
     int device_;
     cudaDeviceProp properties_;
     cublasHandle_t handle_;
     cusolverDnHandle_t solver_handle_;
     size_t pinned_staging_chunk_bytes_;
     bool level0_cholesky_enabled_;
+    bool level0_fold_batch_enabled_;
     void* pinned_staging_[2] = {nullptr, nullptr};
     cudaStream_t upload_streams_[2] = {nullptr, nullptr};
     double* d_genotypes_;
@@ -3559,6 +3897,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     size_t packed_row_counts_capacity_ = 0;
     int ridge_factorized_size_;
     int ridge_factorized_rhs_count_;
+    std::vector<CudaLevel0CholeskyLane> level0_cholesky_lanes_;
 };
 
 }

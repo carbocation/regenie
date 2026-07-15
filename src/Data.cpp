@@ -1126,6 +1126,8 @@ void Data::level_0_calculations() {
         l0.profile_backend_ridge_compute_ms : 0;
       const uint64_t cholesky_folds_before = params.profile_step1 ?
         l0.profile_cholesky_ridge_folds : 0;
+      const uint64_t batched_cholesky_blocks_before = params.profile_step1 ?
+        l0.profile_batched_cholesky_ridge_blocks : 0;
       const uint64_t eigendecomposition_folds_before = params.profile_step1 ?
         l0.profile_eigendecomposition_ridge_folds : 0;
       if(params.use_loocv)
@@ -1151,6 +1153,9 @@ void Data::level_0_calculations() {
         step1_profile.ridge_backend_compute_ms += backend_ridge_ms;
         step1_profile.ridge_cholesky_folds +=
           l0.profile_cholesky_ridge_folds - cholesky_folds_before;
+        step1_profile.ridge_batched_cholesky_blocks +=
+          l0.profile_batched_cholesky_ridge_blocks -
+            batched_cholesky_blocks_before;
         step1_profile.ridge_eigendecomposition_folds +=
           l0.profile_eigendecomposition_ridge_folds -
             eigendecomposition_folds_before;
@@ -1318,7 +1323,7 @@ void Data::print_step1_profile() {
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP1_PROFILE version=7 backend=" << step1_compute_backend->name()
+  out << "\nSTEP1_PROFILE version=8 backend=" << step1_compute_backend->name()
       << " mode=" << (params.use_loocv ? "loocv" : "kfold")
       << " blocks=" << step1_profile.blocks
       << " variants=" << step1_profile.variants
@@ -1438,6 +1443,8 @@ void Data::print_step1_profile() {
   out << "STEP1_PROFILE scope=level0_ridge"
       << " wall_ms=" << step1_profile.ridge_wall_ms
       << " cholesky_folds=" << step1_profile.ridge_cholesky_folds
+      << " batched_cholesky_blocks=" <<
+        step1_profile.ridge_batched_cholesky_blocks
       << " eigendecomposition_folds=" <<
         step1_profile.ridge_eigendecomposition_folds
       << " eigensolve_transform_ms=" << step1_profile.ridge_eigensolve_ms
