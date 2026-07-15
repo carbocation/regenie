@@ -64,6 +64,7 @@ void survival_data::setup(const Eigen::VectorXd& event_time, const Eigen::Vector
 
 	// R matrix
 	n_unique_time = time_first_index.size();
+	risk_set_start = time_first_index.cast<int>();
 	R.resize(n, n_unique_time);
     // R = Eigen::MatrixXd::Zero(n_unique_time, n);
 	for (unsigned int k = 0; k < n_unique_time; ++k) {
@@ -90,7 +91,6 @@ void survival_data::setup(const Eigen::VectorXd& event_time, const Eigen::Vector
     	}
 	}
 }
-
 void survival_data::_getOrder(const Eigen::VectorXd& time, const Eigen::VectorXd& status) {
     // order = Eigen::seq(0, n - 1);
     Eigen::VectorXi order(n);

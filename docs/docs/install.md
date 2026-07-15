@@ -57,6 +57,143 @@ To use with Boost Iostreams and/or Intel MKL library,
 add the corresponding flags before the `cmake` command on line 3
 (e.g. `BGEN_PATH=<path_to_bgen_lib> HAS_BOOST_IOSTREAM=1 cmake ..`).
 
+### Experimental CUDA Step 1 backend
+
+The CUDA backend accelerates the FP64 matrix work in Step 1, including Gram
+and phenotype crossproducts, symmetric eigensystems, batched ridge prediction,
+weighted logistic/Poisson/Cox updates, diagonal-penalty Cholesky solves, and
+chunked final-model influence solves. Level 0 products, design Gram matrices,
+weighted Hessians, score crossproducts, linear predictors, and
+chromosome-grouped LOCO predictions are streamed through bounded device
+buffers; reusable eigensystems and Cholesky factorizations remain
+device-resident across prediction chunks. The backend is disabled by default,
+requires CMake 3.18 or newer and the CUDA toolkit, and currently requires a
+dynamic build.
+Build for an NVIDIA A100 (compute capability 8.0) with:
+
+```
+BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
+  -DREGENIE_WITH_CUDA=ON \
+  -DREGENIE_CUDA_ARCHITECTURES=80
+cmake --build build-cuda -j
+```
+
+Select it in Step 1 with `--compute-backend cuda`; use `--gpu-device` when
+more than one CUDA device is visible. `--compute-backend auto` uses CUDA when
+the binary contains the backend and the requested device is available,
+otherwise it uses the CPU backend.
+
+Sample-major device buffers are limited to approximately 1 GB by default.
+Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer
+streaming limit; this is primarily useful for validation or sharing a GPU with
+other jobs.
+
+CUDA genotype preprocessing uses a resident full-block buffer when the block
+fits within the available device-memory budget. By default, the budget is the
+smaller of 6,000 MB and 60% of currently free device memory. Set
+`REGENIE_CUDA_RESIDENT_MB` to a non-negative integer to override that automatic
+budget. CUDA operations reuse the resident full block and its full-row column
+slices instead of uploading the same genotype values again. Ordinary k-fold
+Step 1 runs leave the normalized block device-only; LOOCV and `--test-l0` also
+receive a normalized host copy because those paths read genotype values on the
+CPU. Larger blocks fall back to CPU preprocessing. Set the limit to `0` to
+disable GPU preprocessing. The validation harness exposes the same setting as
+`CUDA_RESIDENT_MB`.
+
+For k-fold binary-trait Level 1 fitting, CUDA can keep the complete Level 1
+design resident across folds, ridge parameters, and IRLS iterations. This
+eliminates repeated uploads of the same predictions and accumulates each
+weighted Gram matrix and score crossproduct on the device. The automatic
+limit allows one design copy to use at most 40% of currently available device
+memory (capped at 16 GB), because IRLS also needs an equally sized weighted
+design workspace. If the two buffers plus a 512 MB reserve do not fit, REGENIE
+uses the existing streamed fold path. Set `REGENIE_CUDA_LEVEL1_RESIDENT_MB` to
+a non-negative integer to override the maximum size of one design copy; `0`
+disables this specialization. The validation harness exposes the override as
+`CUDA_LEVEL1_RESIDENT_MB`.
+
+Ordinary k-fold PGEN hardcall runs can avoid materializing and uploading the
+host FP64 genotype matrix entirely. When the resident block fits, the reader
+passes PGEN's native two-bit hardcalls to CUDA; the device then expands,
+masks, mean-imputes, residualizes, and scales the block directly into its
+resident FP64 buffer. A 1,000-variant by 500,000-sample block therefore crosses
+the host/device boundary as approximately 125 MB of hardcalls instead of 4 GB
+of doubles. Dosage mode, LOOCV, `--test-l0`, MAF-dependent priors, CPU runs,
+and blocks above the resident limit retain the general host-matrix path. Set
+`REGENIE_STEP1_PGEN_PACKED=0` to disable this specialization for matched A/B
+validation; the validation harness exposes it as `STEP1_PGEN_PACKED`.
+
+Packed-resident k-fold runs solve each Level 0 ridge system directly with one
+Cholesky factorization per ridge parameter. This avoids computing a complete
+eigendecomposition when only the configured ridge solutions are needed, and
+the resulting coefficients are multiplied by the already resident genotype
+block. The existing eigendecomposition implementation remains the fallback for
+other input paths and for any ridge grid containing zero. Set
+`REGENIE_CUDA_LEVEL0_CHOLESKY=0` to force the previous implementation for a
+matched A/B comparison; the validation harness exposes the same switch as
+`CUDA_LEVEL0_CHOLESKY`.
+
+The independent k-fold systems are submitted to reusable CUDA streams so their
+Cholesky factorizations, solves, and held-out predictions can overlap. The
+number of streams follows the configured fold count; it is not tied to a
+particular phenotype count. Set `REGENIE_CUDA_LEVEL0_FOLD_BATCH=0` to retain
+the sequential Cholesky implementation for a matched A/B comparison. The
+validation harness exposes this switch as `CUDA_LEVEL0_FOLD_BATCH`.
+
+Chromosome-grouped prediction uploads copy row slices directly from the
+column-major Level 1 design into bounded device buffers. This avoids building
+a full temporary host matrix for every prediction chunk. Set
+`REGENIE_CUDA_DIRECT_GROUPED_UPLOAD=0` to restore the materialized upload path
+for a matched A/B comparison.
+
+Large resident uploads use two reusable pinned host chunks so host packing can
+overlap transfer to the device. `REGENIE_CUDA_PINNED_STAGING_MB` controls the
+size of each chunk (64 MB by default); set it to `0` to restore direct pageable
+uploads. Pinned staging adds only twice the configured chunk size to host
+memory, independent of the genotype block size.
+
+For CUDA Step 1 runs on PGEN input, the next genotype block is decoded into a
+reusable second host buffer while the current block is processed on the GPU.
+The buffer holds native packed hardcalls when the specialization above is
+active and an FP64 matrix otherwise. Prefetching is enabled when it is no larger than
+`REGENIE_STEP1_PGEN_PREFETCH_MB` (4,096 MB by default). Set the value to `0` to
+disable prefetching or lower it to cap the additional host-memory allowance.
+The PGEN decoder itself reuses one sample tile per worker and fuses
+validation, masking, allele-frequency accumulation, and missing-value
+imputation into a single scatter pass. It materializes eight variants at a
+time by default so each sample-major destination write is contiguous; set
+`REGENIE_STEP1_PGEN_TILE_VARIANTS` to an integer from 1 through 64 to tune the
+memory-bandwidth tradeoff. Each worker retains one tile buffer, so its host
+memory cost is `tile variants * samples * 8` bytes per worker.
+
+For development, the repository includes a single A100 validation command.
+It builds both backends, checks matrix shapes and failure paths, benchmarks
+both the Level 0 eigensystem and nonlinear Level 1 workloads, runs quantitative,
+binary, count, time-to-event, top-SNP, k-fold, and LOOCV Step 1 jobs, and
+compares the CPU and CUDA LOCO files. It also records peak device-memory use
+for the CUDA benchmark and each end-to-end case:
+
+```
+BGEN_PATH=<path_to_bgen_lib> scripts/test_step1_cuda.sh
+```
+
+Application runs using `--step1-profile` report how many blocks used CUDA
+genotype preprocessing, along with pinned-staging upload counts and bytes.
+Packed-hardcall runs additionally report their block count, transfer bytes,
+and device expansion time.
+PGEN-prefetched runs add a `pgen_pipeline` scope containing decoder service,
+foreground wait, and estimated overlap time. A `pgen_ingest` scope separates
+aggregate worker time inside pgenlib from fused validation, masking,
+allele-frequency calculation, missing-value imputation, and matrix
+materialization, and reports packed variant and byte counts when host
+materialization is skipped. On Linux it also reports process I/O deltas sampled around
+each PGEN block; these distinguish logical reads, which may be page-cached,
+from storage-backed reads reported by `/proc/self/io`.
+
+The normal build remains CUDA-free, so CPU development and regression testing
+can continue on macOS. CUDA compilation is also checked in CI without running
+GPU code.
+
 ### With Docker
 Alternatively, you can use a Docker image to run **regenie**. 
 A guide to using docker is available on 

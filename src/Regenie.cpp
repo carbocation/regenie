@@ -257,6 +257,9 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
   // extended options
   AllOptions.add_options("Additional")
     ("v,verbose", "verbose screen output")
+    ("step1-profile", "output structured timing data for step 1 level 0")
+    ("compute-backend", "Step 1 compute backend: cpu, cuda, or auto", cxxopts::value<std::string>(params->compute_backend),"STRING(=cpu)")
+    ("gpu-device", "CUDA device index for the Step 1 compute backend", cxxopts::value<int>(params->gpu_device),"INT(=0)")
     ("version", "print version number and exit")
     ("minCaseCount", "minimum number of cases per trait", cxxopts::value<int>(params->mcc),"INT=10")
     ("tpheno-file", "transposed phenotype file (each row is a phenotype)", cxxopts::value<std::string>(files->pheno_file),"FILE")
@@ -458,6 +461,7 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
     if( vm.count("af-cc") ) params->af_cc = true;
     if( vm.count("tpheno-file") ) params->transposedPheno = true;
     if( vm.count("v") ) params->verbose = true;
+    if( vm.count("step1-profile") ) params->profile_step1 = true;
     if( vm.count("debug") ) params->verbose = params->debug = true;
     if( vm.count("range") ) params->set_range = true;
     if( vm.count("print") ) params->print_block_betas = true;
@@ -899,6 +903,21 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
     }
 
     if(params->test_mode && params->use_loocv) {params->use_loocv = false;valid_args[ "loocv" ] = false;}
+    if(params->test_mode && params->profile_step1) {
+      sout << "WARNING: option --step1-profile is only available in step 1.\n";
+      params->profile_step1 = false;
+      valid_args[ "step1-profile" ] = false;
+    }
+    if(params->compute_backend != "cpu" && params->compute_backend != "cuda" && params->compute_backend != "auto")
+      throw "--compute-backend must be one of: cpu, cuda, auto";
+    if(params->gpu_device < 0)
+      throw "--gpu-device must be non-negative";
+    if(params->test_mode && (params->compute_backend != "cpu" || vm.count("gpu-device"))) {
+      sout << "WARNING: options --compute-backend/--gpu-device currently only apply to step 1.\n";
+      params->compute_backend = "cpu";
+      params->gpu_device = 0;
+      valid_args[ "compute-backend" ] = valid_args[ "gpu-device" ] = false;
+    }
 
     if( (vm.count("write-samples") || vm.count("write-mask")) && vm.count("bgen") && !vm.count("sample") )
       throw "must specify sample file (using --sample) if writing sample IDs to file.";

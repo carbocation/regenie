@@ -30,6 +30,8 @@
 #define ETAMINTHR -30.0
 #define ETAMAXTHR 30.0
 
+class Step1ComputeBackend;
+
 struct ests {
 
   Eigen::MatrixXd offset_nullreg;
@@ -47,11 +49,17 @@ struct ridgel0 {
   Eigen::MatrixXd GGt;
   Eigen::MatrixXd GTY;
   std::vector<Eigen::MatrixXd> G_folds, GtY; // storage for folds at levle 0
-  Eigen::MatrixXd GGt_eig_vec, GGt_eig_val;
-  Eigen::MatrixXd Wmat, ymat_res;
+  Eigen::MatrixXd ymat_res;
   MatrixXb picked_top_snp;
   bool subset_l0_snps_gmat = false;
   Eigen::ArrayXi nspns_picked_block, nspns_picked, indices_gmat_keep;
+  double profile_eigensolve_ms = 0;
+  double profile_backend_upload_ms = 0;
+  double profile_backend_download_ms = 0;
+  double profile_backend_ridge_compute_ms = 0;
+  uint64_t profile_cholesky_ridge_folds = 0;
+  uint64_t profile_batched_cholesky_ridge_blocks = 0;
+  uint64_t profile_eigendecomposition_ridge_folds = 0;
 };
 
 struct ridgel1 {
@@ -84,40 +92,41 @@ bool fit_poisson(const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const 
 double get_poisson_dev(const Eigen::Ref<const Eigen::ArrayXd>& Y, const Eigen::Ref<const Eigen::ArrayXd>& pi, const Eigen::Ref<const ArrayXb>& mask);
 
 void fit_null_cox(bool const&, const int&, struct param*, struct phenodt*, struct ests*, struct in_files*, mstream&, bool const& save_betas = false);
-double getCoxLambdaMax(const Eigen::MatrixXd&, const Eigen::VectorXd&);
+double getCoxLambdaMax(const Eigen::MatrixXd&, const Eigen::VectorXd&,
+  Step1ComputeBackend* compute_backend = nullptr);
 
-void ridge_level_0(const int&,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,std::vector<MatrixXb>&,mstream&);
-void ridge_level_0_loocv(const int,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,mstream&);
+void ridge_level_0(const int&,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,std::vector<MatrixXb>&,Step1ComputeBackend*,mstream&);
+void ridge_level_0_loocv(const int,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,Step1ComputeBackend*,mstream&);
 void write_l0_file(std::ofstream*,Eigen::MatrixXd&,mstream&);
 
 void set_mem_l1(struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,struct ridgel1*,std::vector<MatrixXb>&,mstream&);
-void ridge_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,mstream&);
-void ridge_level_1_loocv(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,mstream&);
+void ridge_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,Step1ComputeBackend*,mstream&);
+void ridge_level_1_loocv(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,Step1ComputeBackend*,mstream&);
 
-void ridge_logistic_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,std::vector<MatrixXb>&,mstream&);
-void ridge_logistic_level_1_loocv(struct in_files*,struct param*,struct phenodt*,struct ests*,struct ridgel1*,mstream&);
-bool run_log_ridge_loocv(const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const int&,const int&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXd>,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,struct param*,mstream&);
-void run_log_ridge_loocv_adam(const int&,const double&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXd>,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,struct param*,mstream&);
+void ridge_logistic_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,std::vector<MatrixXb>&,Step1ComputeBackend*,mstream&);
+void ridge_logistic_level_1_loocv(struct in_files*,struct param*,struct phenodt*,struct ests*,struct ridgel1*,Step1ComputeBackend*,mstream&);
+bool run_log_ridge_loocv(const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const int&,const int&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXd>,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,struct param*,Step1ComputeBackend*,mstream&);
+void run_log_ridge_loocv_adam(const int&,const double&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXd>,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,struct param*,Step1ComputeBackend*,mstream&);
 
-void ridge_poisson_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,std::vector<MatrixXb>&,mstream&);
-void ridge_poisson_level_1_loocv(struct in_files*,struct param*,struct phenodt*,struct ests*,struct ridgel1*,mstream&);
-bool run_ct_ridge_loocv(const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const int&,const int&,Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXd>,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,struct param*,mstream&);
+void ridge_poisson_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,std::vector<MatrixXb>&,Step1ComputeBackend*,mstream&);
+void ridge_poisson_level_1_loocv(struct in_files*,struct param*,struct phenodt*,struct ests*,struct ridgel1*,Step1ComputeBackend*,mstream&);
+bool run_ct_ridge_loocv(const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const int&,const int&,Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXd>,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,struct param*,Step1ComputeBackend*,mstream&);
 
-void ridge_cox_level_1(struct in_files*, struct param*, struct phenodt*, struct ridgel1*, struct ests*, mstream&);
+void ridge_cox_level_1(struct in_files*, struct param*, struct phenodt*, struct ridgel1*, struct ests*, Step1ComputeBackend*, mstream&);
 
 void get_wvec(Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const ArrayXb>&);
 bool get_wvec(Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const ArrayXb>&,const double&);
-void get_pvec(Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,double const&);
+void get_pvec(Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,double const&,Step1ComputeBackend* compute_backend = nullptr);
 void get_pvec(Eigen::ArrayXd&,Eigen::ArrayXd&,const double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::VectorXd>&,double const&);
 void get_pvec(Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,double const&);
-void get_pvec_poisson(Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,double const&);
+void get_pvec_poisson(Eigen::ArrayXd&,Eigen::ArrayXd&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,double const&,Step1ComputeBackend* compute_backend = nullptr);
 double compute_log_lik_bern(const double&,const double&);
 double compute_log_lik_poisson(const double&,const double&);
 double y_log_ypi(const double&,const double&);
 double get_deviance_logistic(const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&);
 
-void test_assoc_block(int const&,int const&,struct ridgel0&,struct ridgel1&,struct geno_block*,struct phenodt*,snp const*,struct param const&,mstream&);
-void apply_iter_cond(int const&,int const&,int const&,struct ridgel0&,struct ridgel1&,struct geno_block*,snp const*,struct param const&);
+void test_assoc_block(int const&,int const&,struct ridgel0&,struct ridgel1&,struct geno_block*,struct phenodt*,snp const*,struct param const&,Step1ComputeBackend*,mstream&);
+void apply_iter_cond(int const&,int const&,int const&,struct ridgel0&,struct ridgel1&,struct geno_block*,snp const*,struct param const&,Step1ComputeBackend*);
 void read_l0(int const&,int const&,struct in_files*,struct param*,struct ridgel1*,mstream&);
 void read_l0_chunk(int const&,int const&,int const&,int const&,const std::string&,struct param*,struct ridgel1*,mstream&);
 void check_l0(int const&,int const&,struct param*,struct ridgel1*,struct phenodt const*,mstream&,bool const& silent_mode = false);
@@ -125,4 +134,3 @@ void check_l0(int const&,int const&,struct param*,struct ridgel1*,struct phenodt
 
 uint64 getSize(std::string const& fname);
 #endif
-

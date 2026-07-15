@@ -376,7 +376,28 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
   }
 
   if( run_full_test ){
-    if( params.strict_mode ) {
+    if(dt_thr->qt_unscaled) {
+
+      const double genotype_scale = gsc / block_info->scale_fac;
+      num = (yres.transpose() * Geno.matrix()).array() * genotype_scale;
+
+      if(dt_thr->qt_complete_masks) {
+        const double residual_dof =
+          params.n_analyzed - params.ncov_analyzed;
+        denum = gsc * gsc * residual_dof;
+        dt_thr->stats = num / sqrt(denum);
+        dt_thr->bhat = dt_thr->stats / sqrt(denum) *
+          pheno_data.scf_sv;
+      } else {
+        denum_arr = genotype_scale * genotype_scale *
+          (pheno_data.masked_indivs.transpose().cast<double>() *
+            Geno.square().matrix());
+        dt_thr->stats = num / denum_arr.sqrt();
+        dt_thr->bhat = dt_thr->stats * pheno_data.scf_sv /
+          denum_arr.sqrt();
+      }
+
+    } else if( params.strict_mode ) {
 
       if(dt_thr->is_sparse){
         ArrayXd XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse; // k x 1
@@ -704,6 +725,7 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   auto t1 = std::chrono::high_resolution_clock::now();
   ArrayXb has_converged = params->pheno_pass; // if null log reg converged
   IOFormat Fmt(StreamPrecision, DontAlignCols, " ", "\n", "", "","","");
+  const double fallback_max_step = params->maxstep_null / 5.0;
 
   if(!silent) sout << "   -fitting null Firth cox regression on time-to-event phenotypes..." << flush;
 
@@ -722,24 +744,14 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
     else offset = m_ests->blups.col(i).array();
 
     cox_firth cox_firth_null;
-    cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
+    cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
     cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
 
     if( !cox_firth_null.converge ){ // if failed to converge
-      cerr << "WARNING: Cox regression with Firth correction did not converge. Step-halving tol=" << params->numtol_cox_stephalf << "\n";
+      cerr << "WARNING: Cox Firth null fit did not converge from the Cox MLE coefficients. ";
+      cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << fallback_max_step << "; maximum number of iterations=" << params->niter_max_firth_null*5 << "; initiate at 0).\n";
 
-      cerr << "Retrying with strict convergence criteria: step-halving tol=0.\n";
-
-      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
-      cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
-    }
-
-    if( !cox_firth_null.converge ){ // if failed to converge
-      cerr << "WARNING: Cox regression with Firth correction did not converge (step-halving tol=0, maximum step size=" << params->maxstep_null <<";maximum number of iterations=" << params->niter_max_firth_null <<").";
-
-      cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << params->maxstep_null/5 <<";maximum number of iterations=" << params->niter_max_firth_null*5 <<";initiate at 0).\n";
-
-      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null/5, !params->cox_nofirth, false);
+      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, fallback_max_step, !params->cox_nofirth, false);
       cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
     }
     has_converged(i) = cox_firth_null.converge;
@@ -758,7 +770,7 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   // check if some did not converge
   if(!has_converged.any()) { //  none passed
 
-    string msg1 = to_string( params->maxstep_null / 5 );
+    string msg1 = to_string(fallback_max_step);
     string msg2 = to_string( params->niter_max_firth_null * 5 );
     throw "Firth penalized cox regression failed to converge for all phenotypes."
       " Try decreasing the maximum step size using `--maxstep-null` (currently=" + msg1 +  ") "
@@ -800,14 +812,19 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   Xmat = MatrixXd::Zero(params->n_samples, pheno_data->new_cov.cols() + 1); // covariates + tested SNP
   Xmat << pheno_data->new_cov, Gvec;
   col_incl = Xmat.cols();
+  beta0 = VectorXd::Zero(col_incl);
+  beta0.head(col_incl - 1) = fest->beta_null_firth.col(ph);
+  const VectorXd reduced_initial_beta = beta0;
+  const double reduced_fallback_max_step = params->maxstep_null / 5.0;
 
   // null model
   cox_firth cox_firth_null;
-  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false);
+  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, beta0);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
 
   if (!cox_firth_null.converge) {
-    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
+    beta0 = reduced_initial_beta;
+    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, reduced_fallback_max_step, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   }
 
@@ -818,12 +835,25 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   }
 
   // test model
+  VectorXd test_beta0 = cox_firth_null.beta;
+  const double score_information = dt_thr->denum(ph);
+  if(std::isfinite(score_information) && score_information > 0) {
+    const double score_beta =
+      dt_thr->stats(ph) / std::sqrt(score_information);
+    if(std::isfinite(score_beta)) {
+      test_beta0.tail(1)(0) = std::max(
+        -static_cast<double>(params->maxstep),
+        std::min(static_cast<double>(params->maxstep), score_beta));
+    }
+  }
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, cox_firth_null.beta);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, test_beta0);
   cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
 
   if (!cox_firth_test.converge) {
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
+    VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
+      cox_firth_test.beta : test_beta0;
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   }
 
@@ -850,6 +880,18 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
 void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, struct param const* params, struct phenodt* pheno_data, struct ests const* m_ests, struct f_ests const* fest, const Ref<const VectorXd>& Gvec, variant_block* block_info, data_thread* dt_thr, mstream& sout) {
   // if firth is used, fit based on penalized log-likelihood
   double lrt;
+  VectorXd beta0 = VectorXd::Zero(1);
+  const double score_information = dt_thr->denum(ph);
+  if(!params->firth_approx && std::isfinite(score_information) &&
+      score_information > 0) {
+    const double score_beta =
+      dt_thr->stats(ph) / std::sqrt(score_information);
+    if(std::isfinite(score_beta)) {
+      beta0(0) = std::max(
+        -static_cast<double>(params->maxstep),
+        std::min(static_cast<double>(params->maxstep), score_beta));
+    }
+  }
 
   // // For rare variants, set entries in Gvec for non-carriers to 0
   // int mac_thr_sparse = (params->skip_fast_firth ? 0 : 50), i = 0, index_j;
@@ -865,11 +907,13 @@ void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, st
   // }
 
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, beta0);
   cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
 
   if(!cox_firth_test.converge){
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->maxstep/5, !params->cox_nofirth, false);
+    VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
+      cox_firth_test.beta : beta0;
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
   }
 
@@ -2083,6 +2127,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
   Gmu = spa_df.Gmod * phat;
   spa_df.val_a = Gmu.sum();
   spa_df.fastSPA = fastSPA;
+  spa_df.root_k2 = 0;
 
   if(spa_df.fastSPA){
     spa_df.val_b = denum;
@@ -2115,7 +2160,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
     return;
   }
   // compute pvalue (one tail)
-  get_SPA_pvalue_snp(root_K1, tval, pval1, test_fail, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+  get_SPA_pvalue_snp(root_K1, tval, pval1, test_fail, denum, Gsparse, phat, spa_df, mask);
   if(test_fail) {return;}
 
   // 2.for -T
@@ -2127,7 +2172,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
     return;
   }
   // compute pvalue (other tail)
-  get_SPA_pvalue_snp(root_K1, tval, pval2, test_fail, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+  get_SPA_pvalue_snp(root_K1, tval, pval2, test_fail, denum, Gsparse, phat, spa_df, mask);
   if(test_fail) {return;}
 
   // get quantile
@@ -2143,30 +2188,96 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
 
 
 // SPA (MT in OpenMP)
+namespace {
+
+struct SpaCgfDerivatives {
+  double k1;
+  double k2;
+};
+
+SpaCgfDerivatives compute_spa_cgf_derivatives(
+    const double& t,
+    const double& denum,
+    SpVec const& Gsparse,
+    const Ref<const ArrayXd>& phat,
+    const Ref<const ArrayXd>& Gamma_sqrt,
+    struct spa_data& spa_df,
+    const Ref<const ArrayXb>& mask) {
+  SpaCgfDerivatives result = {0, 0};
+  if(spa_df.fastSPA) {
+    for(SpVec::InnerIterator it(Gsparse); it; ++it) {
+      const uint32_t index_j = it.index();
+      if(!mask(index_j)) continue;
+
+      const double vexp = -t / spa_df.val_c * spa_df.Gmod(index_j);
+      if(vexp > MAX_EXP_LIM) return result;
+      const double exp_v = exp(vexp);
+      const double denominator = phat(index_j) +
+        (1 - phat(index_j)) * exp_v;
+      result.k1 +=
+        (spa_df.Gmod(index_j) * phat(index_j) / spa_df.val_c) /
+          denominator;
+      result.k2 +=
+        (spa_df.Gmod(index_j) * spa_df.Gmod(index_j) *
+          Gamma_sqrt(index_j) * Gamma_sqrt(index_j) * exp_v /
+          (spa_df.val_c * spa_df.val_c)) /
+          (denominator * denominator);
+    }
+    result.k1 += -spa_df.val_d / spa_df.val_c +
+      t / denum * spa_df.val_b;
+    result.k2 += spa_df.val_b / denum;
+    return result;
+  }
+
+  spa_df.exponent = -t / spa_df.val_c * spa_df.Gmod;
+  if((mask && (spa_df.exponent > MAX_EXP_LIM)).any()) return result;
+  spa_df.exponent = spa_df.exponent.exp();
+  result.k1 = mask.select(
+    (spa_df.Gmod * phat / spa_df.val_c) /
+      (phat + (1 - phat) * spa_df.exponent), 0).sum();
+  result.k1 -= spa_df.val_a / spa_df.val_c;
+  result.k2 = mask.select(
+    (spa_df.Gmod.square() * Gamma_sqrt.square() /
+      (spa_df.val_c * spa_df.val_c) * spa_df.exponent) /
+      (phat + (1 - phat) * spa_df.exponent).square(), 0).sum();
+  return result;
+}
+
+}  // namespace
+
 double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask, double const& tol, int const& niter_max, double const& missing_value_double){
 
   int niter_cur;
   int lambda = spa_df.pos_score ? 1 : -1; // if score is negative, adjust K' and K''
   double min_x, max_x, t_old, f_old, t_new = -1, f_new, hess;
+  SpaCgfDerivatives derivatives = {0, 0};
 
   niter_cur = 0;
   if(tval >=0){min_x = 0, max_x = std::numeric_limits<double>::max();}
   else{min_x = std::numeric_limits<double>::lowest(), max_x = 0;}
   t_old = 0;
-  f_old = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+  spa_df.root_k2 = 0;
+  derivatives = compute_spa_cgf_derivatives(
+    lambda * t_old, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+  f_old = derivatives.k1;
+  hess = derivatives.k2;
   f_old *= lambda;
   f_old -= tval; 
 
   while( niter_cur++ < niter_max ){
 
-    hess = spa_df.fastSPA ? compute_K2_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
     if(hess == 0) return missing_value_double;
     t_new = t_old - f_old / hess;
-    f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+    derivatives = compute_spa_cgf_derivatives(
+      lambda * t_new, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+    f_new = derivatives.k1;
     f_new *= lambda;
     f_new -= tval;
 
-    if( fabs( f_new ) < tol ) break;
+    if( fabs( f_new ) < tol ) {
+      spa_df.root_k2 = derivatives.k2;
+      break;
+    }
 
     // update bounds on root
     if( t_new && (t_new > min_x) && (t_new < max_x) ){
@@ -2175,7 +2286,9 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
     } else{ // bisection method if t_new went out of bounds and re-compute f_new
       t_new = ( min_x + max_x ) / 2;
       // if( fabs( min_x - t_new ) < params->tol_spa ) break;
-      f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+      derivatives = compute_spa_cgf_derivatives(
+        lambda * t_new, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+      f_new = derivatives.k1;
       f_new *= lambda;
       f_new -= tval;
       // reduce bounds based on new value
@@ -2185,6 +2298,7 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
 
     t_old = t_new;
     f_old = f_new;
+    hess = derivatives.k2;
   }
 
   // If didn't converge
@@ -2271,14 +2385,14 @@ double compute_K2_fast_snp(const double& t, const double& b, const double& c, co
   return val;
 }
 
-void get_SPA_pvalue_snp(const double& root, const double& tval, double& pv, bool& test_fail, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask){
+void get_SPA_pvalue_snp(const double& root, const double& tval, double& pv, bool& test_fail, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, struct spa_data& spa_df, const Ref<const ArrayXb>& mask){
 
   int lambda = spa_df.pos_score ? 1 : -1; // if score is negative, adjust K and K''
   double kval, k2val, wval, vval, rval;
   normal nd(0,1);
 
   kval = spa_df.fastSPA ? compute_K_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
-  k2val = spa_df.fastSPA ? compute_K2_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
+  k2val = spa_df.root_k2;
   if(k2val == 0) {
     test_fail = true;
     return;

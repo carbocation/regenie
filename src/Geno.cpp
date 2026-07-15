@@ -29,9 +29,89 @@
 #include "Geno.hpp"
 #include "db/sqlite3.hpp"
 
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+
 using namespace std;
 using namespace Eigen;
 using namespace boost;
+
+namespace {
+
+class ScopedThreadWorkTimer {
+  public:
+    explicit ScopedThreadWorkTimer(double* elapsed_ms)
+      : elapsed_ms_(elapsed_ms) {
+      if(elapsed_ms_) start_ = std::chrono::steady_clock::now();
+    }
+
+    ~ScopedThreadWorkTimer() {
+      if(!elapsed_ms_) return;
+      const std::chrono::duration<double, std::milli> elapsed =
+        std::chrono::steady_clock::now() - start_;
+      *elapsed_ms_ += elapsed.count();
+    }
+
+  private:
+    double* elapsed_ms_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+int step1_pgen_tile_variants() {
+  const char* value = std::getenv("REGENIE_STEP1_PGEN_TILE_VARIANTS");
+  if(!value || !*value) return 8;
+  char* end = nullptr;
+  const long tile_variants = std::strtol(value, &end, 10);
+  if(end == value || *end != '\0' || tile_variants <= 0 ||
+     tile_variants > 64)
+    throw std::invalid_argument(
+      "REGENIE_STEP1_PGEN_TILE_VARIANTS must be an integer in [1,64]");
+  return static_cast<int>(tile_variants);
+}
+
+struct Bgen8DosageLookupEntry {
+  double genotype = 0;
+  double info = 0;
+};
+
+using Bgen8DosageLookup =
+  std::array<Bgen8DosageLookupEntry, 65536>;
+
+Bgen8DosageLookup build_bgen8_dosage_lookup(bool const ref_first) {
+  Bgen8DosageLookup lookup;
+  for(uint32_t byte0 = 0; byte0 < 256; ++byte0) {
+    for(uint32_t byte1 = 0; byte1 < 256; ++byte1) {
+      const double prob0 = double(byte0) / 255.0;
+      const double prob1 = double(byte1) / 255.0;
+      const double prob2 = std::max(1 - prob0 - prob1, 0.0);
+      Bgen8DosageLookupEntry& entry =
+        lookup[byte0 | (byte1 << 8)];
+      entry.genotype = ref_first ?
+        prob1 + 2 * prob2 : prob1 + 2 * prob0;
+      entry.info = ref_first ?
+        4 * prob2 + prob1 - entry.genotype * entry.genotype :
+        4 * prob0 + prob1 - entry.genotype * entry.genotype;
+    }
+  }
+  return lookup;
+}
+
+const Bgen8DosageLookup& bgen8_dosage_lookup(bool const ref_first) {
+  if(ref_first) {
+    static const Bgen8DosageLookup lookup =
+      build_bgen8_dosage_lookup(true);
+    return lookup;
+  }
+  static const Bgen8DosageLookup lookup =
+    build_bgen8_dosage_lookup(false);
+  return lookup;
+}
+
+}
 
 
 
@@ -1495,7 +1575,7 @@ void check_ld_list(map <string, uint32_t>& map_ID, struct in_files* files, struc
 }
 
 // only used in step 1
-void get_G(const int& block, const int& bs, const int& chrom, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct in_files* files, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, mstream& sout){
+void get_G(const int& block, const int& bs, const int& chrom, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct in_files* files, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, mstream& sout, Step1PgenReadProfile* pgen_profile){
 
   auto t1 = std::chrono::high_resolution_clock::now();
   sout << " block [" << block + 1 << "] : " << flush;
@@ -1503,7 +1583,7 @@ void get_G(const int& block, const int& bs, const int& chrom, const uint32_t& sn
   if(params->file_type == "bed")
     readChunkFromBedFileToG(bs, chrom, snpcount, snpinfo, params, files, gblock, filters, masked_indivs, phenotypes_raw, sout);
   else if(params->file_type == "pgen")
-    readChunkFromPGENFileToG(bs, snpcount, snpinfo, params, gblock, filters, masked_indivs, sout);
+    readChunkFromPGENFileToG(bs, snpcount, snpinfo, params, gblock, filters, masked_indivs, sout, pgen_profile);
   else if(params->streamBGEN)
     readChunkFromBGENFileToG_fast(bs, chrom, snpcount, snpinfo, params, files, gblock, filters, masked_indivs, phenotypes_raw, sout);
   else
@@ -1770,55 +1850,228 @@ void readChunkFromBedFileToG(const int& bs, const int& chrom, const uint32_t& sn
 
 
 // only for step 1
-void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, mstream& sout) {
+void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, mstream& sout, Step1PgenReadProfile* profile) {
+
+  (void)masked_indivs;
+  (void)sout;
+  readChunkFromPGENFileToG(bs, snpcount, snpinfo, params,
+    gblock->Gmat, gblock->snp_afs, gblock->pgr, filters,
+    &gblock->step1_pgen_worker_tiles, profile);
+}
+
+// Step 1 PGEN decoding writes an MxN column-major matrix while pgenlib emits
+// one contiguous N-element variant at a time. Keep one multi-variant tile per
+// worker and fuse validation, allele-frequency accumulation, masking,
+// missing-value collection, and the single required strided scatter. The
+// previous implementation allocated two N-element Eigen arrays per variant
+// and scanned/scattered each row several times.
+void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount,
+  vector<snp> const& snpinfo, struct param const* params,
+  MatrixXd& genotype_matrix, MatrixXd& snp_afs, PgenReader& pgr,
+  struct filter const* filters, vector<vector<double>>* worker_tiles,
+  Step1PgenReadProfile* profile) {
 
   ArrayXb oob_err = ArrayXb::Constant(bs, false);
+  const int worker_count = std::max(1, params->neff_threads);
+  const int tile_variants = step1_pgen_tile_variants();
+  const int tile_count = (bs + tile_variants - 1) / tile_variants;
+  vector<vector<double>> local_worker_tiles;
+  vector<vector<double>>& tile_buffers = worker_tiles ?
+    *worker_tiles : local_worker_tiles;
+  tile_buffers.resize(worker_count);
+  const size_t tile_elements = static_cast<size_t>(tile_variants) *
+    params->n_samples;
+  vector<uint64_t> worker_buffer_allocations(
+    profile ? worker_count : 0, 0);
+  vector<double> thread_work_ms(
+    profile ? worker_count : 0, 0);
+  vector<double> reader_call_thread_ms(
+    profile ? worker_count : 0, 0);
+  vector<uint64_t> missing_values(
+    profile ? worker_count : 0, 0);
+  const bool all_samples_in_analysis = filters->ind_in_analysis.all();
+  const uint64_t excluded_per_variant = all_samples_in_analysis ? 0 :
+    static_cast<uint64_t>(filters->ind_in_analysis.size() -
+      filters->ind_in_analysis.count());
+
+  const auto process_variant = [&](const int j, const int thread_num,
+    double* genotypes, vector<Eigen::Index>& missing_indices) {
+    {
+      ScopedThreadWorkTimer reader_call_timer(
+        profile ? &reader_call_thread_ms[thread_num] : nullptr);
+      if(params->dosage_mode)
+        pgr.Read(genotypes, params->n_samples, thread_num,
+          snpinfo[snpcount + j].offset, 1);
+      else
+        pgr.ReadHardcalls(genotypes, params->n_samples, thread_num,
+          snpinfo[snpcount + j].offset, 1);
+    }
+
+    double total = 0;
+    uint64_t observed_count = 0;
+    missing_indices.clear();
+
+    if(all_samples_in_analysis) {
+      for(Eigen::Index sample = 0; sample < params->n_samples; ++sample) {
+        const double genotype = genotypes[sample];
+        if(genotype < -3 || genotype > 2) {
+          oob_err(j) = true;
+          return;
+        }
+        if(genotype == -3)
+          missing_indices.push_back(sample);
+        else {
+          total += genotype;
+          observed_count++;
+        }
+      }
+    } else {
+      for(Eigen::Index sample = 0; sample < params->n_samples; ++sample) {
+        const double genotype = genotypes[sample];
+        if(genotype < -3 || genotype > 2) {
+          oob_err(j) = true;
+          return;
+        }
+        if(!filters->ind_in_analysis(sample)) {
+          genotypes[sample] = 0;
+          continue;
+        }
+        if(genotype == -3)
+          missing_indices.push_back(sample);
+        else {
+          total += genotype;
+          observed_count++;
+        }
+      }
+    }
+
+    total /= observed_count;
+    if(params->alpha_prior != -1) snp_afs(j, 0) = total / 2;
+    for(size_t index = 0; index < missing_indices.size(); ++index)
+      genotypes[missing_indices[index]] = total;
+    if(profile)
+      missing_values[thread_num] += missing_indices.size();
+  };
+
+  const auto process_tile = [&](const int tile_index,
+    const int thread_num, double* tile_genotypes,
+    vector<Eigen::Index>& missing_indices) {
+    ScopedThreadWorkTimer thread_work_timer(
+      profile ? &thread_work_ms[thread_num] : nullptr);
+    const int start_variant = tile_index * tile_variants;
+    const int count = std::min(tile_variants, bs - start_variant);
+    for(int local_variant = 0; local_variant < count; ++local_variant)
+      process_variant(start_variant + local_variant, thread_num,
+        tile_genotypes + static_cast<size_t>(local_variant) *
+          params->n_samples, missing_indices);
+
+    const Eigen::Index destination_stride =
+      genotype_matrix.outerStride();
+    for(Eigen::Index sample = 0; sample < params->n_samples; ++sample) {
+      double* destination = genotype_matrix.data() +
+        sample * destination_stride + start_variant;
+      for(int local_variant = 0; local_variant < count; ++local_variant)
+        destination[local_variant] = tile_genotypes[
+          static_cast<size_t>(local_variant) * params->n_samples + sample];
+    }
+  };
 
 #if defined(_OPENMP)
-  setNbThreads(1);
-#pragma omp parallel for schedule(dynamic)
-#endif
-  for(int j = 0; j < bs; j++) {
-
-    int thread_num = 0;
-#if defined(_OPENMP)
-    thread_num = omp_get_thread_num();
-#endif
-    //cerr << "#" << thread_num << endl;
-
-    double total;
-    ArrayXb keep_indices;
-    // G is MxN, but need to pass g as column vector
-    ArrayXd g (params->n_samples, 1);
-
-    // read genotype data
-    if( params->dosage_mode ){
-      gblock->pgr.Read(g.data(), params->n_samples, thread_num, snpinfo[snpcount+j].offset, 1);
-    } else
-      gblock->pgr.ReadHardcalls(g.data(), params->n_samples, thread_num, snpinfo[snpcount+j].offset, 1);
-
-    oob_err(j) = ((g < -3) || (g > 2)).any();
-    if(oob_err(j)) continue;
-
-    gblock->Gmat.row(j) = g.matrix().transpose();
-
-    keep_indices = filters->ind_in_analysis && (g != -3.0);
-    total = keep_indices.select(g,0).sum() / keep_indices.count();
-
-    if( params->alpha_prior != -1) gblock->snp_afs(j, 0) = total / 2;
-
-    // impute missing
-    for (size_t i = 0; i < params->n_samples; i++) 
-      mean_impute_g(gblock->Gmat(j, i), total, filters->ind_in_analysis(i));
-
+#pragma omp parallel num_threads(worker_count)
+  {
+    const int thread_num = omp_get_thread_num();
+    if(tile_buffers[thread_num].capacity() < tile_elements && profile)
+      worker_buffer_allocations[thread_num]++;
+    tile_buffers[thread_num].resize(tile_elements);
+    vector<Eigen::Index> missing_indices;
+#pragma omp for schedule(dynamic)
+    for(int tile_index = 0; tile_index < tile_count; ++tile_index)
+      process_tile(tile_index, thread_num, tile_buffers[thread_num].data(),
+        missing_indices);
   }
-#if defined(_OPENMP)
-  setNbThreads(params->threads);
+#else
+  if(tile_buffers[0].capacity() < tile_elements && profile)
+    worker_buffer_allocations[0]++;
+  tile_buffers[0].resize(tile_elements);
+  vector<Eigen::Index> missing_indices;
+  for(int tile_index = 0; tile_index < tile_count; ++tile_index)
+    process_tile(tile_index, 0, tile_buffers[0].data(), missing_indices);
 #endif
 
-  if(oob_err.any()) 
+  if(profile) {
+    profile->variants += bs;
+    profile->fused_variants += bs;
+    profile->materialization_tile_variants = std::max<uint64_t>(
+      profile->materialization_tile_variants, tile_variants);
+    profile->worker_buffer_allocations += std::accumulate(
+      worker_buffer_allocations.begin(), worker_buffer_allocations.end(),
+      uint64_t(0));
+    profile->missing_values += std::accumulate(
+      missing_values.begin(), missing_values.end(), uint64_t(0));
+    profile->excluded_values += excluded_per_variant * bs;
+    profile->thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    profile->reader_call_thread_ms += std::accumulate(
+      reader_call_thread_ms.begin(), reader_call_thread_ms.end(), 0.0);
+  }
+
+  if(oob_err.any())
     throw "there is a variant in the block that has a value not in [0,2] or missing";
 
+}
+
+// Preserve pgenlib's native two-bit, variant-major representation for the
+// CUDA hardcall fast path.  Expansion, masking, mean imputation, covariate
+// projection, and scaling are deliberately deferred to the device.
+void readChunkFromPGENFileToPackedHardcalls(const int& bs,
+  const uint32_t& snpcount, vector<snp> const& snpinfo,
+  struct param const* params, PgenReader& pgr,
+  vector<unsigned char>& packed_hardcalls, size_t& packed_stride_bytes,
+  Step1PgenReadProfile* profile) {
+
+  packed_stride_bytes = (static_cast<size_t>(params->n_samples) + 3) / 4;
+  if(packed_stride_bytes > 0 && static_cast<size_t>(bs) >
+      std::numeric_limits<size_t>::max() / packed_stride_bytes)
+    throw std::runtime_error("Step 1 packed PGEN block size overflow");
+  const size_t packed_bytes = static_cast<size_t>(bs) *
+    packed_stride_bytes;
+  packed_hardcalls.resize(packed_bytes);
+
+  const int worker_count = std::max(1, params->neff_threads);
+  vector<double> thread_work_ms(profile ? worker_count : 0, 0);
+  vector<double> reader_call_thread_ms(profile ? worker_count : 0, 0);
+
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(worker_count) schedule(dynamic)
+#endif
+  for(int variant = 0; variant < bs; ++variant) {
+#if defined(_OPENMP)
+    const int thread_num = omp_get_thread_num();
+#else
+    const int thread_num = 0;
+#endif
+    ScopedThreadWorkTimer work_timer(
+      profile ? &thread_work_ms[thread_num] : nullptr);
+    {
+      ScopedThreadWorkTimer reader_timer(
+        profile ? &reader_call_thread_ms[thread_num] : nullptr);
+      pgr.ReadHardcallsPacked(
+        packed_hardcalls.data() +
+          static_cast<size_t>(variant) * packed_stride_bytes,
+        packed_stride_bytes, params->n_samples, thread_num,
+        snpinfo[snpcount + variant].offset, 1);
+    }
+  }
+
+  if(profile) {
+    profile->variants += bs;
+    profile->packed_variants += bs;
+    profile->packed_bytes += packed_bytes;
+    profile->thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    profile->reader_call_thread_ms += std::accumulate(
+      reader_call_thread_ms.begin(), reader_call_thread_ms.end(), 0.0);
+  }
 }
 
 
@@ -2170,20 +2423,20 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
 
 }
 
-void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
+void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible){
 
   if( ((params->file_type == "bgen") && !params->streamBGEN) || params->file_type == "pgen")
     return;
 
   if(params->file_type == "bgen") // uncompress and extract the dosages
-    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout);
+    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_fast_path_eligible);
   else if(params->file_type == "bed") // extract hardcalls
     parseSnpfromBed(isnp, chrom, *geno_block, params, filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data);
 
 }
 
 
-void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
+void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible){
 
   uint minploidy = 0, maxploidy = 0, phasing = 0, bits_prob = 0;
   uint16_t numberOfAlleles = 0 ;
@@ -2191,8 +2444,11 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   uint32_t index;
   string tmp_buffer;
 
+  const bool non_par = in_non_par(chrom, infosnp->physpos, params);
+  const bool use_fast_dosage_path =
+    bgen_fast_path_eligible && !non_par;
   MapArXd Geno (gblock->Gmat.col(isnp).data(), params->n_samples, 1);
-  Geno = 0;
+  if(!use_fast_dosage_path) Geno = 0;
   // reset variant info
   prep_snp_stats(snp_data, params);
 
@@ -2246,15 +2502,72 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   std::memcpy(&bits_prob, &(buffer[0]), 1);
   buffer++;
 
+  const bool use_dosage_lookup = use_fast_dosage_path &&
+    (bits_prob == 8) && (phasing == 0);
+
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
-  bool non_par = in_non_par(chrom, infosnp->physpos, params);
   int lval, ncarriers = 0, nmales = 0;
   double prob0, prob1, prob2, total = 0, mac = 0, mval, ival, info_num = 0, sum_pos;
 
   // parse genotype probabilities block
   index = 0;
-  for(size_t i = 0; i < nindivs; i++) {
+  bool requires_mean_imputation = false;
+  if(use_fast_dosage_path) {
+    assert(nindivs == static_cast<uint32_t>(Geno.size()));
+    if(use_dosage_lookup) {
+      const Bgen8DosageLookup& lookup =
+        bgen8_dosage_lookup(params->ref_first);
+      for(size_t i = 0; i < nindivs; i++) {
+        missing = ((ploidy_n[i]) & 0x80);
+        if(missing) {
+          Geno(i) = -3;
+          requires_mean_imputation = true;
+          buffer += 2;
+          continue;
+        }
+
+        const uint32_t lookup_index =
+          uint32_t(buffer[0]) | (uint32_t(buffer[1]) << 8);
+        buffer += 2;
+        const Bgen8DosageLookupEntry& entry = lookup[lookup_index];
+        Geno(i) = entry.genotype;
+        total += entry.genotype;
+        info_num += entry.info;
+        snp_data->ns1++;
+      }
+    } else {
+      for(size_t i = 0; i < nindivs; i++) {
+        missing = ((ploidy_n[i]) & 0x80);
+        if(missing) {
+          Geno(i) = -3;
+          requires_mean_imputation = true;
+          buffer += 2;
+          continue;
+        }
+
+        prob0 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
+          255.0;
+        prob1 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
+          255.0;
+        prob2 = std::max(1 - prob0 - prob1, 0.0);
+        if(params->ref_first)
+          Geno(i) = prob1 + 2 * prob2;
+        else
+          Geno(i) = prob1 + 2 * prob0;
+
+        if(params->ref_first)
+          ival = 4 * prob2 + prob1 - Geno(i) * Geno(i);
+        else
+          ival = 4 * prob0 + prob1 - Geno(i) * Geno(i);
+
+        total += Geno(i);
+        info_num += ival;
+        snp_data->ns1++;
+      }
+    }
+  } else {
+    for(size_t i = 0; i < nindivs; i++) {
 
     // skip samples that were ignored from the analysis
     if( filters->ind_ignore(i) ) {
@@ -2333,7 +2646,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
       }
 
     }
-    index++;
+      index++;
+    }
   }
 
   // check MAC
@@ -2404,7 +2718,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   }
 
   // impute missing
-  if(!params->build_mask)
+  if(!params->build_mask &&
+     (!use_fast_dosage_path || requires_mean_imputation))
     mean_impute_g(total, Geno, filters->ind_in_analysis);
 
   return;
@@ -2539,6 +2854,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 
   int const bs = indices.size();
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
+  const bool all_samples_in_analysis = filters->ind_in_analysis.all();
+  const bool has_trait_missingness = filters->has_missing.any();
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -2564,6 +2881,19 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 
     mac = 0, nmales = 0;
     bool non_par = in_non_par(chrom, snp_info->physpos, params);
+    const bool use_fast_hardcall_path =
+      !params->build_mask &&
+      !params->dosage_mode &&
+      (params->test_type == 0) &&
+      !non_par &&
+      !params->af_cc &&
+      params->split_by_pheno &&
+      !params->htp_out &&
+      !params->w_interaction &&
+      !params->snp_set &&
+      !params->trait_set &&
+      !params->multiphen;
+    bool requires_mean_imputation = true;
     if( params->dosage_mode ) eij2 = 0;
 
     // read genotype data
@@ -2573,50 +2903,105 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     else
       pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
 
-    oob_err(j) = ((Geno < -3) || (Geno > 2)).any();
-    if(oob_err(j)) continue;
+    if(use_fast_hardcall_path) {
+      total = 0;
+      snp_data->ns1 = 0;
+      snp_data->n_zero = filters->ind_in_analysis.size() -
+        params->n_samples;
+      requires_mean_imputation = false;
 
-    keep_index = filters->ind_in_analysis && (Geno != -3.0);
-    total = keep_index.select(Geno,0).sum();
-    snp_data->ns1 = keep_index.count();
-    if(params->test_mode && !params->build_mask) snp_data->n_zero = filters->ind_in_analysis.size() - params->n_samples;
-    //cerr << "ID: " << snp_info->ID << "\nG bounds: " << 
-    //  (Geno * keep_index.cast<double>()).minCoeff() << " - " << (Geno * keep_index.cast<double>()).maxCoeff() << "\n\n";
-
-    for (int index = 0; index < filters->ind_in_analysis.size(); index++) {
-
-      if( keep_index(index) ){
-        // compute MAC using 0.5*g for males for variants on sex chr non-PAR (males coded as diploid)
-        // sex is 1 for males and 0 o.w.
-        ival = 0, lval = 0, mval = Geno(index);
-        //cerr << "index (" << params->sex(index)<<") " << index << " : " << mval << "\n";
-        if(params->test_mode){
-          if(!params->build_mask && (mval == 0)) snp_data->n_zero++;
-          if (mval >= 0.5) ncarriers++;
-
-          if(non_par) {
-            lval = (params->sex(index) == 1);
-            mval *= 0.5 * (2 - lval);
-            // check if not 0/2
-            if( !params->dosage_mode && (lval == 1) && (Geno(index) == 1) )
-              het_male_X(j) = true;
+      if(all_samples_in_analysis && !has_trait_missingness) {
+        for(int index = 0; index < Geno.size(); index++) {
+          const double genotype = Geno(index);
+          if(genotype < -3 || genotype > 2) {
+            oob_err(j) = true;
+            break;
           }
+          if(genotype == -3) {
+            requires_mean_imputation = true;
+            continue;
+          }
+          total += genotype;
+          snp_data->ns1++;
+          if(genotype == 0) snp_data->n_zero++;
         }
+      } else {
+        for(int index = 0;
+            index < filters->ind_in_analysis.size(); index++) {
+          const double genotype = Geno(index);
+          if(genotype < -3 || genotype > 2) {
+            oob_err(j) = true;
+            break;
+          }
+          if(!filters->ind_in_analysis(index)) {
+            requires_mean_imputation = true;
+            continue;
+          }
+          if(genotype == -3) {
+            requires_mean_imputation = true;
+            continue;
+          }
 
-        if( params->dosage_mode ) ival = Geno(index) * Geno(index);
-
-        if (params->test_mode && non_par && params->skip_dosage_comp && lval){
-          Geno(index) /= 2.0; // divide by 2 for males in non-par X
-          if (params->af_cc && masked_indivs.row(index).any()) // n_males_cases
-            snp_data->ns_case_adj += masked_indivs.row(index).array().cast<int>() * phenotypes_raw.row(index).array().cast<int>();
+          total += genotype;
+          snp_data->ns1++;
+          if(genotype == 0) snp_data->n_zero++;
+          if(has_trait_missingness && filters->has_missing(index))
+            update_trait_counts(index, genotype, genotype, 0, 0,
+              snp_data, masked_indivs);
         }
+      }
+      if(oob_err(j)) continue;
+    } else {
+      oob_err(j) = ((Geno < -3) || (Geno > 2)).any();
+      if(oob_err(j)) continue;
 
-        mac += mval;
-        nmales += lval;
-        eij2 += ival;
+      keep_index = filters->ind_in_analysis && (Geno != -3.0);
+      total = keep_index.select(Geno,0).sum();
+      snp_data->ns1 = keep_index.count();
+      if(params->test_mode && !params->build_mask) snp_data->n_zero = filters->ind_in_analysis.size() - params->n_samples;
+      //cerr << "ID: " << snp_info->ID << "\nG bounds: " <<
+      //  (Geno * keep_index.cast<double>()).minCoeff() << " - " << (Geno * keep_index.cast<double>()).maxCoeff() << "\n\n";
 
-        // counts by trait
-        if(filters->has_missing(index)) update_trait_counts(index, Geno(index), mval, lval, ival, snp_data, masked_indivs);
+      for (int index = 0; index < filters->ind_in_analysis.size(); index++) {
+
+        if( keep_index(index) ){
+          // compute MAC using 0.5*g for males for variants on sex chr
+          // non-PAR (males coded as diploid); sex is 1 for males and 0 o.w.
+          ival = 0, lval = 0, mval = Geno(index);
+        //cerr << "index (" << params->sex(index)<<") " << index << " : " << mval << "\n";
+          if(params->test_mode){
+            if(!params->build_mask && (mval == 0)) snp_data->n_zero++;
+            if (mval >= 0.5) ncarriers++;
+
+            if(non_par) {
+              lval = (params->sex(index) == 1);
+              mval *= 0.5 * (2 - lval);
+              // check if not 0/2
+              if( !params->dosage_mode && (lval == 1) &&
+                  (Geno(index) == 1) )
+                het_male_X(j) = true;
+            }
+          }
+
+          if( params->dosage_mode ) ival = Geno(index) * Geno(index);
+
+          if (params->test_mode && non_par && params->skip_dosage_comp &&
+              lval){
+            Geno(index) /= 2.0; // divide by 2 for males in non-par X
+            if (params->af_cc && masked_indivs.row(index).any())
+              snp_data->ns_case_adj +=
+                masked_indivs.row(index).array().cast<int>() *
+                phenotypes_raw.row(index).array().cast<int>();
+          }
+
+          mac += mval;
+          nmales += lval;
+          eij2 += ival;
+
+          // counts by trait
+          if(filters->has_missing(index))
+            update_trait_counts(index, Geno(index), mval, lval, ival,
+              snp_data, masked_indivs);
 
        /* // get genotype counts
         if( params->htp_out ) {
@@ -2627,17 +3012,20 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
             hc = (int) (Geno(index) + 0.5); // round to nearest integer 0/1/2
           update_genocounts(params->trait_mode==1, index, hc, snp_data->genocounts, masked_indivs, phenotypes_raw);
         } else */
-        if( params->af_cc )
-        update_af_cc(index, Geno(index), snp_data, masked_indivs, phenotypes_raw);
-        if (!params->split_by_pheno){
-          if(Geno(index) >= 1.5) snp_data->n_aa++;
-          else if(Geno(index) < 0.5) snp_data->n_rr++;
-          else if(non_par && lval && !(params->test_mode && params->skip_dosage_comp)){
-            if (Geno(index) < 1) snp_data->n_rr++;
-            else snp_data->n_aa++;
+          if( params->af_cc )
+            update_af_cc(index, Geno(index), snp_data, masked_indivs,
+              phenotypes_raw);
+          if (!params->split_by_pheno){
+            if(Geno(index) >= 1.5) snp_data->n_aa++;
+            else if(Geno(index) < 0.5) snp_data->n_rr++;
+            else if(non_par && lval &&
+                    !(params->test_mode && params->skip_dosage_comp)){
+              if (Geno(index) < 1) snp_data->n_rr++;
+              else snp_data->n_aa++;
+            }
           }
-        }
 
+        }
       }
     }
 
@@ -2692,7 +3080,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     }
 
     // impute missing
-    if(!params->build_mask)
+    if(!params->build_mask &&
+       (!use_fast_hardcall_path || requires_mean_imputation))
       mean_impute_g(total, Geno, filters->ind_in_analysis);
 
   }
@@ -2916,6 +3305,8 @@ void reset_thread(data_thread* snp_data, struct param const& params){
     }
     snp_data->skat_var = params.missing_value_double;
     snp_data->is_sparse = false;
+    snp_data->qt_unscaled = false;
+    snp_data->qt_complete_masks = false;
     snp_data->fastSPA = params.use_SPA && (!params.build_mask || (params.mask_rule_max || params.mask_rule_comphet));
 }
 
@@ -3258,6 +3649,26 @@ void residualize_geno(const Ref<const MatrixXd>& X, Ref<VectorXd> Graw, variant_
     return;
   }
   Graw /= snp_data->scale_fac;
+
+}
+
+void residualize_geno_unscaled(const Ref<const MatrixXd>& X,
+    Ref<VectorXd> Graw, variant_block* snp_data,
+    struct param const& params){
+
+  if(snp_data->ignored) return;
+
+  // Retain the projected genotype on its raw scale. The score path uses the
+  // saved scale factor algebraically, avoiding both the normalization write
+  // pass and the subsequent full squared-genotype denominator pass.
+  VectorXd beta = X.transpose() * Graw;
+  Graw -= X * beta;
+
+  snp_data->scale_fac = Graw.norm();
+  snp_data->scale_fac /= sqrt(params.n_analyzed - X.cols());
+
+  if(snp_data->scale_fac < params.numtol)
+    snp_data->ignored = true;
 
 }
 

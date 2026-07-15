@@ -73,6 +73,7 @@ basecmd="--step 1 \
 rgcmd="$basecmd \
   --lowmem \
   --lowmem-prefix tmp_rg \
+  --step1-profile \
   --out ${mntpt}test/fit_bin_out"
 
 # run regenie
@@ -86,6 +87,22 @@ if [ ! -f "${REGENIE_PATH}test/fit_bin_out.log" ] || \
   print_custom_err "$fail_msg"
 elif [ "`grep \"0.4504\" ${REGENIE_PATH}test/fit_bin_out.log | grep \"min value\"`" = "" ]; then
   print_custom_err "$fail_msg"
+elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "11" ]; then
+  print_custom_err "Step 1 profiling output is incomplete."
+elif ! grep -q '^STEP1_PROFILE version=9 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 profiling header is missing."
+# Scope records are path-dependent; require the scopes exercised by this
+# LOOCV regression instead of assuming every optional scope is present.
+elif ! grep -q '^STEP1_PROFILE scope=genotype_preprocess ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 genotype preprocessing profiling is missing."
+elif ! grep -q '^STEP1_PROFILE scope=cv_matrices ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 CV matrix profiling is missing."
+elif ! grep -q '^STEP1_PROFILE scope=level0_ridge ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 Level 0 ridge profiling is missing."
+elif ! grep -q '^STEP1_PROFILE scope=prediction_output ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 prediction output profiling is missing."
+elif ! grep -q '^STEP1_PROFILE_FINAL version=1 backend=cpu ' ${REGENIE_PATH}test/fit_bin_out.log; then
+  print_custom_err "Step 1 final profiling output is missing."
 fi
 
 #### Run step 1 splitting across jobs for level 0
@@ -166,6 +183,184 @@ fi
 
 if [ "`cat ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie | wc -l`" != "1001" ]
 then
+  print_err
+fi
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# PGEN binary traits with complete phenotype data
+for file_type in bed pgen; do
+  rgcmd="--step 2 \
+    --${file_type} ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype_bin.txt${fsuf} \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --bt \
+    --ignore-pred \
+    --out ${mntpt}test/test_bin_out_pgen_bt_complete_${file_type}"
+
+  ./$regenie_bin $rgcmd
+done
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_complete_bed_${phenotype}.regenie \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_complete_pgen_${phenotype}.regenie
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# PGEN quantitative traits with complete phenotype data
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype.txt \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --ignore-pred \
+  --out ${mntpt}test/test_bin_out_pgen_qt_complete"
+
+./$regenie_bin $rgcmd
+
+for phenotype in Y1 Y2; do
+  if [ "`cat ${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_${phenotype}.regenie | wc -l`" != "1001" ]; then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# PGEN binary traits with phenotype-specific missingness
+for file_type in bed pgen; do
+  rgcmd="--step 2 \
+    --${file_type} ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --bt \
+    --ignore-pred \
+    --out ${mntpt}test/test_bin_out_pgen_bt_missing_${file_type}"
+
+  ./$regenie_bin $rgcmd
+done
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_missing_bed_${phenotype}.regenie \
+    ${REGENIE_PATH}test/test_bin_out_pgen_bt_missing_pgen_${phenotype}.regenie
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# PGEN quantitative traits with phenotype-specific missingness
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --force-qt \
+  --ignore-pred \
+  --out ${mntpt}test/test_bin_out_pgen_qt_missing"
+
+./$regenie_bin $rgcmd
+
+for phenotype in Y1 Y2; do
+  if [ "`cat ${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie | wc -l`" != "1001" ]; then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# complete-sample BGEN dosage decoding in both allele orientations
+for ref_mode in default ref_first; do
+  ref_arg=""
+  if [ "$ref_mode" = "ref_first" ]; then
+    ref_arg="--ref-first"
+  fi
+
+  rgcmd="--step 2 \
+    --bgen ${mntpt}example/example.bgen \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype.txt \
+    --bsize 200 \
+    --ignore-pred \
+    $ref_arg \
+    --out ${mntpt}test/test_bin_out_bgen_qt_${ref_mode}_bgen"
+  ./$regenie_bin $rgcmd
+
+  for phenotype in Y1 Y2; do
+    if [ "`cat ${REGENIE_PATH}test/test_bin_out_bgen_qt_${ref_mode}_bgen_${phenotype}.regenie | wc -l`" != "1001" ]
+    then
+      print_err
+    fi
+  done
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# phenotype missingness retains the general BGEN decoder
+rgcmd="--step 2 \
+  --bgen ${mntpt}example/example.bgen \
+  --covarFile ${mntpt}example/covariates.txt${fsuf} \
+  --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+  --bsize 200 \
+  --force-qt \
+  --ignore-pred \
+  --out ${mntpt}test/test_bin_out_bgen_qt_missing"
+./$regenie_bin $rgcmd
+
+for phenotype in Y1 Y2; do
+  if [ "`cat ${REGENIE_PATH}test/test_bin_out_bgen_qt_missing_${phenotype}.regenie | wc -l`" != "1001" ]
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# saddlepoint approximation
+rgcmd="--step 2 \
+  --bgen ${mntpt}example/example.bgen \
+  --covarFile ${mntpt}example/covariates.txt${fsuf} \
+  --phenoFile ${mntpt}example/phenotype_bin.txt${fsuf} \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --bt \
+  --spa \
+  --pThresh 0.01 \
+  --pred ${mntpt}test/fit_bin_out_pred.list \
+  $arg_gz \
+  --out ${mntpt}test/test_bin_out_spa"
+
+# run regenie
+./$regenie_bin $rgcmd
+
+if [ -f ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie.gz ]; then
+  ( zcat < ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie
+fi
+
+if [ "`cat ${REGENIE_PATH}test/test_bin_out_spa_Y1.regenie | wc -l`" != "1001" ]; then
+  print_err
+elif ! grep -Eq '^Number of tests with SPA correction : [1-9][0-9]*$' ${REGENIE_PATH}test/test_bin_out_spa.log; then
+  print_err
+elif ! grep -Eq '^Number of failed tests : \(0/[1-9][0-9]*\)$' ${REGENIE_PATH}test/test_bin_out_spa.log; then
   print_err
 fi
 
@@ -469,4 +664,3 @@ fi
 echo "SUCCESS: REGENIE build passed the tests!"
 # file cleanup
 rm -f ${REGENIE_PATH}test/fit_bin_* ${REGENIE_PATH}test/test_bin_out* ${REGENIE_PATH}test/test_out* ${REGENIE_PATH}test/tmp[12].txt
-

@@ -28,6 +28,7 @@ class survival_data {
         // tie
         std::map<double, std::vector<int>> unique_time_indices;
         Eigen::VectorXd time_first_index;
+        Eigen::VectorXi risk_set_start;
         std::map<double, Eigen::VectorXi> ties_index;
         // weights
         Eigen::VectorXd w, w_orig;

@@ -68,6 +68,23 @@ struct tally {
   uint32_t n_ignored_tests = 0;
 };
 
+struct Step1PgenReadProfile {
+  uint64_t variants = 0;
+  uint64_t fused_variants = 0;
+  uint64_t packed_variants = 0;
+  uint64_t packed_bytes = 0;
+  uint64_t materialization_tile_variants = 0;
+  uint64_t worker_buffer_allocations = 0;
+  uint64_t missing_values = 0;
+  uint64_t excluded_values = 0;
+  uint64_t io_samples = 0;
+  uint64_t logical_read_bytes = 0;
+  uint64_t physical_read_bytes = 0;
+  uint64_t read_syscalls = 0;
+  double thread_work_ms = 0;
+  double reader_call_thread_ms = 0;
+};
+
 // for step 2 per thread
 struct data_thread {
   SpVec Gsparse;
@@ -92,6 +109,9 @@ struct data_thread {
   // reset each time
   bool fastSPA = true;
   bool is_sparse = false;
+  // QT residual is retained on its raw scale for the dense score path.
+  bool qt_unscaled = false;
+  bool qt_complete_masks = false;
 };
 
 struct geno_block {
@@ -100,6 +120,10 @@ struct geno_block {
   PgenReader pgr;
   Eigen::MatrixXd Gmat;
   Eigen::MatrixXd snp_afs;
+  std::vector<std::vector<double>> step1_pgen_worker_tiles;
+  std::vector<unsigned char> step1_pgen_packed_hardcalls;
+  size_t step1_pgen_packed_stride_bytes = 0;
+  bool step1_pgen_packed_block = false;
   std::vector<data_thread> thread_data;
 };
 
@@ -174,17 +198,21 @@ void check_forced_MAC_file(std::map<std::string,uint32_t>&,std::vector<snp>&,str
 void check_samples_include_exclude(struct in_files const*,struct param*,struct filter*,mstream&);
 void check_ld_list(std::map<std::string,uint32_t>&,struct in_files*,struct param*,mstream&);
 
-void get_G(const int&,const int&,const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct in_files*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,mstream&);
+void get_G(const int&,const int&,const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct in_files*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,mstream&,Step1PgenReadProfile* = nullptr);
 
 void readChunkFromBGENFileToG(const int&,const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,mstream&);
 void readChunkFromBGENFileToG_fast(const int&,const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct in_files*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,mstream&);
 void readChunkFromBedFileToG(const int&,const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct in_files*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,mstream&);
-void readChunkFromPGENFileToG(const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,mstream&);
+void readChunkFromPGENFileToG(const int&,const uint32_t&,std::vector<snp> const&,struct param const*,struct geno_block*,struct filter const*,const Eigen::Ref<const MatrixXb>&,mstream&,Step1PgenReadProfile* = nullptr);
+void readChunkFromPGENFileToG(const int&,const uint32_t&,std::vector<snp> const&,struct param const*,Eigen::MatrixXd&,Eigen::MatrixXd&,PgenReader&,struct filter const*,std::vector<std::vector<double>>*,Step1PgenReadProfile* = nullptr);
+void readChunkFromPGENFileToPackedHardcalls(const int&,const uint32_t&,
+  std::vector<snp> const&,struct param const*,PgenReader&,
+  std::vector<unsigned char>&,size_t&,Step1PgenReadProfile* = nullptr);
 
 void readChunkFromBGENFileToG(std::vector<uint64> const&,const int&,std::vector<snp> const&,struct param const*,Eigen::Ref<Eigen::MatrixXd>,BgenParser&,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<variant_block>&,mstream&);
 void readChunkFromBGEN(std::istream*,std::vector<uint32_t>&,std::vector<uint32_t>&,std::vector<std::vector<uchar>>&,std::vector<uint64>&);
-void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&);
-void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&);
+void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool = false);
+void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool);
 void parseSnpfromBed(const int&,const int&,const std::vector<uchar>&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*);
 void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&);
 
@@ -209,6 +237,7 @@ void mean_impute_g(double &,const double&,const bool&);
 void mean_impute_g(const double&,Eigen::Ref<Eigen::ArrayXd>,const Eigen::Ref<const ArrayXb>&);
 void residualize_geno(int const&,int const&,variant_block*,bool const&,const Eigen::Ref<const Eigen::MatrixXd>&,struct geno_block*,struct param const*);
 void residualize_geno(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
+void residualize_geno_unscaled(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
 void writeSnplist(std::string const&,int const&,int const&,std::vector<snp> const&,mstream&);
 
 bool in_chrList(const int&,struct filter const*);

@@ -27,6 +27,81 @@
 #ifndef DATA_H
 #define DATA_H
 
+class Step1ComputeBackend;
+
+struct Step1GroupedPredictionProfile {
+  uint64_t calls = 0;
+  uint64_t design_uploads = 0;
+  uint64_t design_upload_bytes = 0;
+  double wall_ms = 0;
+  double upload_ms = 0;
+  double compute_ms = 0;
+  double download_ms = 0;
+  double host_materialization_ms = 0;
+};
+
+struct Step1Profile {
+  uint64_t blocks = 0;
+  uint64_t variants = 0;
+  double total_ms = 0;
+  double decode_ms = 0;
+  double residualize_ms = 0;
+  double gram_ms = 0;
+  double gty_ms = 0;
+  double backend_upload_ms = 0;
+  double backend_download_ms = 0;
+  double eigensolve_ms = 0;
+  double association_ms = 0;
+  double ridge_ms = 0;
+  double backend_ridge_compute_ms = 0;
+  double cv_wall_ms = 0;
+  double cv_backend_compute_ms = 0;
+  double cv_transfer_ms = 0;
+  double cv_host_orchestration_ms = 0;
+  double ridge_wall_ms = 0;
+  double ridge_eigensolve_ms = 0;
+  double ridge_transfer_ms = 0;
+  double ridge_backend_compute_ms = 0;
+  double ridge_host_orchestration_ms = 0;
+  uint64_t ridge_cholesky_folds = 0;
+  uint64_t ridge_batched_cholesky_blocks = 0;
+  uint64_t ridge_eigendecomposition_folds = 0;
+  uint64_t preprocess_backend_blocks = 0;
+  uint64_t preprocess_fallback_blocks = 0;
+  double preprocess_wall_ms = 0;
+  double preprocess_backend_compute_ms = 0;
+  double preprocess_upload_ms = 0;
+  double preprocess_download_ms = 0;
+  double preprocess_host_orchestration_ms = 0;
+  double preprocess_data_setup_ms = 0;
+  double preprocess_backend_wall_ms = 0;
+  double preprocess_data_finalize_ms = 0;
+  uint64_t preprocess_pinned_staging_upload_count = 0;
+  uint64_t preprocess_pinned_staging_upload_bytes = 0;
+  uint64_t preprocess_packed_hardcall_blocks = 0;
+  uint64_t preprocess_packed_hardcall_upload_bytes = 0;
+  double preprocess_packed_hardcall_expand_ms = 0;
+  double preprocess_packed_hardcall_validation_ms = 0;
+  double preprocess_packed_hardcall_allocation_ms = 0;
+  double preprocess_packed_hardcall_host_prepare_ms = 0;
+  double preprocess_packed_hardcall_backend_wall_ms = 0;
+  uint64_t pgen_prefetched_blocks = 0;
+  double pgen_prefetch_service_ms = 0;
+  double pgen_prefetch_wait_ms = 0;
+  double initialization_ms = 0;
+  double level0_wall_ms = 0;
+  double level1_prepare_ms = 0;
+  double level1_fit_ms = 0;
+  double output_ms = 0;
+  uint64_t prediction_output_rows = 0;
+  uint64_t prediction_output_values = 0;
+  uint64_t prediction_output_threads = 0;
+  double prediction_output_format_ms = 0;
+  double prediction_output_write_ms = 0;
+  Step1GroupedPredictionProfile grouped_prediction;
+  double end_to_end_ms = 0;
+};
+
 class Data {
 
   public:
@@ -63,6 +138,9 @@ class Data {
     Eigen::RowVectorXd p_sd_yres;
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
     MultiPhen mphen;
+    Step1Profile step1_profile;
+    Step1PgenReadProfile step1_pgen_read_profile;
+    std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions
     void run();
@@ -84,6 +162,8 @@ class Data {
     void setmem();
     void calc_cv_matrices(struct ridgel0*);
     void level_0_calculations();
+    void print_step1_profile();
+    void print_step1_final_profile();
     void prep_l1_models();
     void write_inputs(); 
     void exit_early();
@@ -97,10 +177,18 @@ class Data {
     void make_predictions_count(int const&,int const&);
     void make_predictions_count_loocv(int const&,int const&);
     void make_predictions_cox(int const&, int const&);
+    void step1_grouped_predict(
+      const Eigen::Ref<const Eigen::MatrixXd>&,
+      const Eigen::Ref<const Eigen::VectorXd>&,
+      const Eigen::Ref<const Eigen::VectorXi>&,
+      const Eigen::Ref<const Eigen::VectorXi>&,
+      Eigen::MatrixXd&);
     void print_snp_betas(const Eigen::Ref<const Eigen::VectorXd>&);
     void write_predictions(int const&);
-    std::string write_ID_header();
-    std::string write_chr_row(int const&,int const&,const Eigen::Ref<const Eigen::VectorXd>&);
+    std::string write_ID_header(std::vector<uint32_t>&);
+    std::string write_chr_row(int const&,int const&,
+      const Eigen::Ref<const Eigen::VectorXd>&,
+      const std::vector<uint32_t>&);
     void rm_l0_files(int const& ph);
 
     // step 2 main functions

@@ -63,6 +63,9 @@ public:
 
   void ReadHardcalls(double* buf, size_t const& n, int const& thr, int variant_idx, int allele_idx);
 
+  void ReadHardcallsPacked(unsigned char* buf, size_t const& byte_count,
+    size_t const& n, int const& thr, int variant_idx, int allele_idx);
+
   void Read(double* buf, size_t const& n, int const& thr, int variant_idx, int allele_idx);
 
   void Close();
@@ -97,4 +100,3 @@ private:
   void SetSampleSubsetInternal(std::vector<int>& sample_subset_1based, int const& thr);
   void ReadAllelesPhasedInternal(int variant_idx);
 };
-

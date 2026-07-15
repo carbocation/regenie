@@ -24,6 +24,11 @@ project(regenie
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
+include(CTest)
+
+option(REGENIE_WITH_CUDA "Build the experimental CUDA Step 1 compute backend" OFF)
+set(REGENIE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
+  "CUDA architectures to compile for when REGENIE_WITH_CUDA=ON")
 
 # specify the C++ standard
 set(CMAKE_CXX_STANDARD 11)
@@ -47,6 +52,18 @@ endif()
 if($ENV{STATIC})
   set(BUILD_STATIC ON CACHE INTERNAL "Static compilation")
   message( STATUS "Static compilation mode")
+endif()
+
+if(REGENIE_WITH_CUDA)
+  if(CMAKE_VERSION VERSION_LESS 3.18)
+    message(FATAL_ERROR "REGENIE_WITH_CUDA requires CMake 3.18 or newer")
+  endif()
+  if(BUILD_STATIC)
+    message(FATAL_ERROR "REGENIE_WITH_CUDA currently requires a dynamic build (do not set STATIC=1)")
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "Building experimental CUDA Step 1 backend for architectures: ${REGENIE_CUDA_ARCHITECTURES}")
 endif()
 
 # check Boost IOStreams
@@ -107,6 +124,7 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/Regenie.cpp
   ${CMAKE_SOURCE_DIR}/src/SKAT.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/MultiTrait_Tests.cpp
   ${CMAKE_SOURCE_DIR}/src/MCC.cpp
@@ -117,6 +135,20 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
   )
 target_include_directories(regenie PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+function(configure_step1_cuda target_name)
+  if(REGENIE_WITH_CUDA)
+    target_sources(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
+    target_compile_definitions(${target_name} PRIVATE WITH_CUDA)
+    target_link_libraries(${target_name} PRIVATE CUDA::cublas CUDA::cusolver CUDA::cudart)
+    set_target_properties(${target_name} PROPERTIES
+      CUDA_STANDARD 11
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_ARCHITECTURES "${REGENIE_CUDA_ARCHITECTURES}")
+  endif()
+endfunction()
+
+configure_step1_cuda(regenie)
 
 set(CMAKE_CXX_FLAGS "-O3 -Wall -pedantic -ffast-math -Wno-unused-local-typedefs -Wno-deprecated-declarations -Wno-long-long -Wno-c11-extensions -fPIC")
 add_definitions(-DVERSION_NUMBER="${RG_VERSION}")
@@ -208,10 +240,15 @@ if(EXISTS ${HTSLIB_PATH})
   )
 endif()
 
+# Keep the selected accelerated linear-algebra dependencies available to every
+# target compiled with the corresponding global Eigen definitions.
+set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS "")
+set(REGENIE_LINEAR_ALGEBRA_LIBRARIES "")
+
 # Intel MKL
 if(EXISTS ${MKLROOT})
   add_definitions(-DWITH_MKL -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
-  target_include_directories(regenie PRIVATE ${MKLROOT}/include/)
+  set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS ${MKLROOT}/include/)
   if(${BUILD_STATIC}) # specify static libs
     find_library(MKL_LP64_LIB libmkl_intel_lp64.a 
       HINTS "${MKLROOT}/lib/intel64"
@@ -225,7 +262,9 @@ if(EXISTS ${MKLROOT})
       HINTS "${MKLROOT}/lib/intel64"
       "${MKLROOT}/lib" 
       REQUIRED)
-    target_link_libraries(regenie PRIVATE "-Wl,--start-group" ${MKL_LP64_LIB} ${MKL_THREAD_LIB} ${MKL_CORE_LIB} "-Wl,--end-group" -lgomp)
+    set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+      "-Wl,--start-group" ${MKL_LP64_LIB} ${MKL_THREAD_LIB}
+      ${MKL_CORE_LIB} "-Wl,--end-group" -lgomp)
   else() # use dynamic libs
     find_library(MKL_LP64_LIB mkl_intel_lp64 
       PATHS "${MKLROOT}/lib/intel64"
@@ -239,14 +278,26 @@ if(EXISTS ${MKLROOT})
       PATHS "${MKLROOT}/lib/intel64"
       "${MKLROOT}/lib" 
       REQUIRED)
-    target_link_libraries(regenie PRIVATE "-Wl,--no-as-needed" ${MKL_LP64_LIB} ${MKL_THREAD_LIB} ${MKL_CORE_LIB} -lgomp)
+    set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+      "-Wl,--no-as-needed" ${MKL_LP64_LIB} ${MKL_THREAD_LIB}
+      ${MKL_CORE_LIB} -lgomp)
   endif()
 elseif(EXISTS ${OPENBLAS_ROOT}) # OpenBLAS
   add_definitions(-DWITH_OPENBLAS -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
-  target_include_directories(regenie PRIVATE ${OPENBLAS_ROOT}/include/)
+  set(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS ${OPENBLAS_ROOT}/include/)
   find_library(LAPACK_LIB lapack REQUIRED)
   find_library(BLAS_LIB openblas HINTS "${OPENBLAS_ROOT}/lib/" REQUIRED)
-  target_link_libraries(regenie PRIVATE ${LAPACK_LIB} -llapacke ${BLAS_LIB})
+  set(REGENIE_LINEAR_ALGEBRA_LIBRARIES
+    ${LAPACK_LIB} -llapacke ${BLAS_LIB})
+endif()
+
+if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+  target_include_directories(regenie PRIVATE
+    ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+endif()
+if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+  target_link_libraries(regenie PRIVATE
+    ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
 endif()
 
 # cxxopts (header-only)
@@ -257,6 +308,46 @@ target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/LBFGSpp/include/)
 
 # Eigen (header-only)
 target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+
+if(BUILD_TESTING)
+  add_executable(step1_compute_test
+    ${CMAKE_SOURCE_DIR}/test/test_step1_compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp)
+  target_include_directories(step1_compute_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(step1_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(step1_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  configure_step1_cuda(step1_compute_test)
+  add_test(NAME step1_compute_cpu
+    COMMAND step1_compute_test --backend cpu)
+  add_test(NAME step1_compute_auto
+    COMMAND step1_compute_test --backend auto)
+
+  add_executable(cox_firth_test
+    ${CMAKE_SOURCE_DIR}/test/test_cox_firth.cpp
+    ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
+    ${CMAKE_SOURCE_DIR}/src/survival_data.cpp)
+  target_include_directories(cox_firth_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/
+    ${BGEN_PATH}/3rd_party/boost_1_55_0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(cox_firth_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(cox_firth_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  add_test(NAME cox_firth COMMAND cox_firth_test)
+endif()
 
 # Boost IO
 if(${HAS_BOOST_IOSTREAM})
