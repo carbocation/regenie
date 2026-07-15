@@ -2104,6 +2104,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
   Gmu = spa_df.Gmod * phat;
   spa_df.val_a = Gmu.sum();
   spa_df.fastSPA = fastSPA;
+  spa_df.root_k2 = 0;
 
   if(spa_df.fastSPA){
     spa_df.val_b = denum;
@@ -2136,7 +2137,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
     return;
   }
   // compute pvalue (one tail)
-  get_SPA_pvalue_snp(root_K1, tval, pval1, test_fail, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+  get_SPA_pvalue_snp(root_K1, tval, pval1, test_fail, denum, Gsparse, phat, spa_df, mask);
   if(test_fail) {return;}
 
   // 2.for -T
@@ -2148,7 +2149,7 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
     return;
   }
   // compute pvalue (other tail)
-  get_SPA_pvalue_snp(root_K1, tval, pval2, test_fail, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+  get_SPA_pvalue_snp(root_K1, tval, pval2, test_fail, denum, Gsparse, phat, spa_df, mask);
   if(test_fail) {return;}
 
   // get quantile
@@ -2164,30 +2165,96 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
 
 
 // SPA (MT in OpenMP)
+namespace {
+
+struct SpaCgfDerivatives {
+  double k1;
+  double k2;
+};
+
+SpaCgfDerivatives compute_spa_cgf_derivatives(
+    const double& t,
+    const double& denum,
+    SpVec const& Gsparse,
+    const Ref<const ArrayXd>& phat,
+    const Ref<const ArrayXd>& Gamma_sqrt,
+    struct spa_data& spa_df,
+    const Ref<const ArrayXb>& mask) {
+  SpaCgfDerivatives result = {0, 0};
+  if(spa_df.fastSPA) {
+    for(SpVec::InnerIterator it(Gsparse); it; ++it) {
+      const uint32_t index_j = it.index();
+      if(!mask(index_j)) continue;
+
+      const double vexp = -t / spa_df.val_c * spa_df.Gmod(index_j);
+      if(vexp > MAX_EXP_LIM) return result;
+      const double exp_v = exp(vexp);
+      const double denominator = phat(index_j) +
+        (1 - phat(index_j)) * exp_v;
+      result.k1 +=
+        (spa_df.Gmod(index_j) * phat(index_j) / spa_df.val_c) /
+          denominator;
+      result.k2 +=
+        (spa_df.Gmod(index_j) * spa_df.Gmod(index_j) *
+          Gamma_sqrt(index_j) * Gamma_sqrt(index_j) * exp_v /
+          (spa_df.val_c * spa_df.val_c)) /
+          (denominator * denominator);
+    }
+    result.k1 += -spa_df.val_d / spa_df.val_c +
+      t / denum * spa_df.val_b;
+    result.k2 += spa_df.val_b / denum;
+    return result;
+  }
+
+  spa_df.exponent = -t / spa_df.val_c * spa_df.Gmod;
+  if((mask && (spa_df.exponent > MAX_EXP_LIM)).any()) return result;
+  spa_df.exponent = spa_df.exponent.exp();
+  result.k1 = mask.select(
+    (spa_df.Gmod * phat / spa_df.val_c) /
+      (phat + (1 - phat) * spa_df.exponent), 0).sum();
+  result.k1 -= spa_df.val_a / spa_df.val_c;
+  result.k2 = mask.select(
+    (spa_df.Gmod.square() * Gamma_sqrt.square() /
+      (spa_df.val_c * spa_df.val_c) * spa_df.exponent) /
+      (phat + (1 - phat) * spa_df.exponent).square(), 0).sum();
+  return result;
+}
+
+}  // namespace
+
 double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask, double const& tol, int const& niter_max, double const& missing_value_double){
 
   int niter_cur;
   int lambda = spa_df.pos_score ? 1 : -1; // if score is negative, adjust K' and K''
   double min_x, max_x, t_old, f_old, t_new = -1, f_new, hess;
+  SpaCgfDerivatives derivatives = {0, 0};
 
   niter_cur = 0;
   if(tval >=0){min_x = 0, max_x = std::numeric_limits<double>::max();}
   else{min_x = std::numeric_limits<double>::lowest(), max_x = 0;}
   t_old = 0;
-  f_old = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+  spa_df.root_k2 = 0;
+  derivatives = compute_spa_cgf_derivatives(
+    lambda * t_old, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+  f_old = derivatives.k1;
+  hess = derivatives.k2;
   f_old *= lambda;
   f_old -= tval; 
 
   while( niter_cur++ < niter_max ){
 
-    hess = spa_df.fastSPA ? compute_K2_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
     if(hess == 0) return missing_value_double;
     t_new = t_old - f_old / hess;
-    f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+    derivatives = compute_spa_cgf_derivatives(
+      lambda * t_new, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+    f_new = derivatives.k1;
     f_new *= lambda;
     f_new -= tval;
 
-    if( fabs( f_new ) < tol ) break;
+    if( fabs( f_new ) < tol ) {
+      spa_df.root_k2 = derivatives.k2;
+      break;
+    }
 
     // update bounds on root
     if( t_new && (t_new > min_x) && (t_new < max_x) ){
@@ -2196,7 +2263,9 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
     } else{ // bisection method if t_new went out of bounds and re-compute f_new
       t_new = ( min_x + max_x ) / 2;
       // if( fabs( min_x - t_new ) < params->tol_spa ) break;
-      f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+      derivatives = compute_spa_cgf_derivatives(
+        lambda * t_new, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask);
+      f_new = derivatives.k1;
       f_new *= lambda;
       f_new -= tval;
       // reduce bounds based on new value
@@ -2206,6 +2275,7 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
 
     t_old = t_new;
     f_old = f_new;
+    hess = derivatives.k2;
   }
 
   // If didn't converge
@@ -2292,14 +2362,14 @@ double compute_K2_fast_snp(const double& t, const double& b, const double& c, co
   return val;
 }
 
-void get_SPA_pvalue_snp(const double& root, const double& tval, double& pv, bool& test_fail, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask){
+void get_SPA_pvalue_snp(const double& root, const double& tval, double& pv, bool& test_fail, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, struct spa_data& spa_df, const Ref<const ArrayXb>& mask){
 
   int lambda = spa_df.pos_score ? 1 : -1; // if score is negative, adjust K and K''
   double kval, k2val, wval, vval, rval;
   normal nd(0,1);
 
   kval = spa_df.fastSPA ? compute_K_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
-  k2val = spa_df.fastSPA ? compute_K2_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
+  k2val = spa_df.root_k2;
   if(k2val == 0) {
     test_fail = true;
     return;
