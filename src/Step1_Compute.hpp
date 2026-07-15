@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 #include <Eigen/Dense>
 
 enum class Step1GramMode {
