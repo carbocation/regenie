@@ -507,13 +507,30 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings) override {
 
+      const ComputeClock::time_point backend_wall_start =
+        ComputeClock::now();
+      const ComputeClock::time_point validation_start =
+        ComputeClock::now();
       validate_packed_hardcall_preprocessing_inputs(
         packed_hardcalls, packed_bytes, packed_stride_bytes,
         variants, samples, covariates, sample_weights,
         degrees_of_freedom, minimum_scale);
+      if(timings)
+        timings->packed_hardcall_validation_ms +=
+          elapsed_ms(validation_start);
 
+      const ComputeClock::time_point allocation_start =
+        ComputeClock::now();
       invalidate_resident_genotypes();
-      if(!can_preprocess_packed_hardcalls(variants, samples)) return false;
+      if(!can_preprocess_packed_hardcalls(variants, samples)) {
+        if(timings) {
+          timings->packed_hardcall_allocation_ms +=
+            elapsed_ms(allocation_start);
+          timings->packed_hardcall_backend_wall_ms +=
+            elapsed_ms(backend_wall_start);
+        }
+        return false;
+      }
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
         variants, "packed hardcall preprocessing variant count");
@@ -530,6 +547,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_rows_ = 0;
         resident_columns_ = columns;
         resident_valid_ = true;
+        if(timings) {
+          timings->packed_hardcall_allocation_ms +=
+            elapsed_ms(allocation_start);
+          timings->packed_hardcall_backend_wall_ms +=
+            elapsed_ms(backend_wall_start);
+        }
         return true;
       }
 
@@ -556,11 +579,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           static_cast<Eigen::Index>(rows) * covariate_count,
           "cudaMalloc(packed hardcall projection coefficients)");
       }
+      if(timings)
+        timings->packed_hardcall_allocation_ms +=
+          elapsed_ms(allocation_start);
 
+      const ComputeClock::time_point host_prepare_start =
+        ComputeClock::now();
       const Eigen::MatrixXd packed_covariates = covariate_count > 0 ?
         contiguous_copy_if_needed(covariates) : Eigen::MatrixXd();
       const double* covariate_data = packed_covariates.size() ?
         packed_covariates.data() : covariates.data();
+      if(timings)
+        timings->packed_hardcall_host_prepare_ms +=
+          elapsed_ms(host_prepare_start);
       ComputeClock::time_point transfer_start;
       if(timings) transfer_start = ComputeClock::now();
       copy_host_to_device_staged(d_packed_hardcalls_, packed_hardcalls,
@@ -652,7 +683,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(!row_scales.allFinite())
         throw std::runtime_error(
           "CUDA packed hardcall preprocessing produced non-finite row scales");
-      if(row_scales.minCoeff() < minimum_scale) return true;
+      if(row_scales.minCoeff() < minimum_scale) {
+        if(timings)
+          timings->packed_hardcall_backend_wall_ms +=
+            elapsed_ms(backend_wall_start);
+        return true;
+      }
 
       std::unique_ptr<CudaEventPair> scale_events;
       if(timings) {
@@ -672,6 +708,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       resident_rows_ = variants;
       resident_columns_ = samples;
       resident_valid_ = true;
+      if(timings)
+        timings->packed_hardcall_backend_wall_ms +=
+          elapsed_ms(backend_wall_start);
       return true;
     }
 

@@ -288,6 +288,14 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.packed_hardcall_upload_bytes;
   destination.packed_hardcall_expand_ms +=
     source.packed_hardcall_expand_ms;
+  destination.packed_hardcall_validation_ms +=
+    source.packed_hardcall_validation_ms;
+  destination.packed_hardcall_allocation_ms +=
+    source.packed_hardcall_allocation_ms;
+  destination.packed_hardcall_host_prepare_ms +=
+    source.packed_hardcall_host_prepare_ms;
+  destination.packed_hardcall_backend_wall_ms +=
+    source.packed_hardcall_backend_wall_ms;
 }
 
 void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
@@ -369,7 +377,12 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
   if(!processed || scale_error > preprocessing_tolerance ||
      preprocess_timings.packed_hardcall_upload_count != 1 ||
      preprocess_timings.packed_hardcall_upload_bytes != packed.size() ||
-     !std::isfinite(preprocess_timings.packed_hardcall_expand_ms))
+     !std::isfinite(preprocess_timings.packed_hardcall_expand_ms) ||
+     !std::isfinite(preprocess_timings.packed_hardcall_validation_ms) ||
+     !std::isfinite(preprocess_timings.packed_hardcall_allocation_ms) ||
+     !std::isfinite(preprocess_timings.packed_hardcall_host_prepare_ms) ||
+     !std::isfinite(preprocess_timings.packed_hardcall_backend_wall_ms) ||
+     preprocess_timings.packed_hardcall_backend_wall_ms <= 0)
     throw std::runtime_error(
       "packed hardcall preprocessing conformance failed");
 
