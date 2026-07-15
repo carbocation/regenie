@@ -72,6 +72,19 @@ bool cox_firth_direct_null_fallback_enabled() {
   return value == nullptr || std::string(value) != "0";
 }
 
+double cox_firth_direct_null_max_step(double default_value) {
+  // Keep --maxstep-null available to the ordinary Cox null fit while
+  // allowing the Firth optimizer's conservative step to be profiled alone.
+  const char* value =
+    std::getenv("REGENIE_COX_FIRTH_DIRECT_NULL_MAX_STEP");
+  if(value == nullptr) return default_value;
+
+  char* end = nullptr;
+  const double parsed = std::strtod(value, &end);
+  return end != value && *end == '\0' && std::isfinite(parsed) && parsed > 0 ?
+    parsed : default_value;
+}
+
 enum class CoxFirthProfilePhase {
   reduced,
   full
@@ -817,6 +830,10 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   IOFormat Fmt(StreamPrecision, DontAlignCols, " ", "\n", "", "","","");
   const bool direct_null_fallback =
     cox_firth_direct_null_fallback_enabled();
+  const double direct_null_max_step = cox_firth_direct_null_max_step(
+    params->maxstep_null / 5.0);
+  const double fallback_max_step = direct_null_fallback ?
+    direct_null_max_step : params->maxstep_null / 5.0;
   std::vector<CoxFirthFitProfile> null_profiles(params->n_pheno);
   std::string null_profile_line;
 
@@ -842,7 +859,7 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
     const double initial_stephalf_tolerance = direct_null_fallback ?
       0 : params->numtol_cox_stephalf;
     const double initial_max_step = direct_null_fallback ?
-      params->maxstep_null / 5.0 : params->maxstep_null;
+      direct_null_max_step : params->maxstep_null;
     cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), initial_iterations, params->niter_max_line_search, params->numtol_cox, initial_stephalf_tolerance, params->numtol_beta_cox, initial_max_step, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
     cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
     null_profiles[i].add(cox_firth_null);
@@ -864,9 +881,9 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
         cerr << "WARNING: Cox regression with Firth correction did not converge (step-halving tol=0, maximum step size=" << params->maxstep_null <<";maximum number of iterations=" << params->niter_max_firth_null <<").";
       }
 
-      cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << params->maxstep_null/5 <<";maximum number of iterations=" << params->niter_max_firth_null*5 <<";initiate at 0).\n";
+      cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << fallback_max_step <<";maximum number of iterations=" << params->niter_max_firth_null*5 <<";initiate at 0).\n";
 
-      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null/5, !params->cox_nofirth, false);
+      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, fallback_max_step, !params->cox_nofirth, false);
       cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
       null_profiles[i].add(cox_firth_null);
     }
@@ -915,6 +932,9 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
                        total_attempts - profiled_phenotypes : 0)
                    << " direct_fallback=" <<
                      (direct_null_fallback ? 1 : 0)
+                   << " max_step=" <<
+                     (direct_null_fallback ? direct_null_max_step :
+                       static_cast<double>(params->maxstep_null))
                    << " iterations=" << total_iterations
                    << " likelihood_evaluations=" <<
                      total_likelihood_evaluations
@@ -928,7 +948,7 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   // check if some did not converge
   if(!has_converged.any()) { //  none passed
 
-    string msg1 = to_string( params->maxstep_null / 5 );
+    string msg1 = to_string(fallback_max_step);
     string msg2 = to_string( params->niter_max_firth_null * 5 );
     throw "Firth penalized cox regression failed to converge for all phenotypes."
       " Try decreasing the maximum step size using `--maxstep-null` (currently=" + msg1 +  ") "
