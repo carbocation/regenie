@@ -29,9 +29,53 @@
 #include "Geno.hpp"
 #include "db/sqlite3.hpp"
 
+#include <array>
+
 using namespace std;
 using namespace Eigen;
 using namespace boost;
+
+namespace {
+
+struct Bgen8DosageLookupEntry {
+  double genotype = 0;
+  double info = 0;
+};
+
+using Bgen8DosageLookup =
+  std::array<Bgen8DosageLookupEntry, 65536>;
+
+Bgen8DosageLookup build_bgen8_dosage_lookup(bool const ref_first) {
+  Bgen8DosageLookup lookup;
+  for(uint32_t byte0 = 0; byte0 < 256; ++byte0) {
+    for(uint32_t byte1 = 0; byte1 < 256; ++byte1) {
+      const double prob0 = double(byte0) / 255.0;
+      const double prob1 = double(byte1) / 255.0;
+      const double prob2 = std::max(1 - prob0 - prob1, 0.0);
+      Bgen8DosageLookupEntry& entry =
+        lookup[byte0 | (byte1 << 8)];
+      entry.genotype = ref_first ?
+        prob1 + 2 * prob2 : prob1 + 2 * prob0;
+      entry.info = ref_first ?
+        4 * prob2 + prob1 - entry.genotype * entry.genotype :
+        4 * prob0 + prob1 - entry.genotype * entry.genotype;
+    }
+  }
+  return lookup;
+}
+
+const Bgen8DosageLookup& bgen8_dosage_lookup(bool const ref_first) {
+  if(ref_first) {
+    static const Bgen8DosageLookup lookup =
+      build_bgen8_dosage_lookup(true);
+    return lookup;
+  }
+  static const Bgen8DosageLookup lookup =
+    build_bgen8_dosage_lookup(false);
+  return lookup;
+}
+
+}
 
 
 
@@ -2249,6 +2293,9 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   std::memcpy(&bits_prob, &(buffer[0]), 1);
   buffer++;
 
+  const bool use_dosage_lookup = use_fast_dosage_path &&
+    (bits_prob == 8) && (phasing == 0);
+
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
   int lval, ncarriers = 0, nmales = 0;
@@ -2259,33 +2306,56 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   bool requires_mean_imputation = false;
   if(use_fast_dosage_path) {
     assert(nindivs == static_cast<uint32_t>(Geno.size()));
-    for(size_t i = 0; i < nindivs; i++) {
-      missing = ((ploidy_n[i]) & 0x80);
-      if(missing) {
-        Geno(i) = -3;
-        requires_mean_imputation = true;
+    if(use_dosage_lookup) {
+      const Bgen8DosageLookup& lookup =
+        bgen8_dosage_lookup(params->ref_first);
+      for(size_t i = 0; i < nindivs; i++) {
+        missing = ((ploidy_n[i]) & 0x80);
+        if(missing) {
+          Geno(i) = -3;
+          requires_mean_imputation = true;
+          buffer += 2;
+          continue;
+        }
+
+        const uint32_t lookup_index =
+          uint32_t(buffer[0]) | (uint32_t(buffer[1]) << 8);
         buffer += 2;
-        continue;
+        const Bgen8DosageLookupEntry& entry = lookup[lookup_index];
+        Geno(i) = entry.genotype;
+        total += entry.genotype;
+        info_num += entry.info;
+        snp_data->ns1++;
       }
+    } else {
+      for(size_t i = 0; i < nindivs; i++) {
+        missing = ((ploidy_n[i]) & 0x80);
+        if(missing) {
+          Geno(i) = -3;
+          requires_mean_imputation = true;
+          buffer += 2;
+          continue;
+        }
 
-      prob0 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
-        255.0;
-      prob1 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
-        255.0;
-      prob2 = std::max(1 - prob0 - prob1, 0.0);
-      if(params->ref_first)
-        Geno(i) = prob1 + 2 * prob2;
-      else
-        Geno(i) = prob1 + 2 * prob0;
+        prob0 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
+          255.0;
+        prob1 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
+          255.0;
+        prob2 = std::max(1 - prob0 - prob1, 0.0);
+        if(params->ref_first)
+          Geno(i) = prob1 + 2 * prob2;
+        else
+          Geno(i) = prob1 + 2 * prob0;
 
-      if(params->ref_first)
-        ival = 4 * prob2 + prob1 - Geno(i) * Geno(i);
-      else
-        ival = 4 * prob0 + prob1 - Geno(i) * Geno(i);
+        if(params->ref_first)
+          ival = 4 * prob2 + prob1 - Geno(i) * Geno(i);
+        else
+          ival = 4 * prob0 + prob1 - Geno(i) * Geno(i);
 
-      total += Geno(i);
-      info_num += ival;
-      snp_data->ns1++;
+        total += Geno(i);
+        info_num += ival;
+        snp_data->ns1++;
+      }
     }
   } else {
     for(size_t i = 0; i < nindivs; i++) {
