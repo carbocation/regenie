@@ -3351,6 +3351,16 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     !params.htp_out &&
     !params.getCorMat &&
     (pheno_data.new_cov.cols() == params.ncov_analyzed);
+  const bool use_fast_bgen_dosage =
+    (params.file_type == "bgen") && params.streamBGEN &&
+    (params.trait_mode == 0) && params.dosage_mode &&
+    (params.test_type == 0) && !params.build_mask &&
+    !params.af_cc && params.split_by_pheno && !params.htp_out &&
+    !params.w_interaction && !params.snp_set && !params.trait_set &&
+    !params.multiphen && !params.mcc_test && !params.joint_test &&
+    !params.getCorMat && !params.with_flip &&
+    !in_filters.ind_ignore.any() && in_filters.ind_in_analysis.all() &&
+    !in_filters.has_missing.any();
 
     // start openmp for loop
 #if defined(_OPENMP)
@@ -3367,7 +3377,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
 
       // to store variant information
       if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") )
-        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout);
+        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout, use_fast_bgen_dosage);
 
       // to store variant information
       reset_thread(&(Gblock.thread_data[thread_num]), params);

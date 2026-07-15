@@ -286,6 +286,55 @@ done
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
+# complete-sample BGEN dosage decoding in both allele orientations
+for ref_mode in default ref_first; do
+  ref_arg=""
+  if [ "$ref_mode" = "ref_first" ]; then
+    ref_arg="--ref-first"
+  fi
+
+  rgcmd="--step 2 \
+    --bgen ${mntpt}example/example.bgen \
+    --covarFile ${mntpt}example/covariates.txt${fsuf} \
+    --phenoFile ${mntpt}example/phenotype.txt \
+    --bsize 200 \
+    --ignore-pred \
+    $ref_arg \
+    --out ${mntpt}test/test_bin_out_bgen_qt_${ref_mode}_bgen"
+  ./$regenie_bin $rgcmd
+
+  for phenotype in Y1 Y2; do
+    if [ "`cat ${REGENIE_PATH}test/test_bin_out_bgen_qt_${ref_mode}_bgen_${phenotype}.regenie | wc -l`" != "1001" ]
+    then
+      print_err
+    fi
+  done
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# phenotype missingness retains the general BGEN decoder
+rgcmd="--step 2 \
+  --bgen ${mntpt}example/example.bgen \
+  --covarFile ${mntpt}example/covariates.txt${fsuf} \
+  --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+  --bsize 200 \
+  --force-qt \
+  --ignore-pred \
+  --out ${mntpt}test/test_bin_out_bgen_qt_missing"
+./$regenie_bin $rgcmd
+
+for phenotype in Y1 Y2; do
+  if [ "`cat ${REGENIE_PATH}test/test_bin_out_bgen_qt_missing_${phenotype}.regenie | wc -l`" != "1001" ]
+  then
+    print_err
+  fi
+done
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
 # interaction tests
 rgcmd="--step 2 \
   --bed ${mntpt}example/example \
