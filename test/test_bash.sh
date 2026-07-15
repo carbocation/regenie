@@ -12,7 +12,57 @@ print_simple_err () {
   echo "ERROR: ${1}"; exit 1 
 }
 print_custom_err () {
-  echo "ERROR: ${1} $help_msg"; exit 1 
+  echo "ERROR: ${1} $help_msg"; exit 1
+}
+
+check_step2_correction_profile () {
+  local profile_file="$1"
+  local correction_kind="$2"
+
+  awk -v correction_kind="$correction_kind" '
+    function profile_value(name, field, parts) {
+      for(field = 1; field <= NF; ++field) {
+        split($field, parts, "=")
+        if(parts[1] == name) return parts[2] + 0
+      }
+      return -1
+    }
+
+    /^STEP2_PROFILE version=/ {
+      corrected_tests = profile_value("corrected_tests")
+      profile_failures = profile_value("failed_tests")
+    }
+
+    /^STEP2_PROFILE scope=corrections/ {
+      saw_corrections = 1
+      tests = profile_value("tests")
+      failures = profile_value("failures")
+      if(correction_kind == "logistic_firth") {
+        correction_tests = profile_value("logistic_firth_tests")
+        correction_failures = profile_value("logistic_firth_failures")
+        approximate_tests = profile_value("logistic_firth_approximate_tests")
+      } else if(correction_kind == "spa") {
+        correction_tests = profile_value("spa_tests")
+        correction_failures = profile_value("spa_failures")
+        fused_tests = profile_value("spa_fused_cgf_tests")
+        fused_evaluations = profile_value("spa_fused_cgf_evaluations")
+      }
+    }
+
+    END {
+      valid = (corrected_tests > 0 && profile_failures == 0 && saw_corrections &&
+        tests == corrected_tests && failures == 0 &&
+        correction_tests == corrected_tests && correction_failures == 0)
+      if(correction_kind == "logistic_firth")
+        valid = valid && approximate_tests == corrected_tests
+      else if(correction_kind == "spa")
+        valid = valid && fused_tests == corrected_tests &&
+          fused_evaluations > 0
+      else
+        valid = 0
+      exit(valid ? 0 : 1)
+    }
+  ' "$profile_file"
 }
 
 
@@ -184,7 +234,8 @@ elif ! grep -q '^STEP2_PROFILE version=1 mode=single_variant file_type=bgen trai
   print_custom_err "Step 2 profiling header is missing."
 elif ! grep -q '^STEP2_PROFILE scope=bgen_parse variants=1000 ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
   print_custom_err "Step 2 BGEN parsing profile is missing."
-elif ! grep -q '^STEP2_PROFILE scope=corrections tests=20 failures=0 .*logistic_firth_tests=20 logistic_firth_failures=0 logistic_firth_approximate_tests=20 ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
+elif ! check_step2_correction_profile \
+  "${REGENIE_PATH}test/test_bin_out_firth.log" logistic_firth; then
   print_custom_err "Step 2 correction profile is missing."
 elif ! grep -q '^STEP2_PROFILE_FINAL version=1 mode=single_variant ' ${REGENIE_PATH}test/test_bin_out_firth.log; then
   print_custom_err "Step 2 final profiling output is missing."
@@ -212,7 +263,8 @@ fi
 
 if [ "`cat ${REGENIE_PATH}test/test_bin_out_spa_profile_Y1.regenie | wc -l`" != "1001" ]; then
   print_err
-elif ! grep -q '^STEP2_PROFILE scope=corrections tests=20 failures=0 .*spa_tests=20 spa_failures=0 .*spa_fused_cgf_tests=20 spa_fused_cgf_evaluations=[1-9][0-9]* ' ${REGENIE_PATH}test/test_bin_out_spa_profile.log; then
+elif ! check_step2_correction_profile \
+  "${REGENIE_PATH}test/test_bin_out_spa_profile.log" spa; then
   print_custom_err "Step 2 SPA correction profile is missing."
 fi
 
