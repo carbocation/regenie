@@ -2170,20 +2170,20 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
 
 }
 
-void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
+void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible){
 
   if( ((params->file_type == "bgen") && !params->streamBGEN) || params->file_type == "pgen")
     return;
 
   if(params->file_type == "bgen") // uncompress and extract the dosages
-    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout);
+    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_fast_path_eligible);
   else if(params->file_type == "bed") // extract hardcalls
     parseSnpfromBed(isnp, chrom, *geno_block, params, filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data);
 
 }
 
 
-void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
+void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible){
 
   uint minploidy = 0, maxploidy = 0, phasing = 0, bits_prob = 0;
   uint16_t numberOfAlleles = 0 ;
@@ -2191,8 +2191,11 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   uint32_t index;
   string tmp_buffer;
 
+  const bool non_par = in_non_par(chrom, infosnp->physpos, params);
+  const bool use_fast_dosage_path =
+    bgen_fast_path_eligible && !non_par;
   MapArXd Geno (gblock->Gmat.col(isnp).data(), params->n_samples, 1);
-  Geno = 0;
+  if(!use_fast_dosage_path) Geno = 0;
   // reset variant info
   prep_snp_stats(snp_data, params);
 
@@ -2248,13 +2251,44 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
 
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
-  bool non_par = in_non_par(chrom, infosnp->physpos, params);
   int lval, ncarriers = 0, nmales = 0;
   double prob0, prob1, prob2, total = 0, mac = 0, mval, ival, info_num = 0, sum_pos;
 
   // parse genotype probabilities block
   index = 0;
-  for(size_t i = 0; i < nindivs; i++) {
+  bool requires_mean_imputation = false;
+  if(use_fast_dosage_path) {
+    assert(nindivs == static_cast<uint32_t>(Geno.size()));
+    for(size_t i = 0; i < nindivs; i++) {
+      missing = ((ploidy_n[i]) & 0x80);
+      if(missing) {
+        Geno(i) = -3;
+        requires_mean_imputation = true;
+        buffer += 2;
+        continue;
+      }
+
+      prob0 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
+        255.0;
+      prob1 = double((*reinterpret_cast< uint8_t const* >( buffer++ ))) /
+        255.0;
+      prob2 = std::max(1 - prob0 - prob1, 0.0);
+      if(params->ref_first)
+        Geno(i) = prob1 + 2 * prob2;
+      else
+        Geno(i) = prob1 + 2 * prob0;
+
+      if(params->ref_first)
+        ival = 4 * prob2 + prob1 - Geno(i) * Geno(i);
+      else
+        ival = 4 * prob0 + prob1 - Geno(i) * Geno(i);
+
+      total += Geno(i);
+      info_num += ival;
+      snp_data->ns1++;
+    }
+  } else {
+    for(size_t i = 0; i < nindivs; i++) {
 
     // skip samples that were ignored from the analysis
     if( filters->ind_ignore(i) ) {
@@ -2333,7 +2367,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
       }
 
     }
-    index++;
+      index++;
+    }
   }
 
   // check MAC
@@ -2404,7 +2439,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   }
 
   // impute missing
-  if(!params->build_mask)
+  if(!params->build_mask &&
+     (!use_fast_dosage_path || requires_mean_imputation))
     mean_impute_g(total, Geno, filters->ind_in_analysis);
 
   return;
