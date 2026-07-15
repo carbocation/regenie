@@ -100,17 +100,30 @@ Eigen::Index bounded_cuda_chunk_rows(Eigen::Index rows, Eigen::Index columns) {
 }
 
 Eigen::Index cuda_resident_preprocess_max_elements() {
-  Eigen::Index max_elements = 125000000; // approximately 1 GB of FP64 data
   const char* resident_mb_text = std::getenv("REGENIE_CUDA_RESIDENT_MB");
   if(resident_mb_text && *resident_mb_text) {
     char* end = nullptr;
     const long resident_mb = std::strtol(resident_mb_text, &end, 10);
-    if(end != resident_mb_text && *end == '\0' && resident_mb >= 0 &&
-       resident_mb <= std::numeric_limits<int>::max())
-      max_elements = static_cast<Eigen::Index>(resident_mb) *
-        1000000 / sizeof(double);
+    if(end == resident_mb_text || *end != '\0' || resident_mb < 0 ||
+       resident_mb > std::numeric_limits<int>::max())
+      throw std::invalid_argument(
+        "REGENIE_CUDA_RESIDENT_MB must be a non-negative integer");
+    return std::min<Eigen::Index>(
+      static_cast<Eigen::Index>(resident_mb) *
+        1000000 / sizeof(double),
+      INT_MAX);
   }
-  return std::min<Eigen::Index>(max_elements, INT_MAX);
+
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+  free_bytes = std::min(free_bytes, total_bytes);
+  const size_t automatic_cap_bytes = size_t(6000) * 1000000;
+  const size_t automatic_budget_bytes = std::min(
+    automatic_cap_bytes, free_bytes / 5 * 3);
+  return std::min<Eigen::Index>(
+    static_cast<Eigen::Index>(automatic_budget_bytes / sizeof(double)),
+    INT_MAX);
 }
 
 size_t cuda_pinned_staging_bytes() {
@@ -445,6 +458,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         level0_cholesky_enabled_(cuda_level0_cholesky_enabled()),
         level0_fold_batch_enabled_(cuda_level0_fold_batch_enabled()),
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
+        resident_preprocess_max_elements_(0),
         d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
         d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
         d_factorized_(nullptr),
@@ -469,6 +483,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ridge_factorized_size_(-1), ridge_factorized_rhs_count_(0) {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      resident_preprocess_max_elements_ =
+        cuda_resident_preprocess_max_elements();
       check_cuda(cudaGetDeviceProperties(&properties_, device_), "cudaGetDeviceProperties");
       check_cublas(cublasCreate(&handle_), "cublasCreate");
       try {
@@ -541,6 +557,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(level0_cholesky_enabled_)
         result << ", level0 folds " <<
           (level0_fold_batch_enabled_ ? "batched" : "sequential");
+      result << ", resident preprocess " <<
+        (resident_preprocess_max_elements_ * sizeof(double) / 1000000.0) <<
+        " MB";
       result << ", grouped upload " <<
         (direct_grouped_upload_ ? "direct" : "materialized");
       result << ")";
@@ -556,7 +575,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const long long element_count =
         static_cast<long long>(variants) * samples;
       return element_count <= INT_MAX &&
-        element_count <= cuda_resident_preprocess_max_elements();
+        element_count <= resident_preprocess_max_elements_;
     }
 
     bool preprocess_packed_hardcalls(
@@ -796,10 +815,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       invalidate_resident_genotypes();
       const long long required_elements_long =
         static_cast<long long>(genotypes.rows()) * genotypes.cols();
-      const Eigen::Index resident_limit =
-        cuda_resident_preprocess_max_elements();
       if(required_elements_long > INT_MAX ||
-         required_elements_long > resident_limit)
+         required_elements_long > resident_preprocess_max_elements_)
         return false;
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
@@ -3863,6 +3880,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     bool level0_cholesky_enabled_;
     bool level0_fold_batch_enabled_;
     bool direct_grouped_upload_;
+    Eigen::Index resident_preprocess_max_elements_;
     void* pinned_staging_[2] = {nullptr, nullptr};
     cudaStream_t upload_streams_[2] = {nullptr, nullptr};
     double* d_genotypes_;

@@ -89,14 +89,15 @@ streaming limit; this is primarily useful for validation or sharing a GPU with
 other jobs.
 
 CUDA genotype preprocessing uses a resident full-block buffer when the block
-fits within `REGENIE_CUDA_RESIDENT_MB` (1,024 MB by default). CUDA operations
-reuse the resident full block and its full-row column slices instead of
-uploading the same genotype values again. Ordinary k-fold Step 1 runs leave the
-normalized block device-only; LOOCV and `--test-l0` also receive a normalized
-host copy because those paths read genotype values on the CPU. Larger blocks
-fall back to CPU preprocessing. Set the limit to `0` to disable GPU
-preprocessing, or raise it deliberately when a larger block fits comfortably
-in device memory. The validation harness exposes the same setting as
+fits within the available device-memory budget. By default, the budget is the
+smaller of 6,000 MB and 60% of currently free device memory. Set
+`REGENIE_CUDA_RESIDENT_MB` to a non-negative integer to override that automatic
+budget. CUDA operations reuse the resident full block and its full-row column
+slices instead of uploading the same genotype values again. Ordinary k-fold
+Step 1 runs leave the normalized block device-only; LOOCV and `--test-l0` also
+receive a normalized host copy because those paths read genotype values on the
+CPU. Larger blocks fall back to CPU preprocessing. Set the limit to `0` to
+disable GPU preprocessing. The validation harness exposes the same setting as
 `CUDA_RESIDENT_MB`.
 
 Ordinary k-fold PGEN hardcall runs can avoid materializing and uploading the
