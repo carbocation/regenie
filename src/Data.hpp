@@ -77,6 +77,17 @@ struct Step1Profile {
   uint64_t pgen_prefetched_blocks = 0;
   double pgen_prefetch_service_ms = 0;
   double pgen_prefetch_wait_ms = 0;
+  double initialization_ms = 0;
+  double level0_wall_ms = 0;
+  double level1_prepare_ms = 0;
+  double level1_fit_ms = 0;
+  double output_ms = 0;
+  uint64_t prediction_output_rows = 0;
+  uint64_t prediction_output_values = 0;
+  uint64_t prediction_output_threads = 0;
+  double prediction_output_format_ms = 0;
+  double prediction_output_write_ms = 0;
+  double end_to_end_ms = 0;
 };
 
 class Data {
@@ -140,6 +151,7 @@ class Data {
     void calc_cv_matrices(struct ridgel0*);
     void level_0_calculations();
     void print_step1_profile();
+    void print_step1_final_profile();
     void prep_l1_models();
     void write_inputs(); 
     void exit_early();
@@ -155,8 +167,10 @@ class Data {
     void make_predictions_cox(int const&, int const&);
     void print_snp_betas(const Eigen::Ref<const Eigen::VectorXd>&);
     void write_predictions(int const&);
-    std::string write_ID_header();
-    std::string write_chr_row(int const&,int const&,const Eigen::Ref<const Eigen::VectorXd>&);
+    std::string write_ID_header(std::vector<uint32_t>&);
+    std::string write_chr_row(int const&,int const&,
+      const Eigen::Ref<const Eigen::VectorXd>&,
+      const std::vector<uint32_t>&);
     void rm_l0_files(int const& ph);
 
     // step 2 main functions
