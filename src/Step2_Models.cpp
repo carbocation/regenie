@@ -725,6 +725,7 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   auto t1 = std::chrono::high_resolution_clock::now();
   ArrayXb has_converged = params->pheno_pass; // if null log reg converged
   IOFormat Fmt(StreamPrecision, DontAlignCols, " ", "\n", "", "","","");
+  const double fallback_max_step = params->maxstep_null / 5.0;
 
   if(!silent) sout << "   -fitting null Firth cox regression on time-to-event phenotypes..." << flush;
 
@@ -743,24 +744,14 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
     else offset = m_ests->blups.col(i).array();
 
     cox_firth cox_firth_null;
-    cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
+    cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
     cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
 
     if( !cox_firth_null.converge ){ // if failed to converge
-      cerr << "WARNING: Cox regression with Firth correction did not converge. Step-halving tol=" << params->numtol_cox_stephalf << "\n";
+      cerr << "WARNING: Cox Firth null fit did not converge from the Cox MLE coefficients. ";
+      cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << fallback_max_step << "; maximum number of iterations=" << params->niter_max_firth_null*5 << "; initiate at 0).\n";
 
-      cerr << "Retrying with strict convergence criteria: step-halving tol=0.\n";
-
-      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, m_ests->cox_MLE_NULL[i].beta);
-      cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
-    }
-
-    if( !cox_firth_null.converge ){ // if failed to converge
-      cerr << "WARNING: Cox regression with Firth correction did not converge (step-halving tol=0, maximum step size=" << params->maxstep_null <<";maximum number of iterations=" << params->niter_max_firth_null <<").";
-
-      cerr << "Retrying with fallback parameters: (step-halving tol=0, maximum step size=" << params->maxstep_null/5 <<";maximum number of iterations=" << params->niter_max_firth_null*5 <<";initiate at 0).\n";
-
-      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null/5, !params->cox_nofirth, false);
+      cox_firth_null.setup(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset, pheno_data->new_cov.cols(), params->niter_max_firth_null*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, fallback_max_step, !params->cox_nofirth, false);
       cox_firth_null.fit(m_ests->survival_data_pheno[i], pheno_data->new_cov, offset);
     }
     has_converged(i) = cox_firth_null.converge;
@@ -779,7 +770,7 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   // check if some did not converge
   if(!has_converged.any()) { //  none passed
 
-    string msg1 = to_string( params->maxstep_null / 5 );
+    string msg1 = to_string(fallback_max_step);
     string msg2 = to_string( params->niter_max_firth_null * 5 );
     throw "Firth penalized cox regression failed to converge for all phenotypes."
       " Try decreasing the maximum step size using `--maxstep-null` (currently=" + msg1 +  ") "
@@ -821,14 +812,19 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   Xmat = MatrixXd::Zero(params->n_samples, pheno_data->new_cov.cols() + 1); // covariates + tested SNP
   Xmat << pheno_data->new_cov, Gvec;
   col_incl = Xmat.cols();
+  beta0 = VectorXd::Zero(col_incl);
+  beta0.head(col_incl - 1) = fest->beta_null_firth.col(ph);
+  const VectorXd reduced_initial_beta = beta0;
+  const double reduced_fallback_max_step = params->maxstep_null / 5.0;
 
   // null model
   cox_firth cox_firth_null;
-  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false);
+  cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep_null, !params->cox_nofirth, false, beta0);
   cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
 
   if (!cox_firth_null.converge) {
-    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
+    beta0 = reduced_initial_beta;
+    cox_firth_null.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl-1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, reduced_fallback_max_step, !params->cox_nofirth, false, beta0);
     cox_firth_null.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   }
 
@@ -839,12 +835,25 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
   }
 
   // test model
+  VectorXd test_beta0 = cox_firth_null.beta;
+  const double score_information = dt_thr->denum(ph);
+  if(std::isfinite(score_information) && score_information > 0) {
+    const double score_beta =
+      dt_thr->stats(ph) / std::sqrt(score_information);
+    if(std::isfinite(score_beta)) {
+      test_beta0.tail(1)(0) = std::max(
+        -static_cast<double>(params->maxstep),
+        std::min(static_cast<double>(params->maxstep), score_beta));
+    }
+  }
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, cox_firth_null.beta);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, test_beta0);
   cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
 
   if (!cox_firth_test.converge) {
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false);
+    VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
+      cox_firth_test.beta : test_beta0;
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph), col_incl, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit(m_ests->survival_data_pheno[ph], Xmat, m_ests->blups.col(ph));
   }
 
@@ -871,6 +880,18 @@ void fit_firth_cox_snp(int const& chrom, int const& ph, int const& isnp, struct 
 void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, struct param const* params, struct phenodt* pheno_data, struct ests const* m_ests, struct f_ests const* fest, const Ref<const VectorXd>& Gvec, variant_block* block_info, data_thread* dt_thr, mstream& sout) {
   // if firth is used, fit based on penalized log-likelihood
   double lrt;
+  VectorXd beta0 = VectorXd::Zero(1);
+  const double score_information = dt_thr->denum(ph);
+  if(!params->firth_approx && std::isfinite(score_information) &&
+      score_information > 0) {
+    const double score_beta =
+      dt_thr->stats(ph) / std::sqrt(score_information);
+    if(std::isfinite(score_beta)) {
+      beta0(0) = std::max(
+        -static_cast<double>(params->maxstep),
+        std::min(static_cast<double>(params->maxstep), score_beta));
+    }
+  }
 
   // // For rare variants, set entries in Gvec for non-carriers to 0
   // int mac_thr_sparse = (params->skip_fast_firth ? 0 : 50), i = 0, index_j;
@@ -886,11 +907,13 @@ void fit_firth_cox_snp_fast(int const& chrom, int const& ph, int const& isnp, st
   // }
 
   cox_firth cox_firth_test;
-  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false);
+  cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth, params->niter_max_line_search, params->numtol_cox, params->numtol_cox_stephalf, params->numtol_beta_cox, params->maxstep, !params->cox_nofirth, false, beta0);
   cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
 
   if(!cox_firth_test.converge){
-    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->maxstep/5, !params->cox_nofirth, false);
+    VectorXd fallback_beta = cox_firth_test.beta.allFinite() ?
+      cox_firth_test.beta : beta0;
+    cox_firth_test.setup(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph), 1, params->niter_max_firth*5, params->niter_max_line_search, params->numtol_cox, 0, params->numtol_beta_cox, params->maxstep/5, !params->cox_nofirth, false, fallback_beta);
     cox_firth_test.fit_1(m_ests->survival_data_pheno[ph], Gvec, fest->cov_blup_offset.col(ph));
   }
 

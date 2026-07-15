@@ -329,6 +329,24 @@ if(BUILD_TESTING)
     COMMAND step1_compute_test --backend cpu)
   add_test(NAME step1_compute_auto
     COMMAND step1_compute_test --backend auto)
+
+  add_executable(cox_firth_test
+    ${CMAKE_SOURCE_DIR}/test/test_cox_firth.cpp
+    ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
+    ${CMAKE_SOURCE_DIR}/src/survival_data.cpp)
+  target_include_directories(cox_firth_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/
+    ${BGEN_PATH}/3rd_party/boost_1_55_0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(cox_firth_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(cox_firth_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  add_test(NAME cox_firth COMMAND cox_firth_test)
 endif()
 
 # Boost IO
