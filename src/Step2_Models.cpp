@@ -65,8 +65,8 @@ bool cox_firth_direct_reduced_fallback_enabled() {
 
 bool cox_firth_direct_null_fallback_enabled() {
   // The historical null fit repeats the same expensive optimizer with
-  // increasingly conservative settings. Start with its robust configuration
-  // and the Cox MLE warm start, while retaining a matched-validation escape.
+  // increasingly conservative settings. Start with strict convergence from
+  // the Cox MLE, while retaining a matched-validation escape.
   const char* value =
     std::getenv("REGENIE_COX_FIRTH_DIRECT_NULL_FALLBACK");
   return value == nullptr || std::string(value) != "0";
@@ -831,9 +831,8 @@ void fit_null_firth_cox(bool const& silent, int const& chrom, struct f_ests* fir
   const bool direct_null_fallback =
     cox_firth_direct_null_fallback_enabled();
   const double direct_null_max_step = cox_firth_direct_null_max_step(
-    params->maxstep_null / 5.0);
-  const double fallback_max_step = direct_null_fallback ?
-    direct_null_max_step : params->maxstep_null / 5.0;
+    params->maxstep_null);
+  const double fallback_max_step = params->maxstep_null / 5.0;
   std::vector<CoxFirthFitProfile> null_profiles(params->n_pheno);
   std::string null_profile_line;
 
