@@ -1,0 +1,52 @@
+# Release build scripts
+
+`build_cuda_release.sh` builds a CUDA-enabled REGENIE executable with static
+oneMKL and GNU C++ runtime linkage, validates it, and creates a versioned
+tarball plus SHA-256 checksum under `dist/`.
+
+Artifact names contain the source commit, and the builder refuses tracked source
+changes that have not been committed. Untracked compiler products are allowed so
+an existing remote build checkout can be reused.
+
+The default `datacenter` profile produces one CUDA fat binary for these compute
+capabilities:
+
+| Compute capability | Representative GPUs |
+| --- | --- |
+| 7.5 | T4 |
+| 8.0 | A100, A30 |
+| 8.6 | A10, A40 |
+| 8.9 | L4, L40 |
+| 9.0 | H100, H200 |
+
+The CUDA toolkit used on the build machine must support every requested target.
+CUDA 13 no longer supports offline compilation for Volta, so V100 (`7.0`) is
+kept in the separate `datacenter-v100` profile, which must be built with CUDA
+12.x. The script checks `nvcc --list-gpu-arch` before starting the expensive
+build.
+
+The packaged host code defaults to `-march=x86-64-v3 -mtune=generic` so that a
+single artifact can run across modern x86-64 GPU hosts. Use `--native-cpu` for a
+machine-specific build, or select another CPU floor explicitly. GPU targets can
+also be supplied directly, which is useful for newer architectures supported by
+the installed toolkit:
+
+```bash
+# Portable fat binary for common NVIDIA data-center GPU families.
+scripts/build/build_cuda_release.sh --profile datacenter --clean
+
+# Include V100 when building with a CUDA 12.x toolkit.
+scripts/build/build_cuda_release.sh --profile datacenter-v100 --clean
+
+# Target only the locally tested T4 and A100 architectures.
+scripts/build/build_cuda_release.sh --profile tested --clean
+
+# Explicit target set and machine-specific CPU optimization.
+scripts/build/build_cuda_release.sh \
+  --cuda-architectures '75;80;89;90' \
+  --native-cpu \
+  --clean
+```
+
+Run `scripts/build/build_cuda_release.sh --help` for dependency expectations,
+environment overrides, and validation controls.

@@ -7,6 +7,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${BUILD_DIR:-${repo_root}/build-cuda}"
 device="${GPU_DEVICE:-0}"
 jobs="${JOBS:-4}"
+cuda_architectures="${CUDA_ARCHITECTURES:-${REGENIE_CUDA_ARCHITECTURES:-}}"
 benchmark_blocks="${BENCHMARK_BLOCKS:-512}"
 benchmark_samples="${BENCHMARK_SAMPLES:-20000}"
 benchmark_phenotypes="${BENCHMARK_PHENOTYPES:-10}"
@@ -117,10 +118,30 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-cmake -S "${repo_root}" -B "${build_dir}" \
-  -DREGENIE_WITH_CUDA=ON \
-  -DREGENIE_CUDA_ARCHITECTURES=80 \
+if [[ -z "${cuda_architectures}" && ! -f "${build_dir}/CMakeCache.txt" ]] &&
+   command -v nvidia-smi >/dev/null 2>&1; then
+  cuda_architectures="$(
+    nvidia-smi --id="${device}" --query-gpu=compute_cap --format=csv,noheader |
+      sed 's/[[:space:].]//g' |
+      head -n 1
+  )"
+fi
+if [[ -n "${cuda_architectures}" &&
+      ! "${cuda_architectures}" =~ ^[0-9]+([;][0-9]+)*$ ]]; then
+  echo "CUDA_ARCHITECTURES must be a semicolon-separated list of integers" >&2
+  exit 2
+fi
+
+cmake_args=(
+  -S "${repo_root}"
+  -B "${build_dir}"
+  -DREGENIE_WITH_CUDA=ON
   -DBUILD_TESTING=ON
+)
+if [[ -n "${cuda_architectures}" ]]; then
+  cmake_args+=("-DREGENIE_CUDA_ARCHITECTURES=${cuda_architectures}")
+fi
+cmake "${cmake_args[@]}"
 cmake --build "${build_dir}" --target regenie step1_compute_test -j "${jobs}"
 mkdir -p "${validation_dir}"
 

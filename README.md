@@ -109,6 +109,11 @@ only for architectures that are present. See NVIDIA's [CUDA installation
 guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) if either
 check fails.
 
+For a redistributable CUDA binary covering several GPU families, use
+[`scripts/build/build_cuda_release.sh`](scripts/build/README.md) instead. The
+release builder packages the binary, build metadata, and a SHA-256 checksum; its
+default profile covers T4, A100/A30, A10/A40, L4/L40, and H100/H200.
+
 The resulting executable includes both CUDA and CPU backends. This recipe uses
 REGENIE's existing `STATIC=1` build mode, which statically links oneMKL and the
 supported host dependencies. CUDA remains dynamically linked. The executable
