@@ -530,32 +530,36 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     ww1 = l0->GGt - l0->G_folds[i];
     Step1ComputeTimings timings;
     const MatrixXd fold_rhs = l0->GTY - l0->GtY[i];
-    compute_backend->factorize_ridge_system(
-      ww1, fold_rhs,
-      params->profile_step1 ? &timings : nullptr);
+    const bool used_cholesky = Gblock->step1_pgen_packed_block &&
+      compute_backend->ridge_predict_preprocessed_system(
+        ww1, fold_rhs, cum_size_folds, params->cv_sizes(i),
+        ridge_parameters, batched_predictions, batched_coefficients,
+        params->profile_step1 ? &timings : nullptr);
+    if(!used_cholesky) {
+      compute_backend->factorize_ridge_system(
+        ww1, fold_rhs,
+        params->profile_step1 ? &timings : nullptr);
+      if(Gblock->step1_pgen_packed_block)
+        compute_backend->ridge_predict_preprocessed(
+          cum_size_folds, params->cv_sizes(i), ridge_parameters,
+          batched_predictions, batched_coefficients,
+          params->profile_step1 ? &timings : nullptr);
+      else
+        compute_backend->ridge_predict_factorized(
+          Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i)),
+          true, ridge_parameters, no_outcomes, false,
+          batched_predictions, batched_coefficients,
+          params->profile_step1 ? &timings : nullptr);
+    }
     if(params->profile_step1) {
       l0->profile_eigensolve_ms += timings.eigensolve_ms + timings.transform_ms;
       l0->profile_backend_upload_ms += timings.upload_ms;
       l0->profile_backend_download_ms += timings.download_ms;
       l0->profile_backend_ridge_compute_ms += timings.ridge_ms;
-    }
-
-    Step1ComputeTimings ridge_timings;
-    if(Gblock->step1_pgen_packed_block)
-      compute_backend->ridge_predict_preprocessed(
-        cum_size_folds, params->cv_sizes(i), ridge_parameters,
-        batched_predictions, batched_coefficients,
-        params->profile_step1 ? &ridge_timings : nullptr);
-    else
-      compute_backend->ridge_predict_factorized(
-        Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i)),
-        true, ridge_parameters, no_outcomes, false,
-        batched_predictions, batched_coefficients,
-        params->profile_step1 ? &ridge_timings : nullptr);
-    if(params->profile_step1) {
-      l0->profile_backend_upload_ms += ridge_timings.upload_ms;
-      l0->profile_backend_download_ms += ridge_timings.download_ms;
-      l0->profile_backend_ridge_compute_ms += ridge_timings.ridge_ms;
+      if(used_cholesky)
+        l0->profile_cholesky_ridge_folds++;
+      else
+        l0->profile_eigendecomposition_ridge_folds++;
     }
 
     for(int j = 0; j < params->n_ridge_l0; ++j ) {

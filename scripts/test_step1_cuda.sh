@@ -13,6 +13,7 @@ benchmark_phenotypes="${BENCHMARK_PHENOTYPES:-10}"
 benchmark_repeats="${BENCHMARK_REPEATS:-3}"
 stream_chunk_mb="${CUDA_STREAM_CHUNK_MB:-64}"
 resident_mb="${CUDA_RESIDENT_MB:-${REGENIE_CUDA_RESIDENT_MB:-1024}}"
+level0_cholesky="${CUDA_LEVEL0_CHOLESKY:-${REGENIE_CUDA_LEVEL0_CHOLESKY:-1}}"
 pinned_staging_mb="${CUDA_PINNED_STAGING_MB:-${REGENIE_CUDA_PINNED_STAGING_MB:-64}}"
 pgen_prefetch_mb="${STEP1_PGEN_PREFETCH_MB:-${REGENIE_STEP1_PGEN_PREFETCH_MB:-4096}}"
 pgen_tile_variants="${STEP1_PGEN_TILE_VARIANTS:-${REGENIE_STEP1_PGEN_TILE_VARIANTS:-8}}"
@@ -32,6 +33,10 @@ if [[ ! "${pgen_tile_variants}" =~ ^[1-9][0-9]*$ ]] ||
 fi
 if [[ ! "${pgen_packed}" =~ ^[01]$ ]]; then
   echo "STEP1_PGEN_PACKED must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "${level0_cholesky}" =~ ^[01]$ ]]; then
+  echo "CUDA_LEVEL0_CHOLESKY must be 0 or 1" >&2
   exit 2
 fi
 
@@ -84,6 +89,7 @@ run_with_memory_log() {
 
 nvcc --version
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
+export REGENIE_CUDA_LEVEL0_CHOLESKY="${level0_cholesky}"
 export REGENIE_CUDA_PINNED_STAGING_MB="${pinned_staging_mb}"
 export REGENIE_STEP1_PGEN_PREFETCH_MB="${pgen_prefetch_mb}"
 export REGENIE_STEP1_PGEN_TILE_VARIANTS="${pgen_tile_variants}"
@@ -229,7 +235,7 @@ run_end_to_end_pair() {
     --compute-backend cuda --gpu-device "${device}" --out "${cuda_prefix}"
 
   grep -Fq 'Step 1 compute backend : [cuda]' "${cuda_prefix}.log"
-  grep -q "^STEP1_PROFILE version=6 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
+  grep -q "^STEP1_PROFILE version=7 backend=cuda mode=${profile_mode} " "${cuda_prefix}.log"
   grep -q '^STEP1_PROFILE_FINAL version=1 backend=cuda ' "${cuda_prefix}.log"
 
   shopt -s nullglob

@@ -449,6 +449,30 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
      ridge_timings.resident_reuse_count == 0)
     throw std::runtime_error(
       "packed hardcall resident ridge conformance failed");
+
+  Eigen::MatrixXd cholesky_predictions, cholesky_coefficients;
+  Step1ComputeTimings cholesky_timings;
+  const bool cholesky_supported =
+    candidate.ridge_predict_preprocessed_system(
+      expected_gram, expected_crossproduct, 0, samples,
+      ridge_parameters, cholesky_predictions, cholesky_coefficients,
+      &cholesky_timings);
+  double cholesky_prediction_error = 0;
+  double cholesky_coefficient_error = 0;
+  if(cholesky_supported) {
+    cholesky_prediction_error =
+      relative_error(cholesky_predictions, expected_predictions);
+    cholesky_coefficient_error =
+      relative_error(cholesky_coefficients, expected_coefficients);
+    const double cholesky_tolerance = preprocessing_tolerance;
+    if(cholesky_prediction_error > cholesky_tolerance ||
+       cholesky_coefficient_error > cholesky_tolerance ||
+       cholesky_timings.resident_reuse_count == 0 ||
+       !std::isfinite(cholesky_timings.ridge_ms) ||
+       cholesky_timings.ridge_ms <= 0)
+      throw std::runtime_error(
+        "packed hardcall resident Cholesky ridge conformance failed");
+  }
   candidate.release_preprocessed_genotypes();
 
   bool rejected_negative_weight = false;
@@ -483,6 +507,11 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
             << " crossproduct_relative_error=" << crossproduct_error
             << " prediction_relative_error=" << prediction_error
             << " coefficient_relative_error=" << coefficient_error
+            << " cholesky_supported=" << cholesky_supported
+            << " cholesky_prediction_relative_error=" <<
+              cholesky_prediction_error
+            << " cholesky_coefficient_relative_error=" <<
+              cholesky_coefficient_error
             << " status=PASS\n";
 }
 
