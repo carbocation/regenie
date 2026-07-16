@@ -32,6 +32,28 @@ validation includes numerical comparisons in addition to regression tests.
 Please report fork-specific problems to the [carbocation/regenie issue
 tracker](https://github.com/carbocation/regenie/issues).
 
+## Creating upload-ready Linux release assets
+
+On an x86-64 Linux build host that already has a supported CUDA toolkit and the
+static oneMKL development files, the release bundle driver builds both Linux
+variants from the current committed revision:
+
+```bash
+scripts/build/build_linux_release_bundle.sh \
+  --profile datacenter \
+  --cuda-validation always \
+  --clean
+```
+
+It manages the checksum-verified BGEN dependency, builds in isolated source
+snapshots, runs CPU and CUDA validation, retests the binaries after extracting
+their archives, and writes an upload-ready directory containing the CPU and
+CUDA archives, checksums, and a release manifest. It does not install system
+packages or alter system directories; managed source dependencies live under
+the user's cache directory. See the [release builder
+documentation](scripts/build/README.md) for prerequisites, target profiles,
+output locations, and individual platform builders.
+
 ## Example optimized builds for x86-64 Ubuntu
 
 > [!IMPORTANT] These example commands are specifically for **x86-64 Ubuntu Linux

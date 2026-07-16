@@ -14,6 +14,8 @@ jobs="${JOBS:-}"
 run_tests=1
 cuda_validation="${CUDA_VALIDATION:-auto}"
 clean_build=0
+clean_dependencies=0
+allow_external_bgen=0
 
 usage() {
   cat <<'USAGE'
@@ -38,12 +40,16 @@ Options:
   --cpu-tune CPU                 GCC -mtune target (default: generic).
   --native-cpu                   Use -march=native -mtune=native. The artifact
                                  may not run on a different host CPU.
-  --build-dir PATH               CMake build directory.
+  --build-dir PATH               Release work directory.
   --output-dir PATH              Package output directory (default: ./dist).
   --jobs N                       Parallel build jobs (default: nproc).
   --cuda-validation MODE         auto, always, or never (default: auto).
-  --skip-tests                   Skip CTest and backend unit tests.
-  --clean                        Remove the selected CMake build directory first.
+  --skip-tests                   Skip CTest, backend tests, CUDA validation,
+                                 and both regression-suite passes.
+  --clean                        Remove the selected release work directory first.
+  --clean-dependencies           Rebuild the managed BGEN dependency.
+  --allow-external-bgen          Permit an explicitly supplied BGEN_PATH and
+                                 record it as unverified in package metadata.
   -h, --help                     Show this help.
 
 Environment equivalents:
@@ -122,6 +128,14 @@ while (( $# > 0 )); do
       clean_build=1
       shift
       ;;
+    --clean-dependencies)
+      clean_dependencies=1
+      shift
+      ;;
+    --allow-external-bgen)
+      allow_external_bgen=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -169,8 +183,12 @@ if ! git -C "${repo_root}" diff --quiet ||
    ! git -C "${repo_root}" diff --cached --quiet; then
   die "tracked source changes are present; commit or stash them before making a release artifact"
 fi
+if [[ -n "${BGEN_PATH:-}" ]] && (( allow_external_bgen == 0 )); then
+  die "BGEN_PATH is set; unset it for a verified managed dependency or pass --allow-external-bgen"
+fi
 
-for command_name in cmake ctest g++ gfortran git gzip make nproc nvcc python3 readelf tar; do
+for command_name in awk cmake cmp ctest g++ gfortran git gzip make nproc nvcc \
+  python3 readelf sed sort tar; do
   command -v "${command_name}" >/dev/null 2>&1 ||
     die "required command '${command_name}' was not found"
 done
@@ -228,6 +246,9 @@ if [[ -z "${BGEN_PATH:-}" ]]; then
   bgen_stamp="${BGEN_PATH}/build/.regenie-${bgen_expected_sha256}-streampos-v1"
   bgen_source_sha256="${bgen_expected_sha256}"
   mkdir -p "${deps_dir}"
+  if (( clean_dependencies == 1 )); then
+    cmake -E remove_directory "${BGEN_PATH}"
+  fi
   if [[ ! -f "${BGEN_PATH}/build/libbgen.a" || ! -f "${bgen_stamp}" ]]; then
     if [[ ! -f "${bgen_archive}" ]]; then
       if command -v curl >/dev/null 2>&1; then
@@ -263,6 +284,9 @@ if [[ -z "${BGEN_PATH:-}" ]]; then
   else
     bgen_provenance="verified-managed-cache"
   fi
+  # The managed-cache stamp is specific to this compatibility correction, so
+  # a cache hit carries the same provenance as a fresh managed build.
+  bgen_compatibility_patch=1
 fi
 export BGEN_PATH
 [[ -f "${BGEN_PATH}/build/libbgen.a" ]] ||
@@ -278,7 +302,14 @@ if (( clean_build == 1 )) && [[ -d "${build_dir}" ]]; then
 fi
 mkdir -p "${build_dir}" "${output_dir}"
 
-version="$(tr -d '[:space:]' < "${repo_root}/VERSION")"
+source_dir="${build_dir}/source"
+cmake_build_dir="${build_dir}/cmake"
+cmake -E remove_directory "${source_dir}"
+mkdir -p "${source_dir}"
+git -C "${repo_root}" archive --format=tar HEAD |
+  tar -xf - -C "${source_dir}"
+
+version="$(tr -d '[:space:]' < "${source_dir}/VERSION")"
 git_commit="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || echo unknown)"
 git_short="$(git -C "${repo_root}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 git_describe="$(git -C "${repo_root}" describe --always --dirty 2>/dev/null || echo unknown)"
@@ -292,6 +323,7 @@ archive_path="${output_dir}/${artifact_base}.tar.gz"
 
 echo "CUDA_RELEASE_BUILD_BEGIN"
 echo "CUDA_RELEASE_BUILD_SOURCE=${repo_root}"
+echo "CUDA_RELEASE_BUILD_SOURCE_SNAPSHOT=${source_dir}"
 echo "CUDA_RELEASE_BUILD_COMMIT=${git_commit}"
 echo "CUDA_RELEASE_BUILD_PROFILE=${profile}"
 echo "CUDA_RELEASE_BUILD_ARCHITECTURES=${cuda_architectures}"
@@ -310,7 +342,7 @@ if (( run_tests == 1 )); then
 else
   cmake_build_testing=OFF
 fi
-cmake -S "${repo_root}" -B "${build_dir}" \
+cmake -S "${source_dir}" -B "${cmake_build_dir}" \
   -DCMAKE_BUILD_TYPE=Release \
   "-DBUILD_TESTING=${cmake_build_testing}" \
   -DREGENIE_WITH_CUDA=ON \
@@ -321,16 +353,16 @@ build_targets=(regenie)
 if (( run_tests == 1 )); then
   build_targets+=(step1_compute_test cox_firth_test)
 fi
-cmake --build "${build_dir}" \
+cmake --build "${cmake_build_dir}" \
   --target "${build_targets[@]}" \
   --parallel "${jobs}"
 
 if (( run_tests == 1 )); then
   (
-    cd "${build_dir}"
+    cd "${cmake_build_dir}"
     ctest --output-on-failure
   )
-  "${build_dir}/step1_compute_test" --backend cpu
+  "${cmake_build_dir}/step1_compute_test" --backend cpu
 
   run_cuda_validation=0
   if [[ "${cuda_validation}" == "always" ]]; then
@@ -347,19 +379,32 @@ if (( run_tests == 1 )); then
   fi
   if (( run_cuda_validation == 1 )); then
     CUDA_ARCHITECTURES="${cuda_architectures}" \
-    BUILD_DIR="${build_dir}" \
+    BUILD_DIR="${cmake_build_dir}" \
     JOBS="${jobs}" \
-      "${repo_root}/scripts/test_step1_cuda.sh"
+      "${source_dir}/scripts/test_step1_cuda.sh"
   elif [[ "${cuda_validation}" == "never" ]]; then
     echo "CUDA_RELEASE_BUILD_CUDA_VALIDATION=SKIPPED reason=disabled"
   else
     echo "CUDA_RELEASE_BUILD_CUDA_VALIDATION=SKIPPED reason=no_usable_gpu"
   fi
+
+  # Exercise the complete upstream regression suite through the CUDA binary's
+  # CPU fallback. GPU-specific behavior is covered separately above by the
+  # focused Step 1 CUDA validation suite.
+  regression_dir="${build_dir}/regression"
+  cmake -E remove_directory "${regression_dir}"
+  mkdir -p "${regression_dir}/src"
+  cp -R "${source_dir}/example" "${regression_dir}/example"
+  cp -R "${source_dir}/test" "${regression_dir}/test"
+  ln -s "${cmake_build_dir}/regenie" "${regression_dir}/regenie"
+  CUDA_VISIBLE_DEVICES="" \
+    "${regression_dir}/test/test_bash.sh" --path "${regression_dir}"
+  echo "CUDA_RELEASE_BUILD_REGRESSION=PASS"
 else
   echo "CUDA_RELEASE_BUILD_TESTS=SKIPPED"
 fi
 
-binary_path="${build_dir}/regenie"
+binary_path="${cmake_build_dir}/regenie"
 [[ -x "${binary_path}" ]] || die "built executable is missing: ${binary_path}"
 dynamic_entries="$(readelf -d "${binary_path}")"
 if grep -Eq 'NEEDED.*lib(mkl|stdc\+\+|gcc_s)' <<<"${dynamic_entries}"; then
@@ -373,18 +418,45 @@ if command -v ldd >/dev/null 2>&1 && ldd "${binary_path}" | grep -q 'not found';
   ldd "${binary_path}" >&2
   die "the release binary has unresolved shared-library dependencies on the build host"
 fi
+dynamic_needed="$(awk '
+  /Shared library:/ {
+    value = $NF
+    gsub(/^\[|\]$/, "", value)
+    libraries = libraries (libraries == "" ? "" : ",") value
+  }
+  END { print libraries }
+' <<<"${dynamic_entries}")"
+glibc_required="$(
+  readelf --version-info "${binary_path}" 2>/dev/null |
+    grep -o 'GLIBC_[0-9][0-9.]*' |
+    sort -Vu |
+    tail -n 1 || true
+)"
+[[ -n "${glibc_required}" ]] || glibc_required="unknown"
+cuda_toolkit_version="$(nvcc --version | awk '
+  /release/ {
+    value = $0
+    sub(/^.*release[[:space:]]+/, "", value)
+    sub(/,.*/, "", value)
+    print value
+    exit
+  }
+')"
+[[ -n "${cuda_toolkit_version}" ]] || cuda_toolkit_version="unknown"
 
 cmake -E remove_directory "${stage_root}"
 mkdir -p "${stage_dir}/bin"
 cp "${binary_path}" "${stage_dir}/bin/regenie"
-cp "${repo_root}/LICENSE" "${repo_root}/README.md" "${repo_root}/VERSION" \
+cp "${source_dir}/LICENSE" "${source_dir}/README.md" "${source_dir}/VERSION" \
   "${stage_dir}/"
 {
   printf 'REGENIE_VERSION=%s\n' "${version}"
   printf 'GIT_COMMIT=%s\n' "${git_commit}"
   printf 'GIT_DESCRIBE=%s\n' "${git_describe}"
+  printf 'BUILD_KIND=cuda\n'
   printf 'CUDA_PROFILE=%s\n' "${profile}"
   printf 'CUDA_ARCHITECTURES=%s\n' "${cuda_architectures}"
+  printf 'CUDA_TOOLKIT_VERSION=%s\n' "${cuda_toolkit_version}"
   printf 'CPU_ARCHITECTURE=%s\n' "${cpu_architecture}"
   printf 'CPU_TUNE=%s\n' "${cpu_tune}"
   printf 'NVCC=%s\n' "$(nvcc --version | tail -n 1)"
@@ -395,6 +467,8 @@ cp "${repo_root}/LICENSE" "${repo_root}/README.md" "${repo_root}/VERSION" \
   printf 'BGEN_PROVENANCE=%s\n' "${bgen_provenance}"
   printf 'BGEN_SOURCE_SHA256=%s\n' "${bgen_source_sha256}"
   printf 'BGEN_COMPATIBILITY_PATCH=%s\n' "${bgen_compatibility_patch}"
+  printf 'GLIBC_REQUIRED=%s\n' "${glibc_required}"
+  printf 'DYNAMIC_NEEDED=%s\n' "${dynamic_needed}"
   printf 'SOURCE_DATE_EPOCH=%s\n' "${source_date_epoch}"
 } > "${stage_dir}/BUILD-METADATA.txt"
 
@@ -410,6 +484,40 @@ mv "${archive_tmp}" "${archive_path}"
   "${sha256_command[@]}" "$(basename "${archive_path}")" \
     > "$(basename "${archive_path}").sha256"
 )
+
+archive_validation="${build_dir}/archive-validation"
+cmake -E remove_directory "${archive_validation}"
+mkdir -p "${archive_validation}"
+tar -xzf "${archive_path}" -C "${archive_validation}"
+validated_dir="${archive_validation}/${artifact_base}"
+validated_binary="${validated_dir}/bin/regenie"
+[[ -x "${validated_binary}" ]] ||
+  die "packaged CUDA executable is missing after archive extraction"
+cmp -s "${binary_path}" "${validated_binary}" ||
+  die "packaged CUDA executable differs from the validated build output"
+"${validated_binary}" --help >/dev/null
+if command -v ldd >/dev/null 2>&1 &&
+   ldd "${validated_binary}" | grep -q 'not found'; then
+  ldd "${validated_binary}" >&2
+  die "packaged CUDA executable has unresolved shared-library dependencies"
+fi
+archive_actual_sha256="$("${sha256_command[@]}" "${archive_path}" | awk '{print $1}')"
+archive_recorded_sha256="$(awk 'NR == 1 { print $1 }' "${archive_path}.sha256")"
+[[ "${archive_actual_sha256}" == "${archive_recorded_sha256}" ]] ||
+  die "packaged CUDA archive does not match its SHA-256 file"
+
+if (( run_tests == 1 )); then
+  packaged_regression_dir="${build_dir}/packaged-regression"
+  cmake -E remove_directory "${packaged_regression_dir}"
+  mkdir -p "${packaged_regression_dir}/src"
+  cp -R "${source_dir}/example" "${packaged_regression_dir}/example"
+  cp -R "${source_dir}/test" "${packaged_regression_dir}/test"
+  ln -s "${validated_binary}" "${packaged_regression_dir}/regenie"
+  CUDA_VISIBLE_DEVICES="" \
+    "${packaged_regression_dir}/test/test_bash.sh" \
+      --path "${packaged_regression_dir}"
+  echo "CUDA_RELEASE_BUILD_PACKAGED_REGRESSION=PASS"
+fi
 
 echo "CUDA_RELEASE_BUILD_STATUS=PASS"
 echo "CUDA_RELEASE_BUILD_BINARY=${binary_path}"

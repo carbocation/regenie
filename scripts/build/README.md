@@ -9,9 +9,13 @@ Apple Silicon artifacts:
   CUDA Step 1 backend and the CPU fallback backend.
 - `build_macos_arm64_release.sh` creates a CPU-only Apple Silicon binary with
   static OpenBLAS and GNU Fortran runtimes plus a bundled LLVM OpenMP runtime.
+- `build_linux_release_bundle.sh` drives both Linux builders from one commit and
+  produces an upload-ready release directory.
+- `verify_release_assets.py` validates archive checksums, build metadata,
+  dependency provenance, and cross-artifact commit consistency.
 
-Both builders validate the executable and create a versioned tarball plus
-SHA-256 checksum under `dist/`.
+Each platform builder validates the executable and creates a versioned tarball
+plus SHA-256 checksum under `dist/`.
 
 Artifact names contain the source commit, and the builder refuses tracked source
 changes that have not been committed. Untracked compiler products are allowed so
@@ -21,18 +25,46 @@ The Linux builders manage BGEN v1.1.7 when `BGEN_PATH` is unset. They verify
 the official source archive's pinned SHA-256 checksum and require a matching
 build stamp before reusing that cache. For a clean build they apply the narrow
 `std::ios::streampos` to `std::streampos` compatibility correction needed by
-current compilers before invoking Waf. Supplying `BGEN_PATH` explicitly is
-treated as an unverified external dependency and is recorded as such in the
-package metadata. The Apple Silicon builder always uses its own platform- and
-deployment-target-specific managed dependency cache.
+current compilers before invoking Waf. An explicit `BGEN_PATH` is rejected by
+default; passing `--allow-external-bgen` permits it as an unverified external
+dependency and records that fact in package metadata. The Apple Silicon builder
+always uses its own platform- and deployment-target-specific managed dependency
+cache.
+
+## Upload-ready Linux release set
+
+On a Linux x86-64 machine with a supported CUDA toolkit and static oneMKL
+development files, one command builds both public Linux variants from the same
+committed source snapshot:
+
+```bash
+scripts/build/build_linux_release_bundle.sh \
+  --profile datacenter \
+  --cuda-validation always \
+  --clean
+```
+
+The command ignores an inherited `BGEN_PATH` and uses the checksum-verified
+managed dependency. It runs the CPU tests and regression suite, focused CUDA
+validation, CPU-fallback regression through the CUDA binary, and repeats the
+regression against both extracted packages. The output directory contains only
+the CPU and CUDA archives, their individual checksum files, `SHA256SUMS`, and
+`release-manifest.json`; these are ready to upload as GitHub release assets.
+Build logs and intermediate files remain under the separate build directory.
+
+To rebuild managed BGEN rather than reuse a verified cache, add
+`--clean-dependencies`. Run
+`scripts/build/build_linux_release_bundle.sh --help` for CPU-floor, CUDA-target,
+work-directory, and validation controls.
 
 ## CPU-only release
 
 The CPU builder defaults to `-march=x86-64-v3 -mtune=generic`, statically links
 oneMKL, and verifies that the resulting executable has no CUDA runtime
 dependencies. Its validation includes CTest, the Step 1 CPU backend test, and
-the repository regression suite running against an isolated copy of the
-committed fixtures:
+the repository regression suite before and after packaging. Compilation uses a
+`git archive HEAD` source snapshot so untracked checkout contents cannot enter
+the artifact:
 
 ```bash
 # Portable optimized binary for modern x86-64 hosts.
@@ -135,4 +167,25 @@ scripts/build/build_cuda_release.sh \
 ```
 
 Run `scripts/build/build_cuda_release.sh --help` for dependency expectations,
-environment overrides, and validation controls.
+environment overrides, and validation controls. CUDA release metadata records
+the build toolkit version and dynamic runtime libraries; the destination host
+must provide compatible CUDA libraries in addition to an NVIDIA driver.
+
+## Verifying downloaded or cross-platform assets
+
+The verifier can check a directory containing Linux and/or macOS archives. Each
+archive must have its sibling `.sha256` file and `BUILD-METADATA.txt`:
+
+```bash
+python3 scripts/build/verify_release_assets.py ./release-assets \
+  --expected-commit COMMIT_SHA \
+  --require-kind cpu-mkl \
+  --require-kind cuda \
+  --require-kind macos-arm64-openblas \
+  --require-verified-dependencies \
+  --manifest ./release-assets/release-manifest.json \
+  --sha256sums ./release-assets/SHA256SUMS
+```
+
+It rejects checksum failures, malformed metadata, mixed source commits or
+versions, missing build kinds, and unverified dependency provenance.
