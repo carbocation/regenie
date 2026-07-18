@@ -414,6 +414,26 @@ void Data::print_step2_profile() {
   print_stage("other", other_ms);
   print_stage("total", step2_profile.end_to_end_ms);
 
+  const double measured_setup_ms =
+    step2_profile.setup_file_initialization_ms +
+    step2_profile.setup_phenotype_covariate_ms +
+    step2_profile.setup_preparation_ms +
+    step2_profile.setup_block_ms + step2_profile.setup_output_ms +
+    step2_profile.setup_model_ms + step2_profile.setup_thread_ms;
+  out << "STEP2_PROFILE scope=setup"
+      << " file_initialization_ms="
+      << step2_profile.setup_file_initialization_ms
+      << " phenotype_covariate_ms="
+      << step2_profile.setup_phenotype_covariate_ms
+      << " preparation_ms=" << step2_profile.setup_preparation_ms
+      << " block_ms=" << step2_profile.setup_block_ms
+      << " output_ms=" << step2_profile.setup_output_ms
+      << " model_ms=" << step2_profile.setup_model_ms
+      << " thread_ms=" << step2_profile.setup_thread_ms
+      << " other_ms="
+      << std::max(0.0, step2_profile.setup_ms - measured_setup_ms)
+      << "\n";
+
   if(step2_pgen_read_profile.variants > 0) {
     const double postdecode_ms = std::max(0.0,
       step2_pgen_read_profile.thread_work_ms -
@@ -3298,17 +3318,45 @@ void Data::test_snps_fast() {
 #endif
   sout << endl;
 
+  ProfileClock::time_point setup_phase_start;
+  if(params.profile_step2) setup_phase_start = ProfileClock::now();
   file_read_initialization(); // set up files for reading
+  if(params.profile_step2) {
+    step2_profile.setup_file_initialization_ms +=
+      elapsed_ms(setup_phase_start);
+    setup_phase_start = ProfileClock::now();
+  }
   read_pheno_and_cov(&files, &params, &in_filters, &pheno_data, &m_ests, &Gblock, sout);   // read phenotype and covariate files
+  if(params.profile_step2) {
+    step2_profile.setup_phenotype_covariate_ms +=
+      elapsed_ms(setup_phase_start);
+    setup_phase_start = ProfileClock::now();
+  }
   prep_run(&files, &in_filters, &params, &pheno_data, &m_ests, sout); // check blup files and adjust for covariates
+  if(params.profile_step2) {
+    step2_profile.setup_preparation_ms += elapsed_ms(setup_phase_start);
+    setup_phase_start = ProfileClock::now();
+  }
   set_blocks_for_testing();   // set number of blocks
   print_usage_info(&params, &files, sout);
   print_test_info();
+  if(params.profile_step2) {
+    step2_profile.setup_block_ms += elapsed_ms(setup_phase_start);
+    setup_phase_start = ProfileClock::now();
+  }
   setup_output(&ofile, out, ofile_split, out_split); // result file
+  if(params.profile_step2) {
+    step2_profile.setup_output_ms += elapsed_ms(setup_phase_start);
+    setup_phase_start = ProfileClock::now();
+  }
   if(params.w_interaction && (params.trait_mode==0) && !params.no_robust && !params.force_robust) 
     nullHLM.prep_run(&pheno_data, &params);
   if(params.trait_mode) set_nullreg_mat();
   sout << endl;
+  if(params.profile_step2) {
+    step2_profile.setup_model_ms += elapsed_ms(setup_phase_start);
+    setup_phase_start = ProfileClock::now();
+  }
 
   // start analyzing each chromosome
   bool block_init_pass = false;
@@ -3316,8 +3364,10 @@ void Data::test_snps_fast() {
   tally snp_tally;
   vector< variant_block > block_info;
   initialize_thread_data(Gblock.thread_data, params);
-  if(params.profile_step2)
+  if(params.profile_step2) {
+    step2_profile.setup_thread_ms += elapsed_ms(setup_phase_start);
     step2_profile.setup_ms += elapsed_ms(profile_stage_start);
+  }
 
 
   for(auto const& chrom : files.chr_read) {

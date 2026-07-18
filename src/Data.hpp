@@ -109,6 +109,13 @@ struct Step2Profile {
   uint64_t corrected_tests = 0;
   uint64_t failed_tests = 0;
   double setup_ms = 0;
+  double setup_file_initialization_ms = 0;
+  double setup_phenotype_covariate_ms = 0;
+  double setup_preparation_ms = 0;
+  double setup_block_ms = 0;
+  double setup_output_ms = 0;
+  double setup_model_ms = 0;
+  double setup_thread_ms = 0;
   double prediction_read_ms = 0;
   double null_model_ms = 0;
   double genotype_io_ms = 0;
