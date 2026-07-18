@@ -174,22 +174,30 @@ void Files::openMode(std::string const& filename, std::ios_base::openmode mode, 
 }
 
 // Split string by tokens
-std::vector<std::string> string_split(std::string const& s, const char* delims) {
+void string_split(std::string const& s, const char* delims,
+                  std::vector<std::string>& out) {
 
-  std::vector<std::string> out;
+  out.clear();
 
-  if(s.size() == 0) return out;
+  if(s.size() == 0) return;
 
   const char* p = s.c_str(); //beginning of string
   const char* q = strpbrk(p+1, delims);//to first delimiter
 
   for( ; q != NULL; q = strpbrk(p, delims)){
-    out.push_back( std::string(p,q) );// add to vector using range constructor
+    out.emplace_back(p,q);// add to vector using range constructor
     p = q + 1;
   }
 
   // check string after last delimiter
-  if(p && (p[0] != '\0')) out.push_back( std::string(p) );
+  if(p && (p[0] != '\0')) out.emplace_back(p);
+
+}
+
+std::vector<std::string> string_split(std::string const& s, const char* delims) {
+
+  std::vector<std::string> out;
+  string_split(s, delims, out);
 
   return(out);
 
@@ -210,4 +218,3 @@ int find_col(std::vector<std::string> const& str_vec, std::string const& name){
   else return std::distance(str_vec.begin(), scol);
 
 }
-

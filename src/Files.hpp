@@ -111,6 +111,7 @@ void openStream(T* ofs, std::string const& fname, std::ios_base::openmode mode, 
   return;
 }
 std::vector<std::string> string_split(std::string const&,const char*);
+void string_split(std::string const&,const char*,std::vector<std::string>&);
 bool startswith(const char*,const char*);
 int find_col(std::vector<std::string> const&,std::string const&);
 

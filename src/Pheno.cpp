@@ -161,7 +161,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
   removeCarriageReturn(line); // remove carriage returns at the end of line if any
 
   // check that FID and IID are first two entries in header
-  tmp_str_vec = string_split(line,"\t ");
+  string_split(line,"\t ",tmp_str_vec);
   if( tmp_str_vec.size() < 2 ) 
     throw "header of phenotype file has too few columns.";
   else if( (tmp_str_vec[0] != "FID") || (tmp_str_vec[1] != "IID") ) 
@@ -211,7 +211,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
 
   // read in data
   while( fClass.readLine(line) ){
-    tmp_str_vec = string_split(line,"\t ");
+    string_split(line,"\t ",tmp_str_vec);
 
     if( (int)tmp_str_vec.size() != (2+keep_cols.size()) )
       throw "incorrectly formatted phenotype file.";
@@ -379,7 +379,7 @@ void tpheno_read(struct param* params, struct in_files* files, struct filter* fi
   fClass.openForRead(files->pheno_file, sout);
   fClass.readLine(line);
   removeCarriageReturn(line); // remove carriage returns at the end of line if any
-  header = string_split(line,"\t ");
+  string_split(line,"\t ",header);
 
   // parse first line
   size_t ncols_file = header.size();
@@ -418,7 +418,7 @@ void tpheno_read(struct param* params, struct in_files* files, struct filter* fi
   // for each trait
   while( fClass.readLine(line) ){
 
-    tmp_str_vec = string_split(line,"\t ");
+    string_split(line,"\t ",tmp_str_vec);
     if( tmp_str_vec.size() != ncols_file )
       throw "incorrectly formatted phenotype file.";
 
@@ -589,7 +589,7 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
   removeCarriageReturn(line); // remove carriage returns at the end of line if any
 
   // check header
-  tmp_str_vec = string_split(line,"\t ");
+  string_split(line,"\t ",tmp_str_vec);
   if( (tmp_str_vec[0] != "FID") || (tmp_str_vec[1] != "IID") ) 
     throw "header of covariate file must start with: FID IID.";
 
@@ -648,7 +648,7 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
 
   // read in data
   while( fClass.readLine(line) ){
-    tmp_str_vec = string_split(line,"\t ");
+    string_split(line,"\t ",tmp_str_vec);
 
     if( (int)tmp_str_vec.size() != (keep_cols.size()+2) )
       throw "incorrectly formatted covariate file.";
