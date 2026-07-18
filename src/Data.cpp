@@ -332,6 +332,9 @@ void Data::run_step1(){
 
 void Data::run_step2(){
 
+  ProfileClock::time_point profile_run_start;
+  if(params.profile_step2) profile_run_start = ProfileClock::now();
+
   // allocate per thread if using OpenMP
   Gblock.thread_data.resize(params.neff_threads);
 
@@ -340,6 +343,70 @@ void Data::run_step2(){
   else if (params.trait_set) test_multitrait();
   else if (params.multiphen) test_multiphen();
   else test_snps_fast();
+
+  if(params.profile_step2) {
+    step2_profile.end_to_end_ms = elapsed_ms(profile_run_start);
+    print_step2_profile();
+  }
+
+}
+
+void Data::print_step2_profile() {
+
+  const double measured_ms = step2_profile.setup_ms +
+    step2_profile.prediction_read_ms + step2_profile.null_model_ms +
+    step2_profile.genotype_io_ms + step2_profile.variant_compute_ms +
+    step2_profile.output_ms;
+  const double other_ms = std::max(
+    0.0, step2_profile.end_to_end_ms - measured_ms);
+  const double denominator = step2_profile.end_to_end_ms > 0 ?
+    step2_profile.end_to_end_ms : 1;
+  const char* mode = params.getCorMat ? "ld" :
+    (params.snp_set ? "joint" :
+      (params.trait_set ? "multitrait" :
+        (params.multiphen ? "multiphen" : "single_variant")));
+  const char* trait = params.trait_mode == 0 ? "qt" :
+    (params.trait_mode == 1 ? "bt" :
+      (params.trait_mode == 2 ? "ct" : "t2e"));
+
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(3);
+  out << "\nSTEP2_PROFILE version=1 mode=" << mode
+      << " file_type=" << params.file_type
+      << " trait=" << trait
+      << " chromosomes=" << step2_profile.chromosomes
+      << " blocks=" << step2_profile.blocks
+      << " variants=" << step2_profile.variants
+      << " samples=" << params.n_samples
+      << " phenotypes=" << params.n_pheno
+      << " threads=" << params.threads
+      << " corrected_tests=" << step2_profile.corrected_tests
+      << " failed_tests=" << step2_profile.failed_tests << "\n";
+
+  const auto print_stage = [&](const char* name, const double value) {
+    out << "STEP2_PROFILE stage=" << name
+        << " elapsed_ms=" << value
+        << " percent=" << (100 * value / denominator) << "\n";
+  };
+
+  print_stage("setup", step2_profile.setup_ms);
+  print_stage("prediction_read", step2_profile.prediction_read_ms);
+  print_stage("null_model", step2_profile.null_model_ms);
+  print_stage("genotype_io", step2_profile.genotype_io_ms);
+  print_stage("variant_compute", step2_profile.variant_compute_ms);
+  print_stage("output", step2_profile.output_ms);
+  print_stage("other", other_ms);
+  print_stage("total", step2_profile.end_to_end_ms);
+  out << "STEP2_PROFILE_FINAL version=1 mode=" << mode
+      << " setup_ms=" << step2_profile.setup_ms
+      << " prediction_read_ms=" << step2_profile.prediction_read_ms
+      << " null_model_ms=" << step2_profile.null_model_ms
+      << " genotype_io_ms=" << step2_profile.genotype_io_ms
+      << " variant_compute_ms=" << step2_profile.variant_compute_ms
+      << " output_ms=" << step2_profile.output_ms
+      << " other_ms=" << other_ms
+      << " total_ms=" << step2_profile.end_to_end_ms << "\n";
+  sout << out.str();
 
 }
 
@@ -3085,6 +3152,9 @@ void Data::set_nullreg_mat(){
 
 void Data::test_snps_fast() {
 
+  ProfileClock::time_point profile_stage_start;
+  if(params.profile_step2) profile_stage_start = ProfileClock::now();
+
   sout << "Association testing mode";
 
   string out;
@@ -3117,6 +3187,8 @@ void Data::test_snps_fast() {
   tally snp_tally;
   vector< variant_block > block_info;
   initialize_thread_data(Gblock.thread_data, params);
+  if(params.profile_step2)
+    step2_profile.setup_ms += elapsed_ms(profile_stage_start);
 
 
   for(auto const& chrom : files.chr_read) {
@@ -3135,16 +3207,24 @@ void Data::test_snps_fast() {
     }
 
     sout << "Chromosome " << chrom << " [" << chrom_nb << " blocks in total]\n";
+    if(params.profile_step2) step2_profile.chromosomes++;
 
     if(!params.getCorMat){
       // read polygenic effect predictions from step 1
+      if(params.profile_step2) profile_stage_start = ProfileClock::now();
       blup_read_chr(false, chrom, m_ests, files, in_filters, pheno_data, params, sout);
+      if(params.profile_step2) {
+        step2_profile.prediction_read_ms += elapsed_ms(profile_stage_start);
+        profile_stage_start = ProfileClock::now();
+      }
 
       // compute phenotype residual (adjusting for BLUP [and covariates for non-QTs])
       if(params.trait_mode == 1) compute_res_bin(chrom);
       else if(params.trait_mode == 2) compute_res_count(chrom);
       else if(params.trait_mode == 3) compute_res_cox(chrom);
       else compute_res();
+      if(params.profile_step2)
+        step2_profile.null_model_ms += elapsed_ms(profile_stage_start);
 
       // print y/x/logreg offset used for level 1 
       if(params.debug) write_inputs();
@@ -3168,9 +3248,14 @@ void Data::test_snps_fast() {
       block_info.resize(bs);
 
       // read SNP, impute missing & compute association test statistic
+      if(params.profile_step2) {
+        step2_profile.blocks++;
+        step2_profile.variants += bs;
+      }
       analyze_block(chrom, bs, &snp_tally, block_info);
 
       // print the results
+      if(params.profile_step2) profile_stage_start = ProfileClock::now();
       for (auto const& snp_data : block_info){
 
         if( snp_data.ignored ) {
@@ -3204,6 +3289,8 @@ void Data::test_snps_fast() {
         }
 
       }
+      if(params.profile_step2)
+        step2_profile.output_ms += elapsed_ms(profile_stage_start);
 
       snp_tally.snp_count += bs;
       block++;
@@ -3211,7 +3298,13 @@ void Data::test_snps_fast() {
 
   }
 
+  if(params.profile_step2) profile_stage_start = ProfileClock::now();
   sout << print_summary(&ofile, out, ofile_split, out_split, n_corrected, snp_tally, files, firth_est, params);
+  if(params.profile_step2) {
+    step2_profile.output_ms += elapsed_ms(profile_stage_start);
+    step2_profile.corrected_tests = n_corrected;
+    step2_profile.failed_tests = snp_tally.n_failed_tests;
+  }
 
 }
 
@@ -3219,6 +3312,7 @@ void Data::test_snps_fast() {
 void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, vector<variant_block> &all_snps_info){
 
   auto t1 = std::chrono::high_resolution_clock::now();
+  ProfileClock::time_point profile_stage_start;
   const int start = snp_tally->snp_count;
   vector< vector < uchar > > snp_data_blocks;
   vector< uint32_t > insize, outsize;
@@ -3226,10 +3320,17 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
   vector<uint64> indices(n_snps);
   std::iota(indices.begin(), indices.end(), start);
 
+  if(params.profile_step2) profile_stage_start = ProfileClock::now();
   readChunk(indices, chrom, snp_data_blocks, insize, outsize, all_snps_info);
+  if(params.profile_step2) {
+    step2_profile.genotype_io_ms += elapsed_ms(profile_stage_start);
+    profile_stage_start = ProfileClock::now();
+  }
 
   // analyze using openmp
   compute_tests_mt(chrom, indices, snp_data_blocks, insize, outsize, all_snps_info);
+  if(params.profile_step2)
+    step2_profile.variant_compute_ms += elapsed_ms(profile_stage_start);
   //compute_tests_st(chrom, indices, snp_data_blocks, insize, outsize, all_snps_info); // this is slower
 
 
