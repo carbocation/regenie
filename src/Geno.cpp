@@ -3817,17 +3817,15 @@ void mean_impute_g(const double& mu, Ref<ArrayXd> Geno, const Ref<const ArrayXb>
 
 findID getIndivIndex(const string &FID, const string &IID, struct param* params, mstream& sout){
 
-  string tmp_str;
   findID indiv;
 
   // get ID of individual
-  tmp_str = FID + "_" + IID;
+  const string tmp_str = FID + "_" + IID;
 
   // check individual is in genotype data
-  indiv.is_found = in_map(tmp_str, params->FID_IID_to_ind);
-
-  if(indiv.is_found)
-    indiv.index = params->FID_IID_to_ind[tmp_str];
+  const auto match = params->FID_IID_to_ind.find(tmp_str);
+  indiv.is_found = match != params->FID_IID_to_ind.end();
+  if(indiv.is_found) indiv.index = match->second;
 
   return indiv;
 }
