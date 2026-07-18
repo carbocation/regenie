@@ -425,8 +425,14 @@ void Data::print_step2_profile() {
         << " variants=" << step2_pgen_read_profile.variants
         << " fast_path_variants="
         << step2_pgen_read_profile.fast_path_variants
+        << " packed_hardcall_variants="
+        << step2_pgen_read_profile.packed_hardcall_variants
+        << " packed_hardcall_bytes="
+        << step2_pgen_read_profile.packed_hardcall_bytes
         << " thread_work_ms=" << step2_pgen_read_profile.thread_work_ms
         << " decode_thread_ms=" << step2_pgen_read_profile.decode_thread_ms
+        << " packed_expand_thread_ms="
+        << step2_pgen_read_profile.packed_expand_thread_ms
         << " postdecode_thread_ms=" << postdecode_ms
         << " decode_percent=" <<
           (100 * step2_pgen_read_profile.decode_thread_ms /

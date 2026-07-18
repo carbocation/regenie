@@ -251,6 +251,8 @@ done
 
 if ! grep -q '^STEP2_PROFILE scope=pgen_ingest ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
   print_custom_err "Step 2 PGEN profiling output is missing."
+elif ! grep -q ' packed_hardcall_variants=1000 ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN packed-hardcall ingestion was not exercised."
 elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
   print_custom_err "Step 2 PGEN variant profiling output is missing."
 elif ! grep -q ' algebraic_dense_qt_variants=1000 ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then

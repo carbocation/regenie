@@ -97,6 +97,91 @@ BgenDecodeWorkspace& bgen_decode_workspace() {
   return workspace;
 }
 
+struct PackedHardcallDecodeEntry {
+  std::array<double, 4> genotypes;
+  unsigned char allele_sum = 0;
+  unsigned char nonmissing = 0;
+  unsigned char zeros = 0;
+  unsigned char missing = 0;
+};
+
+using PackedHardcallDecodeLookup =
+  std::array<PackedHardcallDecodeEntry, 256>;
+
+PackedHardcallDecodeLookup build_packed_hardcall_decode_lookup() {
+  PackedHardcallDecodeLookup lookup;
+  for(unsigned int byte = 0; byte < lookup.size(); ++byte) {
+    PackedHardcallDecodeEntry& entry = lookup[byte];
+    for(unsigned int offset = 0; offset < 4; ++offset) {
+      const unsigned int code = (byte >> (2 * offset)) & 3;
+      if(code == 3) {
+        entry.genotypes[offset] = -3.0;
+        entry.missing++;
+      } else {
+        entry.genotypes[offset] = static_cast<double>(code);
+        entry.allele_sum += code;
+        entry.nonmissing++;
+        entry.zeros += (code == 0);
+      }
+    }
+  }
+  return lookup;
+}
+
+const PackedHardcallDecodeLookup& packed_hardcall_decode_lookup() {
+  static const PackedHardcallDecodeLookup lookup =
+    build_packed_hardcall_decode_lookup();
+  return lookup;
+}
+
+std::vector<unsigned char>& step2_pgen_packed_workspace() {
+  thread_local std::vector<unsigned char> workspace;
+  return workspace;
+}
+
+struct PackedHardcallDecodeStats {
+  uint64_t allele_sum = 0;
+  uint64_t nonmissing = 0;
+  uint64_t zeros = 0;
+  uint64_t missing = 0;
+};
+
+PackedHardcallDecodeStats expand_packed_hardcalls(
+  const unsigned char* packed, size_t sample_count, double* genotypes) {
+  const PackedHardcallDecodeLookup& lookup =
+    packed_hardcall_decode_lookup();
+  PackedHardcallDecodeStats stats;
+  const size_t full_bytes = sample_count / 4;
+
+  for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+    const PackedHardcallDecodeEntry& entry = lookup[packed[byte_index]];
+    const size_t sample = 4 * byte_index;
+    genotypes[sample] = entry.genotypes[0];
+    genotypes[sample + 1] = entry.genotypes[1];
+    genotypes[sample + 2] = entry.genotypes[2];
+    genotypes[sample + 3] = entry.genotypes[3];
+    stats.allele_sum += entry.allele_sum;
+    stats.nonmissing += entry.nonmissing;
+    stats.zeros += entry.zeros;
+    stats.missing += entry.missing;
+  }
+
+  for(size_t sample = 4 * full_bytes; sample < sample_count; ++sample) {
+    const unsigned int code =
+      (packed[full_bytes] >> (2 * (sample - 4 * full_bytes))) & 3;
+    if(code == 3) {
+      genotypes[sample] = -3.0;
+      stats.missing++;
+    } else {
+      genotypes[sample] = static_cast<double>(code);
+      stats.allele_sum += code;
+      stats.nonmissing++;
+      stats.zeros += (code == 0);
+    }
+  }
+  return stats;
+}
+
 class ScopedThreadWorkTimer {
   public:
     explicit ScopedThreadWorkTimer(double* elapsed_ms)
@@ -2937,10 +3022,25 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
   const bool all_samples_in_analysis = filters->ind_in_analysis.all();
   const bool has_trait_missingness = filters->has_missing.any();
+  const bool use_fast_hardcall_base =
+    !params->build_mask &&
+    !params->dosage_mode &&
+    (params->test_type == 0) &&
+    !params->af_cc &&
+    params->split_by_pheno &&
+    !params->htp_out &&
+    !params->w_interaction &&
+    !params->snp_set &&
+    !params->trait_set &&
+    !params->multiphen;
   const int worker_count = std::max(1, params->neff_threads);
   vector<double> thread_work_ms(profile ? worker_count : 0, 0);
   vector<double> decode_thread_ms(profile ? worker_count : 0, 0);
+  vector<double> packed_expand_thread_ms(profile ? worker_count : 0, 0);
   vector<uint64_t> fast_path_variants(profile ? worker_count : 0, 0);
+  vector<uint64_t> packed_hardcall_variants(
+    profile ? worker_count : 0, 0);
+  vector<uint64_t> packed_hardcall_bytes(profile ? worker_count : 0, 0);
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -2969,19 +3069,14 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     mac = 0, nmales = 0;
     bool non_par = in_non_par(chrom, snp_info->physpos, params);
     const bool use_fast_hardcall_path =
-      !params->build_mask &&
-      !params->dosage_mode &&
-      (params->test_type == 0) &&
-      !non_par &&
-      !params->af_cc &&
-      params->split_by_pheno &&
-      !params->htp_out &&
-      !params->w_interaction &&
-      !params->snp_set &&
-      !params->trait_set &&
-      !params->multiphen;
+      use_fast_hardcall_base && !non_par;
+    const bool use_packed_hardcall_path =
+      use_fast_hardcall_path && all_samples_in_analysis &&
+      !has_trait_missingness;
     if(profile && use_fast_hardcall_path)
       fast_path_variants[thread_num]++;
+    if(profile && use_packed_hardcall_path)
+      packed_hardcall_variants[thread_num]++;
     bool requires_mean_imputation = true;
     if( params->dosage_mode ) eij2 = 0;
 
@@ -2992,11 +3087,35 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
         profile ? &decode_thread_ms[thread_num] : nullptr);
       if( params->dosage_mode )
         pgr.Read(Geno.data(), Geno.size(), thread_num, cur_index, 1);
-      else
+      else if(use_packed_hardcall_path) {
+        vector<unsigned char>& packed = step2_pgen_packed_workspace();
+        const size_t packed_bytes =
+          (static_cast<size_t>(Geno.size()) + 3) / 4;
+        packed.resize(packed_bytes);
+        pgr.ReadHardcallsPacked(packed.data(), packed.size(), Geno.size(),
+          thread_num, cur_index, 1);
+        if(profile)
+          packed_hardcall_bytes[thread_num] += packed_bytes;
+      } else
         pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
     }
 
-    if(use_fast_hardcall_path) {
+    if(use_packed_hardcall_path) {
+      PackedHardcallDecodeStats packed_stats;
+      {
+        ScopedThreadWorkTimer packed_expand_timer(
+          profile ? &packed_expand_thread_ms[thread_num] : nullptr);
+        const vector<unsigned char>& packed =
+          step2_pgen_packed_workspace();
+        packed_stats = expand_packed_hardcalls(
+          packed.data(), Geno.size(), Geno.data());
+      }
+      total = static_cast<double>(packed_stats.allele_sum);
+      snp_data->ns1 = packed_stats.nonmissing;
+      snp_data->n_zero = filters->ind_in_analysis.size() -
+        params->n_samples + packed_stats.zeros;
+      requires_mean_imputation = packed_stats.missing > 0;
+    } else if(use_fast_hardcall_path) {
       total = 0;
       snp_data->ns1 = 0;
       snp_data->n_zero = filters->ind_in_analysis.size() -
@@ -3186,10 +3305,18 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     profile->variants += bs;
     profile->fast_path_variants += std::accumulate(
       fast_path_variants.begin(), fast_path_variants.end(), uint64_t(0));
+    profile->packed_hardcall_variants += std::accumulate(
+      packed_hardcall_variants.begin(), packed_hardcall_variants.end(),
+      uint64_t(0));
+    profile->packed_hardcall_bytes += std::accumulate(
+      packed_hardcall_bytes.begin(), packed_hardcall_bytes.end(),
+      uint64_t(0));
     profile->thread_work_ms += std::accumulate(
       thread_work_ms.begin(), thread_work_ms.end(), 0.0);
     profile->decode_thread_ms += std::accumulate(
       decode_thread_ms.begin(), decode_thread_ms.end(), 0.0);
+    profile->packed_expand_thread_ms += std::accumulate(
+      packed_expand_thread_ms.begin(), packed_expand_thread_ms.end(), 0.0);
   }
 
   if(oob_err.any()) 

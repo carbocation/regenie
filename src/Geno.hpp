@@ -88,8 +88,11 @@ struct Step1PgenReadProfile {
 struct Step2PgenReadProfile {
   uint64_t variants = 0;
   uint64_t fast_path_variants = 0;
+  uint64_t packed_hardcall_variants = 0;
+  uint64_t packed_hardcall_bytes = 0;
   double thread_work_ms = 0;
   double decode_thread_ms = 0;
+  double packed_expand_thread_ms = 0;
 };
 
 struct Step2BgenParseProfile {
