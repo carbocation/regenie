@@ -24,6 +24,8 @@
 
 */
 
+#include <cstdlib>
+#include <cstring>
 #include <unordered_set>
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -45,6 +47,55 @@ using namespace std;
 using namespace Eigen;
 using namespace boost;
 using boost::math::normal;
+
+namespace {
+
+struct TextToken {
+  TextToken(const char* begin, const char* end)
+    : begin(begin), length(static_cast<size_t>(end - begin)) {}
+
+  const char* begin;
+  size_t length;
+};
+
+void split_text_tokens(const std::string& line, const char* delims,
+                       std::vector<TextToken>& tokens) {
+  tokens.clear();
+  if(line.empty()) return;
+
+  const char* p = line.c_str();
+  const char* q = strpbrk(p + 1, delims);
+  for(; q != nullptr; q = strpbrk(p, delims)) {
+    tokens.emplace_back(p, q);
+    p = q + 1;
+  }
+  if(p[0] != '\0') tokens.emplace_back(p, line.c_str() + line.size());
+}
+
+bool token_equals(const TextToken& token, const char* value) {
+  const size_t length = std::strlen(value);
+  return token.length == length &&
+    std::memcmp(token.begin, value, length) == 0;
+}
+
+std::string token_string(const TextToken& token) {
+  return std::string(token.begin, token.length);
+}
+
+double convert_token_double(const TextToken& token,
+                            const struct param* params) {
+  if(token_equals(token, params->missing_pheno_str.c_str()) ||
+     token_equals(token, "nan") || token_equals(token, "inf"))
+    return params->missing_value_double;
+
+  char* end = nullptr;
+  const double value = std::strtod(token.begin, &end);
+  if(end == token.begin)
+    throw "could not convert value to double: '" + token_string(token) + "'";
+  return value;
+}
+
+}
 
 
 void read_pheno_and_cov(struct in_files* files, struct param* params, struct filter* filters, struct phenodt* pheno_data, struct ests* m_ests, struct geno_block* gblock, mstream& sout) {
@@ -151,6 +202,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
   bool all_miss;
   string line;
   std::vector< string > tmp_str_vec;
+  std::vector<TextToken> row_tokens;
   ArrayXb keep_cols;
   findID person;
   Files fClass;
@@ -211,12 +263,14 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
 
   // read in data
   while( fClass.readLine(line) ){
-    string_split(line,"\t ",tmp_str_vec);
+    split_text_tokens(line,"\t ",row_tokens);
 
-    if( (int)tmp_str_vec.size() != (2+keep_cols.size()) )
+    if( (int)row_tokens.size() != (2+keep_cols.size()) )
       throw "incorrectly formatted phenotype file.";
 
-    person = getIndivIndex(tmp_str_vec[0], tmp_str_vec[1], params, sout);
+    const string fid = token_string(row_tokens[0]);
+    const string iid = token_string(row_tokens[1]);
+    person = getIndivIndex(fid, iid, params, sout);
     if(!person.is_found) continue;
 
     indiv_index = person.index;
@@ -225,7 +279,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
     if( !ind_in_pheno_and_geno(indiv_index) ){
       ind_in_pheno_and_geno( indiv_index ) = true;
     } else 
-      throw "individual appears more than once in phenotype file: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1] ;
+      throw "individual appears more than once in phenotype file: FID=" + fid + " IID=" + iid;
 
     // read phenotypes 
     all_miss = true;
@@ -257,21 +311,21 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
           }
         }
 
-        pheno_data->phenotypes(indiv_index, time_index) = convertDouble(tmp_str_vec[2+time_ph_index], params, sout);
+        pheno_data->phenotypes(indiv_index, time_index) = convert_token_double(row_tokens[2+time_ph_index], params);
         pheno_data->phenotypes_raw(indiv_index, time_index) = pheno_data->phenotypes(indiv_index, time_index);
 
-        pheno_data->phenotypes(indiv_index, event_index) = convertDouble(tmp_str_vec[2+event_ph_index], params, sout);
+        pheno_data->phenotypes(indiv_index, event_index) = convert_token_double(row_tokens[2+event_ph_index], params);
         if(!params->CC_ZeroOne && (pheno_data->phenotypes(indiv_index, event_index) != params->missing_value_double)) 
             pheno_data->phenotypes(indiv_index, event_index) -= 1; // if using 1/2/NA encoding for BTs
 
         pheno_data->phenotypes_raw(indiv_index, event_index) = pheno_data->phenotypes(indiv_index, event_index);
 
         if ((pheno_data->phenotypes_raw(indiv_index, time_index) < 0) && (pheno_data->phenotypes_raw(indiv_index, time_index) != params->missing_value_double)) {
-          throw "a phenotype time value is <0 for individual: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1] + " Y=" + tmp_str_vec[2+time_index];
+          throw "a phenotype time value is <0 for individual: FID=" + fid + " IID=" + iid + " Y=" + token_string(row_tokens[2+time_index]);
         } else if ((pheno_data->phenotypes_raw(indiv_index, event_index) != 0) && (pheno_data->phenotypes_raw(indiv_index, event_index) != 1) && (pheno_data->phenotypes_raw(indiv_index, event_index) != params->missing_value_double)) {
-          throw "a phenotype censor value is invalid for individual: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1] + " Y=" + tmp_str_vec[2+event_index];
+          throw "a phenotype censor value is invalid for individual: FID=" + fid + " IID=" + iid + " Y=" + token_string(row_tokens[2+event_index]);
         } else if ((pheno_data->phenotypes_raw(indiv_index, time_index) != params->missing_value_double) && (pheno_data->phenotypes_raw(indiv_index, event_index) == params->missing_value_double)) {
-          throw "a phenotype has missing censor with non-missing time for individual: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1];
+          throw "a phenotype has missing censor with non-missing time for individual: FID=" + fid + " IID=" + iid;
         } else if ((pheno_data->phenotypes_raw(indiv_index, time_index) == params->missing_value_double)) {
           pheno_data->masked_indivs(indiv_index, time_index) = false;
           pheno_data->masked_indivs(indiv_index, event_index) = false;
@@ -287,7 +341,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
 
         if( !keep_cols(j) ) continue;
 
-        pheno_data->phenotypes(indiv_index, i_pheno) = convertDouble(tmp_str_vec[2+j], params, sout);
+        pheno_data->phenotypes(indiv_index, i_pheno) = convert_token_double(row_tokens[2+j], params);
 
         // for non-QT, save raw data
         if (params->trait_mode) {
@@ -305,7 +359,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
               throw "no missing value allowed in phenotype file with option -within";
             else if( pheno_data->phenotypes_raw(indiv_index, i_pheno) != params->missing_value_double ) {
               std::string msg = (params->CC_ZeroOne ? "0/1/NA" : "1/2/NA");
-              throw "a phenotype value is not " + msg + " for individual: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1] + " Y=" + tmp_str_vec[2+j];
+              throw "a phenotype value is not " + msg + " for individual: FID=" + fid + " IID=" + iid + " Y=" + token_string(row_tokens[2+j]);
             }
 
             pheno_data->masked_indivs(indiv_index, i_pheno) = false;
@@ -315,7 +369,7 @@ void pheno_read(struct param* params, struct in_files* files, struct filter* fil
             if(params->within_sample_l0)
               throw "no missing value allowed in phenotype file with option -within";
             else if( pheno_data->phenotypes_raw(indiv_index, i_pheno) != params->missing_value_double ) {
-              throw "a phenotype value is <0 for individual: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1] + " Y=" + tmp_str_vec[2+j];
+              throw "a phenotype value is <0 for individual: FID=" + fid + " IID=" + iid + " Y=" + token_string(row_tokens[2+j]);
             }
             pheno_data->masked_indivs(indiv_index, i_pheno) = false;
           }
