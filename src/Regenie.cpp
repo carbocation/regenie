@@ -1702,8 +1702,9 @@ double convertDouble(const string& val, struct param const* params, mstream& sou
   else if( (val == "nan") || (val == "inf") )
     return params->missing_value_double;
 
-  double dval;
-  if(sscanf(val.c_str(), "%lf", &dval) != 1)
+  char* end = nullptr;
+  const double dval = std::strtod(val.c_str(), &end);
+  if(end == val.c_str())
     throw "could not convert value to double: '" + val + "'";
 
   return dval;
@@ -1716,8 +1717,9 @@ float convertFloat(const string& val, struct param const* params, mstream& sout)
   else if( (val == "nan") || (val == "inf") )
     return params->missing_value_float;
 
-  float dval;
-  if(sscanf(val.c_str(), "%f", &dval) != 1)
+  char* end = nullptr;
+  const float dval = std::strtof(val.c_str(), &end);
+  if(end == val.c_str())
     throw "could not convert value to float: '" + val + "'";
 
   return dval;
