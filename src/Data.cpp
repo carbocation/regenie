@@ -3549,8 +3549,18 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   ArrayXb err_caught = ArrayXb::Constant(bs, false);
   const bool qt_phenotypes_have_complete_masks =
     (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
+  const bool use_fast_bgen_dosage =
+    (params.file_type == "bgen") && params.streamBGEN &&
+    (params.trait_mode == 0) && params.dosage_mode &&
+    (params.test_type == 0) && !params.build_mask &&
+    !params.af_cc && params.split_by_pheno && !params.htp_out &&
+    !params.w_interaction && !params.snp_set && !params.trait_set &&
+    !params.multiphen && !params.mcc_test && !params.joint_test &&
+    !params.getCorMat && !params.with_flip &&
+    !in_filters.ind_ignore.any() && in_filters.ind_in_analysis.all() &&
+    !in_filters.has_missing.any();
   const bool use_unscaled_dense_qt =
-    (params.file_type == "pgen") &&
+    ((params.file_type == "pgen") || use_fast_bgen_dosage) &&
     (params.trait_mode == 0) &&
     (params.test_type == 0) &&
     !params.skip_cov_res &&
@@ -3565,16 +3575,6 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     !params.htp_out &&
     !params.getCorMat &&
     (pheno_data.new_cov.cols() == params.ncov_analyzed);
-  const bool use_fast_bgen_dosage =
-    (params.file_type == "bgen") && params.streamBGEN &&
-    (params.trait_mode == 0) && params.dosage_mode &&
-    (params.test_type == 0) && !params.build_mask &&
-    !params.af_cc && params.split_by_pheno && !params.htp_out &&
-    !params.w_interaction && !params.snp_set && !params.trait_set &&
-    !params.multiphen && !params.mcc_test && !params.joint_test &&
-    !params.getCorMat && !params.with_flip &&
-    !in_filters.ind_ignore.any() && in_filters.ind_in_analysis.all() &&
-    !in_filters.has_missing.any();
   const int profile_threads = params.profile_step2 ?
     std::max(1, params.neff_threads) : 0;
   vector<double> thread_work_ms(profile_threads, 0);

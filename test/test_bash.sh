@@ -321,7 +321,9 @@ for ref_mode in default ref_first; do
     --covarFile ${mntpt}example/covariates.txt${fsuf} \
     --phenoFile ${mntpt}example/phenotype.txt \
     --bsize 200 \
+    --prop-zero-thr 1 \
     --ignore-pred \
+    --step2-profile \
     $ref_arg \
     --out ${mntpt}test/test_bin_out_bgen_qt_${ref_mode}_bgen"
   ./$regenie_bin $rgcmd
@@ -333,6 +335,12 @@ for ref_mode in default ref_first; do
     fi
   done
 done
+
+if ! grep -q ' algebraic_dense_qt_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_bgen_qt_default_bgen.log"
+then
+  print_custom_err "Step 2 BGEN algebraic dense-QT projection was not exercised."
+fi
 
 
 (( i++ ))
