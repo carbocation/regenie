@@ -191,6 +191,10 @@ elif [ "$(grep -c '^STEP2_PROFILE stage=' "${REGENIE_PATH}test/test_bin_out_firt
   print_custom_err "Step 2 profiling output is incomplete."
 elif ! grep -q '^STEP2_PROFILE version=1 mode=single_variant file_type=bgen trait=bt ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
   print_custom_err "Step 2 profiling header is missing."
+elif ! grep -q '^STEP2_PROFILE scope=bgen_parse ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 BGEN profiling output is missing."
+elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 variant profiling output is missing."
 elif ! grep -q '^STEP2_PROFILE_FINAL version=1 mode=single_variant ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
   print_custom_err "Step 2 final profiling output is missing."
 fi
@@ -233,6 +237,7 @@ rgcmd="--step 2 \
   --remove ${mntpt}example/fid_iid_to_remove.txt \
   --bsize 200 \
   --ignore-pred \
+  --step2-profile \
   --out ${mntpt}test/test_bin_out_pgen_qt_complete"
 
 ./$regenie_bin $rgcmd
@@ -242,6 +247,12 @@ for phenotype in Y1 Y2; do
     print_err
   fi
 done
+
+if ! grep -q '^STEP2_PROFILE scope=pgen_ingest ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN profiling output is missing."
+elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN variant profiling output is missing."
+fi
 
 
 (( i++ ))

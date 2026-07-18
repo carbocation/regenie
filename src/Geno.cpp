@@ -2480,20 +2480,24 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
 
 }
 
-void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible){
+void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible, Step2BgenParseProfile* profile){
 
   if( ((params->file_type == "bgen") && !params->streamBGEN) || params->file_type == "pgen")
     return;
 
   if(params->file_type == "bgen") // uncompress and extract the dosages
-    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_fast_path_eligible);
+    parseSnpfromBGEN(isnp, chrom, geno_block, insize, outsize, params,filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data, sout, bgen_fast_path_eligible, profile);
   else if(params->file_type == "bed") // extract hardcalls
     parseSnpfromBed(isnp, chrom, *geno_block, params, filters, masked_indivs, phenotypes_raw, infosnp, gblock, snp_data);
 
 }
 
 
-void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible){
+void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout, bool const bgen_fast_path_eligible, Step2BgenParseProfile* profile){
+
+  ScopedThreadWorkTimer thread_work_timer(
+    profile ? &profile->thread_work_ms : nullptr);
+  if(profile) profile->variants++;
 
   uint minploidy = 0, maxploidy = 0, phasing = 0, bits_prob = 0;
   uint16_t numberOfAlleles = 0 ;
@@ -2517,53 +2521,64 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
 
   // uncompress the block
   bool compress_fail;
-  if(params->zlib_compress){ // using zlib
-    compress_fail = !decompress_zlib_block(
-      &((*geno_block)[0]), insize - 4,
-      &(geno_block_uncompressed[0]), outsize);
-  } else { // using zstd
-    size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
-    //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
-    compress_fail = (dest_size != outsize);
+  {
+    ScopedThreadWorkTimer decompress_timer(
+      profile ? &profile->decompress_thread_ms : nullptr);
+    if(params->zlib_compress){ // using zlib
+      compress_fail = !decompress_zlib_block(
+        &((*geno_block)[0]), insize - 4,
+        &(geno_block_uncompressed[0]), outsize);
+    } else { // using zstd
+      size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
+      //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
+      compress_fail = (dest_size != outsize);
+    }
   }
   // check it was successful
   if( compress_fail )
     throw "failed to decompress genotype data block for variant: " + infosnp->ID;
 
-  // stream to uncompressed block
   uchar *buffer = &geno_block_uncompressed[0];
-  // sample size in file
-  std::memcpy(&nindivs, &(buffer[0]), 4);
-  assert( nindivs == filters->ind_ignore.size() );
-  buffer += 4;
-  // num alleles
-  std::memcpy(&numberOfAlleles, &(buffer[0]), 2);
-  assert( numberOfAlleles == 2 );
-  buffer += 2;
-  // ploidy
-  std::memcpy(&minploidy, &(buffer[0]), 1);
-  assert( minploidy == 2 );
-  buffer ++;
-  std::memcpy(&maxploidy, &(buffer[0]), 1);
-  assert( maxploidy == 2 );
-  buffer ++;
-
-  //to identify missing when getting dosages
   vector<uchar>& ploidy_n = workspace.ploidy;
-  ploidy_n.resize(nindivs);
-  std::memcpy(&(ploidy_n[0]), &(buffer[0]), nindivs);
-  buffer += nindivs;
+  {
+    ScopedThreadWorkTimer header_timer(
+      profile ? &profile->header_thread_ms : nullptr);
+    // sample size in file
+    std::memcpy(&nindivs, &(buffer[0]), 4);
+    assert( nindivs == filters->ind_ignore.size() );
+    buffer += 4;
+    // num alleles
+    std::memcpy(&numberOfAlleles, &(buffer[0]), 2);
+    assert( numberOfAlleles == 2 );
+    buffer += 2;
+    // ploidy
+    std::memcpy(&minploidy, &(buffer[0]), 1);
+    assert( minploidy == 2 );
+    buffer ++;
+    std::memcpy(&maxploidy, &(buffer[0]), 1);
+    assert( maxploidy == 2 );
+    buffer ++;
 
-  // phasing
-  std::memcpy(&phasing, &(buffer[0]), 1);
-  buffer++;
+    //to identify missing when getting dosages
+    ploidy_n.resize(nindivs);
+    std::memcpy(&(ploidy_n[0]), &(buffer[0]), nindivs);
+    buffer += nindivs;
 
-  // bits per probability
-  std::memcpy(&bits_prob, &(buffer[0]), 1);
-  buffer++;
+    // phasing
+    std::memcpy(&phasing, &(buffer[0]), 1);
+    buffer++;
+
+    // bits per probability
+    std::memcpy(&bits_prob, &(buffer[0]), 1);
+    buffer++;
+  }
 
   const bool use_dosage_lookup = use_fast_dosage_path &&
     (bits_prob == 8) && (phasing == 0);
+  if(profile) {
+    profile->fast_path_variants += use_fast_dosage_path;
+    profile->lookup_path_variants += use_dosage_lookup;
+  }
 
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
@@ -2573,7 +2588,10 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   // parse genotype probabilities block
   index = 0;
   bool requires_mean_imputation = false;
-  if(use_fast_dosage_path) {
+  {
+    ScopedThreadWorkTimer sample_decode_timer(
+      profile ? &profile->sample_decode_thread_ms : nullptr);
+    if(use_fast_dosage_path) {
     assert(nindivs == static_cast<uint32_t>(Geno.size()));
     if(use_dosage_lookup) {
       const Bgen8DosageLookup& lookup =
@@ -2626,8 +2644,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
         snp_data->ns1++;
       }
     }
-  } else {
-    for(size_t i = 0; i < nindivs; i++) {
+    } else {
+      for(size_t i = 0; i < nindivs; i++) {
 
     // skip samples that were ignored from the analysis
     if( filters->ind_ignore(i) ) {
@@ -2707,9 +2725,12 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
 
     }
       index++;
+      }
     }
   }
 
+  ScopedThreadWorkTimer finalize_timer(
+    profile ? &profile->finalize_thread_ms : nullptr);
   // check MAC
   if( params->test_mode){
     compute_mac(!non_par, mac, total, nmales, ncarriers, infosnp->MAC_fail_if_checked, infosnp->apply_diff_MAC_filter, snp_data, params);
@@ -2910,12 +2931,16 @@ void parseSnpfromBed(const int& isnp, const int &chrom, const vector<uchar>& bed
 
 
 // step 2
-void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info){
+void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile){
 
   int const bs = indices.size();
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
   const bool all_samples_in_analysis = filters->ind_in_analysis.all();
   const bool has_trait_missingness = filters->has_missing.any();
+  const int worker_count = std::max(1, params->neff_threads);
+  vector<double> thread_work_ms(profile ? worker_count : 0, 0);
+  vector<double> decode_thread_ms(profile ? worker_count : 0, 0);
+  vector<uint64_t> fast_path_variants(profile ? worker_count : 0, 0);
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -2927,6 +2952,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 #if defined(_OPENMP)
     thread_num = omp_get_thread_num();
 #endif
+    ScopedThreadWorkTimer thread_work_timer(
+      profile ? &thread_work_ms[thread_num] : nullptr);
 
     int hc, cur_index, lval, nmales, ncarriers = 0;
     double total, mac, mval, ival, eij2 = 0, sum_pos;
@@ -2953,15 +2980,21 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       !params->snp_set &&
       !params->trait_set &&
       !params->multiphen;
+    if(profile && use_fast_hardcall_path)
+      fast_path_variants[thread_num]++;
     bool requires_mean_imputation = true;
     if( params->dosage_mode ) eij2 = 0;
 
     // read genotype data
     cur_index = snp_info->offset;
-    if( params->dosage_mode )
-      pgr.Read(Geno.data(), Geno.size(), thread_num, cur_index, 1);
-    else
-      pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+    {
+      ScopedThreadWorkTimer decode_timer(
+        profile ? &decode_thread_ms[thread_num] : nullptr);
+      if( params->dosage_mode )
+        pgr.Read(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+      else
+        pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+    }
 
     if(use_fast_hardcall_path) {
       total = 0;
@@ -3148,6 +3181,16 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
 #if defined(_OPENMP)
   setNbThreads(params->threads);
 #endif
+
+  if(profile) {
+    profile->variants += bs;
+    profile->fast_path_variants += std::accumulate(
+      fast_path_variants.begin(), fast_path_variants.end(), uint64_t(0));
+    profile->thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    profile->decode_thread_ms += std::accumulate(
+      decode_thread_ms.begin(), decode_thread_ms.end(), 0.0);
+  }
 
   if(oob_err.any()) 
     throw "there is a variant in the block that has a value not in [0,2] or missing";

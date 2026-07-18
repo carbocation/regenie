@@ -84,6 +84,22 @@ double elapsed_ms(const ProfileClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
 }
 
+class ScopedProfileTimer {
+  public:
+    explicit ScopedProfileTimer(double* elapsed_ms)
+      : elapsed_ms_(elapsed_ms) {
+      if(elapsed_ms_) start_ = ProfileClock::now();
+    }
+
+    ~ScopedProfileTimer() {
+      if(elapsed_ms_) *elapsed_ms_ += elapsed_ms(start_);
+    }
+
+  private:
+    double* elapsed_ms_;
+    ProfileClock::time_point start_;
+};
+
 struct ProcessIoCounters {
   bool available = false;
   uint64_t logical_read_bytes = 0;
@@ -397,6 +413,101 @@ void Data::print_step2_profile() {
   print_stage("output", step2_profile.output_ms);
   print_stage("other", other_ms);
   print_stage("total", step2_profile.end_to_end_ms);
+
+  if(step2_pgen_read_profile.variants > 0) {
+    const double postdecode_ms = std::max(0.0,
+      step2_pgen_read_profile.thread_work_ms -
+      step2_pgen_read_profile.decode_thread_ms);
+    const double thread_denominator =
+      step2_pgen_read_profile.thread_work_ms > 0 ?
+      step2_pgen_read_profile.thread_work_ms : 1;
+    out << "STEP2_PROFILE scope=pgen_ingest"
+        << " variants=" << step2_pgen_read_profile.variants
+        << " fast_path_variants="
+        << step2_pgen_read_profile.fast_path_variants
+        << " thread_work_ms=" << step2_pgen_read_profile.thread_work_ms
+        << " decode_thread_ms=" << step2_pgen_read_profile.decode_thread_ms
+        << " postdecode_thread_ms=" << postdecode_ms
+        << " decode_percent=" <<
+          (100 * step2_pgen_read_profile.decode_thread_ms /
+            thread_denominator)
+        << " postdecode_percent=" <<
+          (100 * postdecode_ms / thread_denominator) << "\n";
+  }
+
+  if(step2_bgen_parse_profile.variants > 0) {
+    const double measured_thread_ms =
+      step2_bgen_parse_profile.decompress_thread_ms +
+      step2_bgen_parse_profile.header_thread_ms +
+      step2_bgen_parse_profile.sample_decode_thread_ms +
+      step2_bgen_parse_profile.finalize_thread_ms;
+    const double other_thread_ms = std::max(0.0,
+      step2_bgen_parse_profile.thread_work_ms - measured_thread_ms);
+    const double thread_denominator =
+      step2_bgen_parse_profile.thread_work_ms > 0 ?
+      step2_bgen_parse_profile.thread_work_ms : 1;
+    out << "STEP2_PROFILE scope=bgen_parse"
+        << " variants=" << step2_bgen_parse_profile.variants
+        << " fast_path_variants="
+        << step2_bgen_parse_profile.fast_path_variants
+        << " lookup_path_variants="
+        << step2_bgen_parse_profile.lookup_path_variants
+        << " thread_work_ms=" << step2_bgen_parse_profile.thread_work_ms
+        << " decompress_thread_ms="
+        << step2_bgen_parse_profile.decompress_thread_ms
+        << " header_thread_ms="
+        << step2_bgen_parse_profile.header_thread_ms
+        << " sample_decode_thread_ms="
+        << step2_bgen_parse_profile.sample_decode_thread_ms
+        << " finalize_thread_ms="
+        << step2_bgen_parse_profile.finalize_thread_ms
+        << " other_thread_ms=" << other_thread_ms
+        << " decompress_percent=" <<
+          (100 * step2_bgen_parse_profile.decompress_thread_ms /
+            thread_denominator)
+        << " sample_decode_percent=" <<
+          (100 * step2_bgen_parse_profile.sample_decode_thread_ms /
+            thread_denominator) << "\n";
+  }
+
+  if(step2_variant_compute_profile.variants > 0) {
+    const double measured_thread_ms =
+      step2_variant_compute_profile.parse_thread_ms +
+      step2_variant_compute_profile.preprocess_thread_ms +
+      step2_variant_compute_profile.score_thread_ms +
+      step2_variant_compute_profile.interaction_thread_ms;
+    const double other_thread_ms = std::max(0.0,
+      step2_variant_compute_profile.thread_work_ms - measured_thread_ms);
+    const double thread_denominator =
+      step2_variant_compute_profile.thread_work_ms > 0 ?
+      step2_variant_compute_profile.thread_work_ms : 1;
+    out << "STEP2_PROFILE scope=variant_compute"
+        << " variants=" << step2_variant_compute_profile.variants
+        << " sparse_variants="
+        << step2_variant_compute_profile.sparse_variants
+        << " unscaled_dense_qt_variants="
+        << step2_variant_compute_profile.unscaled_dense_qt_variants
+        << " shared_denom_dense_qt_variants="
+        << step2_variant_compute_profile.shared_denom_dense_qt_variants
+        << " thread_work_ms="
+        << step2_variant_compute_profile.thread_work_ms
+        << " parse_thread_ms="
+        << step2_variant_compute_profile.parse_thread_ms
+        << " preprocess_thread_ms="
+        << step2_variant_compute_profile.preprocess_thread_ms
+        << " score_thread_ms="
+        << step2_variant_compute_profile.score_thread_ms
+        << " interaction_thread_ms="
+        << step2_variant_compute_profile.interaction_thread_ms
+        << " other_thread_ms=" << other_thread_ms
+        << " preprocess_percent=" <<
+          (100 * step2_variant_compute_profile.preprocess_thread_ms /
+            thread_denominator)
+        << " score_percent=" <<
+          (100 * step2_variant_compute_profile.score_thread_ms /
+            thread_denominator) << "\n";
+  }
+
   out << "STEP2_PROFILE_FINAL version=1 mode=" << mode
       << " setup_ms=" << step2_profile.setup_ms
       << " prediction_read_ms=" << step2_profile.prediction_read_ms
@@ -3462,6 +3573,17 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     !params.getCorMat && !params.with_flip &&
     !in_filters.ind_ignore.any() && in_filters.ind_in_analysis.all() &&
     !in_filters.has_missing.any();
+  const int profile_threads = params.profile_step2 ?
+    std::max(1, params.neff_threads) : 0;
+  vector<double> thread_work_ms(profile_threads, 0);
+  vector<double> parse_thread_ms(profile_threads, 0);
+  vector<double> preprocess_thread_ms(profile_threads, 0);
+  vector<double> score_thread_ms(profile_threads, 0);
+  vector<double> interaction_thread_ms(profile_threads, 0);
+  vector<uint64_t> sparse_variants(profile_threads, 0);
+  vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
+  vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
+  vector<Step2BgenParseProfile> bgen_profiles(profile_threads);
 
     // start openmp for loop
 #if defined(_OPENMP)
@@ -3475,60 +3597,95 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       #if defined(_OPENMP)
       thread_num = omp_get_thread_num();
       #endif
+      ScopedProfileTimer thread_work_timer(params.profile_step2 ?
+        &thread_work_ms[thread_num] : nullptr);
 
       // to store variant information
-      if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") )
-        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout, use_fast_bgen_dosage);
+      {
+        ScopedProfileTimer parse_timer(params.profile_step2 ?
+          &parse_thread_ms[thread_num] : nullptr);
+        if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") )
+          parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout, use_fast_bgen_dosage, params.profile_step2 ? &bgen_profiles[thread_num] : nullptr);
+      }
 
       // to store variant information
-      reset_thread(&(Gblock.thread_data[thread_num]), params);
+      {
+        ScopedProfileTimer preprocess_timer(params.profile_step2 ?
+          &preprocess_thread_ms[thread_num] : nullptr);
+        reset_thread(&(Gblock.thread_data[thread_num]), params);
 
-      // check if g is sparse
-      if (!params.w_interaction)
-        check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
+        // check if g is sparse
+        if (!params.w_interaction)
+          check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
+        if(params.profile_step2 &&
+           Gblock.thread_data[thread_num].is_sparse)
+          sparse_variants[thread_num]++;
+      }
 
       if (params.w_interaction)
       {
+        ScopedProfileTimer interaction_timer(params.profile_step2 ?
+          &interaction_thread_ms[thread_num] : nullptr);
         if (params.interaction_snp && (snpinfo[snp_index].ID == in_filters.interaction_cov))
           block_info->skip_int = true;
         get_interaction_terms(isnp, thread_num, &pheno_data, &Gblock, block_info, nullHLM, &params, sout);
       }
 
-      // for QTs with non-sparse G: residualize and re-scale
-      if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse) {
-        if(use_unscaled_dense_qt) {
-          residualize_geno_unscaled(pheno_data.new_cov,
-            Gblock.Gmat.col(isnp), block_info, params);
-          Gblock.thread_data[thread_num].qt_unscaled = true;
-          Gblock.thread_data[thread_num].qt_complete_masks =
-            qt_phenotypes_have_complete_masks;
-        } else {
-          residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp),
-            block_info, params);
+      {
+        ScopedProfileTimer preprocess_timer(params.profile_step2 ?
+          &preprocess_thread_ms[thread_num] : nullptr);
+        // for QTs with non-sparse G: residualize and re-scale
+        if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse) {
+          if(use_unscaled_dense_qt) {
+            residualize_geno_unscaled(pheno_data.new_cov,
+              Gblock.Gmat.col(isnp), block_info, params);
+            Gblock.thread_data[thread_num].qt_unscaled = true;
+            Gblock.thread_data[thread_num].qt_complete_masks =
+              qt_phenotypes_have_complete_masks;
+          } else {
+            residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp),
+              block_info, params);
+          }
         }
+        else block_info->scale_fac = 1;
+
+        if(params.profile_step2 &&
+           Gblock.thread_data[thread_num].qt_unscaled) {
+          unscaled_dense_qt_variants[thread_num]++;
+          if(Gblock.thread_data[thread_num].qt_complete_masks)
+            shared_denom_dense_qt_variants[thread_num]++;
+        }
+
+        // skip SNP if fails filters
+        if (!block_info->ignored && !params.getCorMat)
+          reset_stats(block_info, params);
       }
-      else block_info->scale_fac = 1;
 
       // skip SNP if fails filters
       if (block_info->ignored || params.getCorMat)
         continue;
 
-      reset_stats(block_info, params);
-
       try
       {
-        // if ran vc tests, print out results before mask test
-        if ((block_info->sum_stats_vc.size() > 0) && !params.p_joint_only)
-          print_vc_sumstats(snp_index, "ADD", wgr_string, block_info, snpinfo, files, &params);
+        {
+          ScopedProfileTimer score_timer(params.profile_step2 ?
+            &score_thread_ms[thread_num] : nullptr);
+          // if ran vc tests, print out results before mask test
+          if ((block_info->sum_stats_vc.size() > 0) && !params.p_joint_only)
+            print_vc_sumstats(snp_index, "ADD", wgr_string, block_info, snpinfo, files, &params);
 
-        compute_score(isnp, snp_index, chrom, thread_num, test_string + params.condtl_suff, model_type + params.condtl_suff, res, p_sd_yres, params, pheno_data, Gblock, block_info, snpinfo, m_ests, firth_est, files, sout);
+          compute_score(isnp, snp_index, chrom, thread_num, test_string + params.condtl_suff, model_type + params.condtl_suff, res, p_sd_yres, params, pheno_data, Gblock, block_info, snpinfo, m_ests, firth_est, files, sout);
 
-        // for joint test, store logp
-        if (params.joint_test)
-          block_info->pval_log = Gblock.thread_data[thread_num].pval_log;
+          // for joint test, store logp
+          if (params.joint_test)
+            block_info->pval_log = Gblock.thread_data[thread_num].pval_log;
+        }
 
-        if (params.w_interaction)
+        if (params.w_interaction) {
+          ScopedProfileTimer interaction_timer(params.profile_step2 ?
+            &interaction_thread_ms[thread_num] : nullptr);
           apply_interaction_tests(snp_index, isnp, thread_num, res, p_sd_yres, model_type, test_string, &pheno_data, nullHLM, &in_filters, &files, &Gblock, block_info, snpinfo, &m_ests, &firth_est, &params, sout);
+        }
       } catch (...) {
         err_caught(isnp) = true;
         block_info->sum_stats[0] = boost::current_exception_diagnostic_information();
@@ -3539,6 +3696,44 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
 #if defined(_OPENMP)
   setNbThreads(params.threads);
 #endif
+
+  if(params.profile_step2) {
+    step2_variant_compute_profile.variants += bs;
+    step2_variant_compute_profile.sparse_variants += std::accumulate(
+      sparse_variants.begin(), sparse_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.unscaled_dense_qt_variants +=
+      std::accumulate(unscaled_dense_qt_variants.begin(),
+        unscaled_dense_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.shared_denom_dense_qt_variants +=
+      std::accumulate(shared_denom_dense_qt_variants.begin(),
+        shared_denom_dense_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.thread_work_ms += std::accumulate(
+      thread_work_ms.begin(), thread_work_ms.end(), 0.0);
+    step2_variant_compute_profile.parse_thread_ms += std::accumulate(
+      parse_thread_ms.begin(), parse_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.preprocess_thread_ms += std::accumulate(
+      preprocess_thread_ms.begin(), preprocess_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.score_thread_ms += std::accumulate(
+      score_thread_ms.begin(), score_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.interaction_thread_ms += std::accumulate(
+      interaction_thread_ms.begin(), interaction_thread_ms.end(), 0.0);
+    for(const Step2BgenParseProfile& profile : bgen_profiles) {
+      step2_bgen_parse_profile.variants += profile.variants;
+      step2_bgen_parse_profile.fast_path_variants +=
+        profile.fast_path_variants;
+      step2_bgen_parse_profile.lookup_path_variants +=
+        profile.lookup_path_variants;
+      step2_bgen_parse_profile.thread_work_ms += profile.thread_work_ms;
+      step2_bgen_parse_profile.decompress_thread_ms +=
+        profile.decompress_thread_ms;
+      step2_bgen_parse_profile.header_thread_ms +=
+        profile.header_thread_ms;
+      step2_bgen_parse_profile.sample_decode_thread_ms +=
+        profile.sample_decode_thread_ms;
+      step2_bgen_parse_profile.finalize_thread_ms +=
+        profile.finalize_thread_ms;
+    }
+  }
 
   // check no errors
   if(err_caught.any())
@@ -3952,7 +4147,10 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
   } else if((params.file_type == "bgen") && !params.streamBGEN) 
     readChunkFromBGENFileToG(indices, chrom, snpinfo, &params, Gblock.Gmat, Gblock.bgen, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, all_snps_info, sout);
   else if(params.file_type == "pgen") {
-    readChunkFromPGENFileToG(indices, chrom, &params, &in_filters, Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs, pheno_data.phenotypes_raw, snpinfo, all_snps_info);
+    readChunkFromPGENFileToG(indices, chrom, &params, &in_filters,
+      Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs,
+      pheno_data.phenotypes_raw, snpinfo, all_snps_info,
+      params.profile_step2 ? &step2_pgen_read_profile : nullptr);
   } else {
 
     snp_data_blocks.resize( n_snps );

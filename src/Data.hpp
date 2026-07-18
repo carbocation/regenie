@@ -156,6 +156,9 @@ class Data {
     Step1Profile step1_profile;
     Step1PgenReadProfile step1_pgen_read_profile;
     Step2Profile step2_profile;
+    Step2PgenReadProfile step2_pgen_read_profile;
+    Step2BgenParseProfile step2_bgen_parse_profile;
+    Step2VariantComputeProfile step2_variant_compute_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
 
     // function definitions
