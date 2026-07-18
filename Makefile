@@ -24,6 +24,7 @@ MKLROOT       =
 # directory containing libhts.a or libhts.so
 HTSLIB_PATH   =
 OPENBLAS_ROOT = 
+LIBDEFLATE_ROOT =
 STATIC       := 0
 
 ############
@@ -110,6 +111,18 @@ else ifneq ($(strip $(OPENBLAS_ROOT)),)
 	else
 	 DLIBS     += -Wl,-rpath=${OPENBLAS_ROOT}/lib/ -llapack -llapacke -lopenblas
 	endif
+ endif
+endif
+
+## Optional libdeflate acceleration for zlib-compressed BGEN
+ifneq ($(strip $(LIBDEFLATE_ROOT)),)
+ RGFLAGS     += -DWITH_LIBDEFLATE
+ INC         += -I${LIBDEFLATE_ROOT}/include
+ LPATHS      += -L${LIBDEFLATE_ROOT}/lib
+ ifeq ($(strip $(STATIC)),1)
+  SLIBS      += ${LIBDEFLATE_ROOT}/lib/libdeflate.a
+ else
+  DLIBS      += -ldeflate
  endif
 endif
 

@@ -36,11 +36,56 @@
 #include <numeric>
 #include <stdexcept>
 
+#if defined(WITH_LIBDEFLATE)
+#include <libdeflate.h>
+#endif
+
 using namespace std;
 using namespace Eigen;
 using namespace boost;
 
 namespace {
+
+#if defined(WITH_LIBDEFLATE)
+class ThreadLocalLibdeflateDecompressor {
+  public:
+    ThreadLocalLibdeflateDecompressor()
+      : decompressor_(libdeflate_alloc_decompressor()) {
+      if(!decompressor_)
+        throw std::runtime_error(
+          "failed to allocate a libdeflate decompressor");
+    }
+
+    ~ThreadLocalLibdeflateDecompressor() {
+      libdeflate_free_decompressor(decompressor_);
+    }
+
+    libdeflate_decompressor* get() const { return decompressor_; }
+
+  private:
+    libdeflate_decompressor* decompressor_;
+};
+#endif
+
+bool decompress_zlib_block(
+  const unsigned char* source, size_t source_size,
+  unsigned char* destination, size_t destination_size) {
+#if defined(WITH_LIBDEFLATE)
+  thread_local ThreadLocalLibdeflateDecompressor decompressor;
+  size_t actual_size = 0;
+  return libdeflate_zlib_decompress(
+      decompressor.get(), source, source_size,
+      destination, destination_size, &actual_size) ==
+      LIBDEFLATE_SUCCESS &&
+    actual_size == destination_size;
+#else
+  uLongf actual_size = static_cast<uLongf>(destination_size);
+  return uncompress(
+      destination, &actual_size, source,
+      static_cast<uLong>(source_size)) == Z_OK &&
+    actual_size == destination_size;
+#endif
+}
 
 class ScopedThreadWorkTimer {
   public:
@@ -1684,8 +1729,9 @@ void readChunkFromBGENFileToG_fast(const int& bs, const int& chrom, const uint32
     // uncompress the block
     bool compress_fail;
     if(params->zlib_compress){ // using zlib
-      uLongf dest_size = outsize[isnp];
-      compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize[isnp] - 4) != Z_OK) || (dest_size != outsize[isnp]);
+      compress_fail = !decompress_zlib_block(
+        &((*geno_block)[0]), insize[isnp] - 4,
+        &(geno_block_uncompressed[0]), outsize[isnp]);
     } else { // using zstd
       size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize[isnp], &((*geno_block)[0]), insize[isnp] - 4) ;
       compress_fail = (dest_size != outsize[isnp]);
@@ -2146,8 +2192,9 @@ void check_bgen(const string& bgen_file, string const& file_type, bool& zlib_com
   // uncompress the block
   //cout << "zlib:"<< std::boolalpha << zlib_compress ;
   if(zlib_compress){ // using zlib
-    uLongf dest_size = size_block_post_compression;
-    if( (uncompress( &(geno_block_uncompressed[0]), &dest_size, &geno_block[0], size_block - 4) != Z_OK) || (dest_size != size_block_post_compression) ){
+    if(!decompress_zlib_block(
+        &geno_block[0], size_block - 4,
+        &(geno_block_uncompressed[0]), size_block_post_compression)) {
       streamBGEN = false;
       return;
     }
@@ -2459,8 +2506,9 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   // uncompress the block
   bool compress_fail;
   if(params->zlib_compress){ // using zlib
-    uLongf dest_size = outsize;
-    compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize - 4) != Z_OK) || (dest_size != outsize);
+    compress_fail = !decompress_zlib_block(
+      &((*geno_block)[0]), insize - 4,
+      &(geno_block_uncompressed[0]), outsize);
   } else { // using zstd
     size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
     //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
@@ -4817,8 +4865,9 @@ void read_snps_bgen(bool const& mean_impute, map<string, uint64>& snp_map, Ref<M
     // uncompress the block
     bool compress_fail;
     if(ginfo.zlib_compress){ // using zlib
-      uLongf dest_size = outsize[isnp];
-      compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize[isnp] - 4) != Z_OK) || (dest_size != outsize[isnp]);
+      compress_fail = !decompress_zlib_block(
+        &((*geno_block)[0]), insize[isnp] - 4,
+        &(geno_block_uncompressed[0]), outsize[isnp]);
     } else { // using zstd
       size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize[isnp], &((*geno_block)[0]), insize[isnp] - 4) ;
       compress_fail = (dest_size != outsize[isnp]);

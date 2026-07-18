@@ -57,6 +57,13 @@ To use with Boost Iostreams and/or Intel MKL library,
 add the corresponding flags before the `cmake` command on line 3
 (e.g. `BGEN_PATH=<path_to_bgen_lib> HAS_BOOST_IOSTREAM=1 cmake ..`).
 
+If libdeflate development headers and its library are installed, CMake uses
+libdeflate automatically to decompress zlib-compressed BGEN blocks and falls
+back to zlib when it is unavailable. Use `-DREGENIE_LIBDEFLATE=ON` to require
+libdeflate or `-DREGENIE_LIBDEFLATE=OFF` to disable it. For a nonstandard
+installation, set `-DREGENIE_LIBDEFLATE_ROOT=<path>`. Makefile builds can opt
+in with `LIBDEFLATE_ROOT=<path>`.
+
 ### Experimental CUDA Step 1 backend
 
 The CUDA backend accelerates the FP64 matrix work in Step 1, including Gram

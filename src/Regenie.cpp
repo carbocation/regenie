@@ -128,6 +128,10 @@ void print_header(std::ostream& o){
   o << "Compiled with HTSlib.\n";
 #endif
 
+#if defined(WITH_LIBDEFLATE)
+  o << "Compiled with libdeflate BGEN decompression.\n";
+#endif
+
   // adding BLAS/LAPACK external routines
 #if defined(WITH_MKL)
   o << "Using Intel MKL with Eigen.\n";

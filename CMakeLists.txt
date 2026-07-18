@@ -29,6 +29,16 @@ include(CTest)
 option(REGENIE_WITH_CUDA "Build the experimental CUDA Step 1 compute backend" OFF)
 set(REGENIE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
   "CUDA architectures to compile for when REGENIE_WITH_CUDA=ON")
+set(REGENIE_LIBDEFLATE "AUTO" CACHE STRING
+  "libdeflate acceleration for zlib-compressed BGEN: AUTO, ON, or OFF")
+set_property(CACHE REGENIE_LIBDEFLATE PROPERTY STRINGS AUTO ON OFF)
+set(REGENIE_LIBDEFLATE_ROOT "" CACHE PATH
+  "Root of a libdeflate installation")
+string(TOUPPER "${REGENIE_LIBDEFLATE}" REGENIE_LIBDEFLATE)
+if(NOT REGENIE_LIBDEFLATE MATCHES "^(AUTO|ON|OFF)$")
+  message(FATAL_ERROR
+    "REGENIE_LIBDEFLATE must be one of: AUTO, ON, or OFF")
+endif()
 
 # specify the C++ standard
 set(CMAKE_CXX_STANDARD 11)
@@ -386,6 +396,35 @@ endif()
 
 # Other libraries
 find_library(ZLIB_LIBRARY libz.a z REQUIRED)
+add_library(regenie_libdeflate INTERFACE)
+if(NOT REGENIE_LIBDEFLATE STREQUAL "OFF")
+  set(libdeflate_hints
+    "${REGENIE_LIBDEFLATE_ROOT}" "$ENV{LIBDEFLATE_ROOT}")
+  find_path(REGENIE_LIBDEFLATE_INCLUDE_DIR libdeflate.h
+    HINTS ${libdeflate_hints} PATH_SUFFIXES include)
+  if(BUILD_STATIC)
+    find_library(REGENIE_LIBDEFLATE_LIBRARY NAMES libdeflate.a
+      HINTS ${libdeflate_hints} PATH_SUFFIXES lib lib64)
+  else()
+    find_library(REGENIE_LIBDEFLATE_LIBRARY NAMES deflate libdeflate
+      HINTS ${libdeflate_hints} PATH_SUFFIXES lib lib64)
+  endif()
+  if(REGENIE_LIBDEFLATE_INCLUDE_DIR AND REGENIE_LIBDEFLATE_LIBRARY)
+    target_include_directories(regenie_libdeflate INTERFACE
+      "${REGENIE_LIBDEFLATE_INCLUDE_DIR}")
+    target_link_libraries(regenie_libdeflate INTERFACE
+      "${REGENIE_LIBDEFLATE_LIBRARY}")
+    target_compile_definitions(regenie_libdeflate INTERFACE
+      WITH_LIBDEFLATE)
+    message(STATUS "Using libdeflate for zlib-compressed BGEN")
+  elseif(REGENIE_LIBDEFLATE STREQUAL "ON")
+    message(FATAL_ERROR
+      "libdeflate was not found. Set REGENIE_LIBDEFLATE_ROOT or "
+      "CMAKE_PREFIX_PATH, or use REGENIE_LIBDEFLATE=OFF.")
+  else()
+    message(STATUS "libdeflate not found; using zlib for compressed BGEN")
+  endif()
+endif()
 find_library(M_LIB m REQUIRED)
 find_library(DL_LIB dl REQUIRED)
 set(GFORTRAN_LIBRARIES "")
@@ -419,6 +458,7 @@ elseif("${UNAME_S}" STREQUAL "Darwin")
 endif()
 target_link_libraries(
   regenie PRIVATE
+  regenie_libdeflate
   ${ZLIB_LIBRARY} ${M_LIB} ${DL_LIB} ${PTHREAD_LIB}
   ${GFORTRAN_LIBRARIES}
 )
