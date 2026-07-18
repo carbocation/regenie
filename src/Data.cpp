@@ -497,6 +497,16 @@ void Data::print_step2_profile() {
         << step2_variant_compute_profile.shared_denom_dense_qt_variants
         << " algebraic_dense_qt_variants="
         << step2_variant_compute_profile.algebraic_dense_qt_variants
+        << " dense_qt_score_candidates="
+        << step2_variant_compute_profile.dense_qt_score_candidates
+        << " batched_dense_qt_blocks="
+        << step2_variant_compute_profile.batched_dense_qt_blocks
+        << " batched_dense_qt_variants="
+        << step2_variant_compute_profile.batched_dense_qt_variants
+        << " batched_dense_qt_columns="
+        << step2_variant_compute_profile.batched_dense_qt_columns
+        << " batched_dense_qt_ms="
+        << step2_variant_compute_profile.batched_dense_qt_ms
         << " thread_work_ms="
         << step2_variant_compute_profile.thread_work_ms
         << " parse_thread_ms="
@@ -3593,6 +3603,50 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> algebraic_dense_qt_variants(profile_threads, 0);
   vector<Step2BgenParseProfile> bgen_profiles(profile_threads);
+
+  // The per-variant score path is best for a small phenotype count, but it
+  // repeatedly streams every phenotype residual for large phenotype panels.
+  // Use one BLAS-3 crossproduct there so G and Y can be reused from cache.
+  // BGEN blocks are decoded inside the parallel loop and therefore are not
+  // eligible at this point.
+  Gblock.step2_qt_YtG_valid = false;
+  const bool batched_dense_qt_base_eligible =
+    use_unscaled_dense_qt && qt_phenotypes_have_complete_masks &&
+    (params.file_type == "pgen") && (params.n_pheno >= 16);
+  size_t dense_qt_score_candidates = 0;
+  if(batched_dense_qt_base_eligible) {
+    const double sparse_zero_threshold =
+      params.n_samples * params.prop_zero_thr;
+    for(const variant_block& variant : all_snps_info) {
+      if((variant.n_zero >= 0) &&
+         (variant.n_zero < sparse_zero_threshold))
+        dense_qt_score_candidates++;
+    }
+    if(params.profile_step2)
+      step2_variant_compute_profile.dense_qt_score_candidates +=
+        dense_qt_score_candidates;
+  }
+  // The multiplication includes every block column because gathering only
+  // dense columns would require another multi-gigabyte materialization. A
+  // majority gate therefore keeps mixed rare-variant blocks on the existing
+  // sparse/dense per-variant implementation.
+  const bool use_batched_dense_qt_score =
+    batched_dense_qt_base_eligible &&
+    (dense_qt_score_candidates * 2 >= bs);
+  if(use_batched_dense_qt_score) {
+    const ProfileClock::time_point batch_start = ProfileClock::now();
+    Gblock.step2_qt_YtG.noalias() =
+      res.transpose() * Gblock.Gmat.leftCols(bs);
+    Gblock.step2_qt_YtG_valid = true;
+    if(params.profile_step2) {
+      step2_variant_compute_profile.batched_dense_qt_blocks++;
+      step2_variant_compute_profile.batched_dense_qt_variants +=
+        dense_qt_score_candidates;
+      step2_variant_compute_profile.batched_dense_qt_columns += bs;
+      step2_variant_compute_profile.batched_dense_qt_ms +=
+        elapsed_ms(batch_start);
+    }
+  }
 
     // start openmp for loop
 #if defined(_OPENMP)

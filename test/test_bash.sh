@@ -262,6 +262,55 @@ fi
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
+# Batched PGEN quantitative scores for a larger phenotype panel
+p16_pheno="${REGENIE_PATH}test/test_bin_out_pgen_qt_p16.pheno"
+awk '
+  NR == 1 {
+    printf "FID IID"
+    for (i = 1; i <= 16; ++i) printf " Y%d", i
+    printf "\n"
+    next
+  }
+  {
+    printf "%s %s", $1, $2
+    for (i = 0; i < 16; ++i) printf " %s", $(3 + (i % 2))
+    printf "\n"
+  }
+' "${REGENIE_PATH}example/phenotype.txt" > "$p16_pheno"
+
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile $p16_pheno \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 1 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p16"
+
+./$regenie_bin $rgcmd
+
+if ! grep -q ' batched_dense_qt_blocks=5 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16.log"
+then
+  print_custom_err "Step 2 PGEN batched dense-QT scores were not exercised."
+fi
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_${phenotype}.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_${phenotype}.regenie"
+  then
+    print_err
+  fi
+done
+
+rm -f "$p16_pheno"
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
 # PGEN binary traits with phenotype-specific missingness
 for file_type in bed pgen; do
   rgcmd="--step 2 \

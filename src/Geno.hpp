@@ -112,6 +112,11 @@ struct Step2VariantComputeProfile {
   uint64_t unscaled_dense_qt_variants = 0;
   uint64_t shared_denom_dense_qt_variants = 0;
   uint64_t algebraic_dense_qt_variants = 0;
+  uint64_t dense_qt_score_candidates = 0;
+  uint64_t batched_dense_qt_blocks = 0;
+  uint64_t batched_dense_qt_variants = 0;
+  uint64_t batched_dense_qt_columns = 0;
+  double batched_dense_qt_ms = 0;
   double thread_work_ms = 0;
   double parse_thread_ms = 0;
   double preprocess_thread_ms = 0;
@@ -156,6 +161,9 @@ struct geno_block {
   BgenParser bgen;
   PgenReader pgr;
   Eigen::MatrixXd Gmat;
+  // Optional phenotype-by-variant score crossproducts for dense QT blocks.
+  Eigen::MatrixXd step2_qt_YtG;
+  bool step2_qt_YtG_valid = false;
   Eigen::MatrixXd snp_afs;
   std::vector<std::vector<double>> step1_pgen_worker_tiles;
   std::vector<unsigned char> step1_pgen_packed_hardcalls;
