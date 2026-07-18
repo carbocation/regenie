@@ -379,7 +379,12 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
     if(dt_thr->qt_unscaled) {
 
       const double genotype_scale = gsc / block_info->scale_fac;
-      num = (yres.transpose() * Geno.matrix()).array() * genotype_scale;
+      if(dt_thr->qt_algebraic_projection) {
+        num = (yres.transpose() * Geno.matrix() -
+          pheno_data.YtX * dt_thr->qt_XtG).array() * genotype_scale;
+      } else {
+        num = (yres.transpose() * Geno.matrix()).array() * genotype_scale;
+      }
 
       if(dt_thr->qt_complete_masks) {
         const double residual_dof =

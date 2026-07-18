@@ -108,6 +108,7 @@ struct Step2VariantComputeProfile {
   uint64_t sparse_variants = 0;
   uint64_t unscaled_dense_qt_variants = 0;
   uint64_t shared_denom_dense_qt_variants = 0;
+  uint64_t algebraic_dense_qt_variants = 0;
   double thread_work_ms = 0;
   double parse_thread_ms = 0;
   double preprocess_thread_ms = 0;
@@ -130,6 +131,8 @@ struct data_thread {
   Eigen::ArrayXd bhat;
   Eigen::ArrayXd se_b;
   Eigen::ArrayXd skat_var;
+  // Covariate crossproducts for the algebraic dense-QT projection path.
+  Eigen::VectorXd qt_XtG;
   // for spa
   bool pos_score;
   double val_a, val_b, val_c, val_d; 
@@ -142,6 +145,7 @@ struct data_thread {
   // QT residual is retained on its raw scale for the dense score path.
   bool qt_unscaled = false;
   bool qt_complete_masks = false;
+  bool qt_algebraic_projection = false;
 };
 
 struct geno_block {
@@ -268,6 +272,7 @@ void mean_impute_g(const double&,Eigen::Ref<Eigen::ArrayXd>,const Eigen::Ref<con
 void residualize_geno(int const&,int const&,variant_block*,bool const&,const Eigen::Ref<const Eigen::MatrixXd>&,struct geno_block*,struct param const*);
 void residualize_geno(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
 void residualize_geno_unscaled(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
+bool prepare_geno_qt_algebraic(const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const Eigen::VectorXd>&,variant_block*,data_thread*,struct param const&);
 void writeSnplist(std::string const&,int const&,int const&,std::vector<snp> const&,mstream&);
 
 bool in_chrList(const int&,struct filter const*);

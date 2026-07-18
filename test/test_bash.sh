@@ -236,6 +236,7 @@ rgcmd="--step 2 \
   --phenoFile ${mntpt}example/phenotype.txt \
   --remove ${mntpt}example/fid_iid_to_remove.txt \
   --bsize 200 \
+  --prop-zero-thr 1 \
   --ignore-pred \
   --step2-profile \
   --out ${mntpt}test/test_bin_out_pgen_qt_complete"
@@ -252,6 +253,8 @@ if ! grep -q '^STEP2_PROFILE scope=pgen_ingest ' "${REGENIE_PATH}test/test_bin_o
   print_custom_err "Step 2 PGEN profiling output is missing."
 elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
   print_custom_err "Step 2 PGEN variant profiling output is missing."
+elif ! grep -q ' algebraic_dense_qt_variants=1000 ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN algebraic dense-QT projection was not exercised."
 fi
 
 

@@ -3391,6 +3391,7 @@ void initialize_thread_data(vector<data_thread>& all_snp_data, struct param cons
       snp_data->denum = ArrayXd::Zero(params.n_pheno);
     }
     snp_data->skat_var = ArrayXd::Zero(params.n_pheno);
+    snp_data->qt_XtG = VectorXd::Zero(params.ncov_analyzed);
   }
 }
 
@@ -3410,6 +3411,7 @@ void reset_thread(data_thread* snp_data, struct param const& params){
     snp_data->is_sparse = false;
     snp_data->qt_unscaled = false;
     snp_data->qt_complete_masks = false;
+    snp_data->qt_algebraic_projection = false;
     snp_data->fastSPA = params.use_SPA && (!params.build_mask || (params.mask_rule_max || params.mask_rule_comphet));
 }
 
@@ -3772,6 +3774,38 @@ void residualize_geno_unscaled(const Ref<const MatrixXd>& X,
 
   if(snp_data->scale_fac < params.numtol)
     snp_data->ignored = true;
+
+}
+
+bool prepare_geno_qt_algebraic(const Ref<const MatrixXd>& X,
+    const Ref<const VectorXd>& Graw, variant_block* snp_data,
+    data_thread* thread_data, struct param const& params){
+
+  if(snp_data->ignored) return false;
+
+  // X is an orthonormal covariate basis. Retain G on its decoded scale and
+  // represent its projection using only X'G. This avoids materializing the
+  // N-sample residual vector while preserving the exact score-test algebra.
+  thread_data->qt_XtG.noalias() = X.transpose() * Graw;
+  const double raw_norm_sq = Graw.squaredNorm();
+  const double residual_norm_sq =
+    raw_norm_sq - thread_data->qt_XtG.squaredNorm();
+  const double residual_dof = params.n_analyzed - X.cols();
+
+  // Near-collinear variants are rare and numerically delicate. Let the
+  // materialized implementation handle them rather than subtracting two
+  // nearly equal squared norms here.
+  const double stability_floor = std::max(
+    params.numtol * params.numtol * residual_dof,
+    raw_norm_sq * 64 * std::numeric_limits<double>::epsilon());
+  if(residual_norm_sq <= stability_floor)
+    return false;
+
+  snp_data->scale_fac = sqrt(residual_norm_sq / residual_dof);
+  thread_data->qt_unscaled = true;
+  thread_data->qt_complete_masks = true;
+  thread_data->qt_algebraic_projection = true;
+  return true;
 
 }
 

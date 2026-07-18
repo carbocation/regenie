@@ -489,6 +489,8 @@ void Data::print_step2_profile() {
         << step2_variant_compute_profile.unscaled_dense_qt_variants
         << " shared_denom_dense_qt_variants="
         << step2_variant_compute_profile.shared_denom_dense_qt_variants
+        << " algebraic_dense_qt_variants="
+        << step2_variant_compute_profile.algebraic_dense_qt_variants
         << " thread_work_ms="
         << step2_variant_compute_profile.thread_work_ms
         << " parse_thread_ms="
@@ -3583,6 +3585,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<uint64_t> sparse_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
+  vector<uint64_t> algebraic_dense_qt_variants(profile_threads, 0);
   vector<Step2BgenParseProfile> bgen_profiles(profile_threads);
 
     // start openmp for loop
@@ -3637,11 +3640,20 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         // for QTs with non-sparse G: residualize and re-scale
         if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse) {
           if(use_unscaled_dense_qt) {
-            residualize_geno_unscaled(pheno_data.new_cov,
-              Gblock.Gmat.col(isnp), block_info, params);
-            Gblock.thread_data[thread_num].qt_unscaled = true;
-            Gblock.thread_data[thread_num].qt_complete_masks =
-              qt_phenotypes_have_complete_masks;
+            const bool used_algebraic_projection =
+              qt_phenotypes_have_complete_masks &&
+              prepare_geno_qt_algebraic(pheno_data.new_cov,
+                Gblock.Gmat.col(isnp), block_info,
+                &Gblock.thread_data[thread_num], params);
+            if(!used_algebraic_projection) {
+              residualize_geno_unscaled(pheno_data.new_cov,
+                Gblock.Gmat.col(isnp), block_info, params);
+              Gblock.thread_data[thread_num].qt_unscaled = true;
+              Gblock.thread_data[thread_num].qt_complete_masks =
+                qt_phenotypes_have_complete_masks;
+            } else if(params.profile_step2) {
+              algebraic_dense_qt_variants[thread_num]++;
+            }
           } else {
             residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp),
               block_info, params);
@@ -3707,6 +3719,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.shared_denom_dense_qt_variants +=
       std::accumulate(shared_denom_dense_qt_variants.begin(),
         shared_denom_dense_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.algebraic_dense_qt_variants +=
+      std::accumulate(algebraic_dense_qt_variants.begin(),
+        algebraic_dense_qt_variants.end(), uint64_t(0));
     step2_variant_compute_profile.thread_work_ms += std::accumulate(
       thread_work_ms.begin(), thread_work_ms.end(), 0.0);
     step2_variant_compute_profile.parse_thread_ms += std::accumulate(
