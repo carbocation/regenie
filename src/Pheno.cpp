@@ -633,6 +633,7 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
   MatrixXd inter_cov_matrix;
   string line;
   std::vector< string > tmp_str_vec, covar_names;
+  std::vector<TextToken> row_tokens;
   std::vector< std::map<std::string,int> > categories;
   findID person;
   Files fClass;
@@ -702,12 +703,14 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
 
   // read in data
   while( fClass.readLine(line) ){
-    string_split(line,"\t ",tmp_str_vec);
+    split_text_tokens(line,"\t ",row_tokens);
 
-    if( (int)tmp_str_vec.size() != (keep_cols.size()+2) )
+    if( (int)row_tokens.size() != (keep_cols.size()+2) )
       throw "incorrectly formatted covariate file.";
 
-    person = getIndivIndex(tmp_str_vec[0], tmp_str_vec[1], params, sout);
+    const string fid = token_string(row_tokens[0]);
+    const string iid = token_string(row_tokens[1]);
+    person = getIndivIndex(fid, iid, params, sout);
     if(!person.is_found) continue;
 
     indiv_index = person.index;
@@ -716,7 +719,7 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
     if( !ind_in_cov_and_geno(indiv_index) )
       ind_in_cov_and_geno(indiv_index) = true;
     else 
-      throw "individual appears more than once in covariate file: FID=" + tmp_str_vec[0] + " IID=" + tmp_str_vec[1];
+      throw "individual appears more than once in covariate file: FID=" + fid + " IID=" + iid;
 
     // read covariate data and check for missing values
     for(int i_cov = 0, i_col = 0, i_cat = 0, j = 0; j < keep_cols.size(); j++) {
@@ -727,11 +730,11 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
       if(params->w_interaction && !params->interaction_snp && !params->interaction_prs && (covar_names[i_cov] == filters->interaction_cov)){
 
         if( filters->cov_colKeep_names[ covar_names[i_cov] ] ) // if quantitative
-          inter_cov_column(indiv_index) = convertDouble(tmp_str_vec[2+j], params, sout);
+          inter_cov_column(indiv_index) = convert_token_double(row_tokens[2+j], params);
         else{ // set null category if interaction test and base level is specified
           if( (categories[i_cat].size() == 0) && filters->interaction_cov_null_level.size() > 0 )
             categories[i_cat][filters->interaction_cov_null_level] = 0;
-          inter_cov_column(indiv_index) = convertNumLevel(tmp_str_vec[2+j], categories[i_cat++], params, sout);
+          inter_cov_column(indiv_index) = convertNumLevel(token_string(row_tokens[2+j]), categories[i_cat++], params, sout);
         }
 
         if( inter_cov_column(indiv_index) == params->missing_value_double ) { // ignore individual
@@ -742,9 +745,9 @@ void covariate_read(struct param* params, struct in_files* files, struct filter*
       } else { // regular covariate
 
         if( filters->cov_colKeep_names[ covar_names[i_cov] ] ) // quantitative
-          pheno_data->new_cov(indiv_index, 1 + i_col) = convertDouble(tmp_str_vec[2+j], params, sout);
+          pheno_data->new_cov(indiv_index, 1 + i_col) = convert_token_double(row_tokens[2+j], params);
         else // categorical so convert to numerical
-          pheno_data->new_cov(indiv_index, 1 + i_col) = convertNumLevel(tmp_str_vec[2+j], categories[i_cat++], params, sout);
+          pheno_data->new_cov(indiv_index, 1 + i_col) = convertNumLevel(token_string(row_tokens[2+j]), categories[i_cat++], params, sout);
 
         if( pheno_data->new_cov(indiv_index, 1 + i_col) == params->missing_value_double ) { // ignore individual
           ind_in_cov_and_geno(indiv_index) = false;
