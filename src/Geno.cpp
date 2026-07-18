@@ -87,6 +87,16 @@ bool decompress_zlib_block(
 #endif
 }
 
+struct BgenDecodeWorkspace {
+  std::vector<unsigned char> uncompressed_block;
+  std::vector<unsigned char> ploidy;
+};
+
+BgenDecodeWorkspace& bgen_decode_workspace() {
+  thread_local BgenDecodeWorkspace workspace;
+  return workspace;
+}
+
 class ScopedThreadWorkTimer {
   public:
     explicit ScopedThreadWorkTimer(double* elapsed_ms)
@@ -2499,8 +2509,10 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   // reset variant info
   prep_snp_stats(snp_data, params);
 
-  // set genotype data block
-  vector < uchar > geno_block_uncompressed;
+  // Reuse the largest buffers seen by each worker instead of allocating them
+  // once per variant.
+  BgenDecodeWorkspace& workspace = bgen_decode_workspace();
+  vector<uchar>& geno_block_uncompressed = workspace.uncompressed_block;
   geno_block_uncompressed.resize(outsize);
 
   // uncompress the block
@@ -2537,8 +2549,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   buffer ++;
 
   //to identify missing when getting dosages
-  vector < uchar > ploidy_n;
-  ploidy_n.resize( nindivs );
+  vector<uchar>& ploidy_n = workspace.ploidy;
+  ploidy_n.resize(nindivs);
   std::memcpy(&(ploidy_n[0]), &(buffer[0]), nindivs);
   buffer += nindivs;
 
