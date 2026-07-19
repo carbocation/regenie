@@ -328,6 +328,10 @@ if ! grep -q ' shared_denom_sparse_qt_variants=1000 ' \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
 then
   print_custom_err "Step 2 PGEN shared sparse-QT denominator was not exercised."
+elif ! grep -q ' packed_sparse_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
+then
+  print_custom_err "Step 2 packed PGEN sparse-vector construction was not exercised."
 fi
 
 for phenotype in Y1 Y2; do

@@ -517,6 +517,8 @@ void Data::print_step2_profile() {
         << " variants=" << step2_variant_compute_profile.variants
         << " sparse_variants="
         << step2_variant_compute_profile.sparse_variants
+        << " packed_sparse_variants="
+        << step2_variant_compute_profile.packed_sparse_variants
         << " shared_denom_sparse_qt_variants="
         << step2_variant_compute_profile.shared_denom_sparse_qt_variants
         << " rowmajor_sparse_qt_variants="
@@ -3704,6 +3706,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<double> dense_score_thread_ms(profile_threads, 0);
   vector<double> interaction_thread_ms(profile_threads, 0);
   vector<uint64_t> sparse_variants(profile_threads, 0);
+  vector<uint64_t> packed_sparse_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> rowmajor_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
@@ -3792,6 +3795,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
             (params.trait_mode == 0) && qt_phenotypes_have_complete_masks;
           if(params.profile_step2) {
             sparse_variants[thread_num]++;
+            if(Gblock.thread_data[thread_num].sparse_from_packed)
+              packed_sparse_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].qt_complete_masks)
               shared_denom_sparse_qt_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].qt_complete_masks &&
@@ -3893,6 +3898,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.variants += bs;
     step2_variant_compute_profile.sparse_variants += std::accumulate(
       sparse_variants.begin(), sparse_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.packed_sparse_variants +=
+      std::accumulate(packed_sparse_variants.begin(),
+        packed_sparse_variants.end(), uint64_t(0));
     step2_variant_compute_profile.shared_denom_sparse_qt_variants +=
       std::accumulate(shared_denom_sparse_qt_variants.begin(),
         shared_denom_sparse_qt_variants.end(), uint64_t(0));
@@ -4355,7 +4363,8 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
     readChunkFromPGENFileToG(indices, chrom, &params, &in_filters,
       Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs,
       pheno_data.phenotypes_raw, snpinfo, all_snps_info,
-      params.profile_step2 ? &step2_pgen_read_profile : nullptr);
+      params.profile_step2 ? &step2_pgen_read_profile : nullptr,
+      &Gblock.step2_pgen_sparse_hardcalls);
   } else {
 
     snp_data_blocks.resize( n_snps );
