@@ -41,6 +41,8 @@
 #include "Data.hpp"
 #include "MCC.hpp"
 
+#include <array>
+
 using namespace std;
 using namespace Eigen;
 using namespace boost;
@@ -340,6 +342,31 @@ void compute_score_qt_mcc(int const& isnp, int const& snp_index, int const& thre
 
 }
 // score test stat for QT
+struct PackedSparseQtDecodeEntry {
+  unsigned char count = 0;
+  std::array<unsigned char, 4> offsets{};
+  std::array<unsigned char, 4> codes{};
+};
+
+static const std::array<PackedSparseQtDecodeEntry, 256>&
+packed_sparse_qt_decode_lookup() {
+  static const std::array<PackedSparseQtDecodeEntry, 256> lookup = [] {
+    std::array<PackedSparseQtDecodeEntry, 256> entries{};
+    for(unsigned int byte = 0; byte < entries.size(); ++byte) {
+      PackedSparseQtDecodeEntry& entry = entries[byte];
+      for(unsigned int offset = 0; offset < 4; ++offset) {
+        const unsigned int code = (byte >> (2 * offset)) & 3;
+        if(code == 0) continue;
+        entry.offsets[entry.count] = offset;
+        entry.codes[entry.count] = code;
+        entry.count++;
+      }
+    }
+    return entries;
+  }();
+  return lookup;
+}
+
 static void accumulate_packed_sparse_qt(
     const int isnp,
     const Ref<const MatrixXd>& yres,
@@ -380,16 +407,16 @@ static void accumulate_packed_sparse_qt(
     num(0) += genotype * yres(sample, 0);
   };
 
+  const auto& decode_lookup = packed_sparse_qt_decode_lookup();
   const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
   for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
     const unsigned char packed_byte = packed[byte_index];
     if(packed_byte == 0) continue;
+    const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
     const Eigen::Index first_sample = 4 * byte_index;
-    for(unsigned int offset = 0; offset < 4; ++offset) {
-      const unsigned int code =
-        (packed_byte >> (2 * offset)) & 3;
-      if(code != 0) accumulate_sample(first_sample + offset, code);
-    }
+    for(unsigned int carrier = 0; carrier < entry.count; ++carrier)
+      accumulate_sample(first_sample + entry.offsets[carrier],
+        entry.codes[carrier]);
   }
   if(sample_count % 4) {
     const unsigned char packed_byte = packed[full_bytes];
