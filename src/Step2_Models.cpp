@@ -353,6 +353,9 @@ static void accumulate_packed_sparse_qt(
   const double missing_mean = gblock.step2_pgen_sparse_means[isnp];
   const Eigen::Index sample_count = yres.rows();
   const int covariate_count = pheno_data.new_cov.cols();
+  const bool intercept_only = covariate_count == 1;
+  const double intercept_value = intercept_only ?
+    pheno_data.new_cov(0, 0) : 0;
 
   if(yres.cols() != 1)
     throw "packed sparse QT scoring requires one phenotype";
@@ -367,9 +370,13 @@ static void accumulate_packed_sparse_qt(
       static_cast<double>(code);
     if(genotype == 0) return;
     squared_norm += genotype * genotype;
-    for(int covariate = 0; covariate < covariate_count; ++covariate)
-      XtG(covariate) +=
-        genotype * pheno_data.new_cov(sample, covariate);
+    if(intercept_only) {
+      XtG(0) += genotype * intercept_value;
+    } else {
+      for(int covariate = 0; covariate < covariate_count; ++covariate)
+        XtG(covariate) +=
+          genotype * pheno_data.new_cov(sample, covariate);
+    }
     num(0) += genotype * yres(sample, 0);
   };
 

@@ -293,6 +293,32 @@ then
   print_err
 fi
 
+# Exercise the intercept-only specialization independently of the generic
+# multi-covariate direct packed path above.
+for representation in dense packed; do
+  prop_zero_thr=1
+  if [ "$representation" = "packed" ]; then
+    prop_zero_thr=0
+  fi
+  rgcmd="--step 2 \
+    --pgen ${mntpt}example/example \
+    --phenoFile ${mntpt}example/phenotype.txt \
+    --phenoColList Y1 \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --prop-zero-thr $prop_zero_thr \
+    --ignore-pred \
+    --out ${mntpt}test/test_bin_out_pgen_qt_p1_intercept_${representation}"
+  ./$regenie_bin $rgcmd
+done
+
+if ! cmp --silent \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_dense_Y1.regenie" \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_packed_Y1.regenie"
+then
+  print_err
+fi
+
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
