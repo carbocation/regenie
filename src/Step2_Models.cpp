@@ -435,12 +435,18 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
         num = yres.transpose() * dt_thr->Gsparse - pheno_data.YtX * XtG; // P x 1 
         double XtG_ss = XtG.squaredNorm();
         denum_arr.resize(params.n_pheno);
-        for (int ph = 0; ph < params.n_pheno; ph++) {
-          SpVec Gm = dt_thr->Gsparse.cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>()); // N x 1
-          VectorXd XtGm = pheno_data.new_cov.transpose() * Gm;
-          denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + XtG_ss; // last term is an approximation assuming X'X is same for all traits (=I)
-          //VectorXd vm = (pheno_data.new_cov * XtG).cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>());
-          //denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + vm.squaredNorm(); // correct callculation but more expensive
+        if(dt_thr->qt_complete_masks) {
+          const double shared_denum = dt_thr->Gsparse.squaredNorm() -
+            2 * XtG.dot(XtG) + XtG_ss;
+          denum_arr.setConstant(shared_denum);
+        } else {
+          for (int ph = 0; ph < params.n_pheno; ph++) {
+            SpVec Gm = dt_thr->Gsparse.cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>()); // N x 1
+            VectorXd XtGm = pheno_data.new_cov.transpose() * Gm;
+            denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + XtG_ss; // last term is an approximation assuming X'X is same for all traits (=I)
+            //VectorXd vm = (pheno_data.new_cov * XtG).cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>());
+            //denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + vm.squaredNorm(); // correct callculation but more expensive
+          }
         }
       } else {
         num = (yres.transpose() * Geno.matrix()).array() * gsc;

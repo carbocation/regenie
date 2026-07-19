@@ -308,6 +308,37 @@ for phenotype in Y1 Y2; do
   fi
 done
 
+# Force the same complete-mask phenotype panel through the sparse genotype
+# path. Its shared denominator must be computed once per variant rather than
+# rebuilt independently for every phenotype.
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile $p16_pheno \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 0 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p16_sparse"
+
+./$regenie_bin $rgcmd
+
+if ! grep -q ' shared_denom_sparse_qt_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
+then
+  print_custom_err "Step 2 PGEN shared sparse-QT denominator was not exercised."
+fi
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_${phenotype}.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse_${phenotype}.regenie"
+  then
+    print_err
+  fi
+done
+
 rm -f "$p16_pheno"
 
 

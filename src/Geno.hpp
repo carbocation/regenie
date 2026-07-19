@@ -109,6 +109,7 @@ struct Step2BgenParseProfile {
 struct Step2VariantComputeProfile {
   uint64_t variants = 0;
   uint64_t sparse_variants = 0;
+  uint64_t shared_denom_sparse_qt_variants = 0;
   uint64_t unscaled_dense_qt_variants = 0;
   uint64_t shared_denom_dense_qt_variants = 0;
   uint64_t algebraic_dense_qt_variants = 0;

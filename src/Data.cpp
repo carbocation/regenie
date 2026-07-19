@@ -511,6 +511,8 @@ void Data::print_step2_profile() {
         << " variants=" << step2_variant_compute_profile.variants
         << " sparse_variants="
         << step2_variant_compute_profile.sparse_variants
+        << " shared_denom_sparse_qt_variants="
+        << step2_variant_compute_profile.shared_denom_sparse_qt_variants
         << " unscaled_dense_qt_variants="
         << step2_variant_compute_profile.unscaled_dense_qt_variants
         << " shared_denom_dense_qt_variants="
@@ -3649,6 +3651,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<double> score_thread_ms(profile_threads, 0);
   vector<double> interaction_thread_ms(profile_threads, 0);
   vector<uint64_t> sparse_variants(profile_threads, 0);
+  vector<uint64_t> shared_denom_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> algebraic_dense_qt_variants(profile_threads, 0);
@@ -3730,9 +3733,15 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         // check if g is sparse
         if (!params.w_interaction)
           check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
-        if(params.profile_step2 &&
-           Gblock.thread_data[thread_num].is_sparse)
-          sparse_variants[thread_num]++;
+        if(Gblock.thread_data[thread_num].is_sparse) {
+          Gblock.thread_data[thread_num].qt_complete_masks =
+            (params.trait_mode == 0) && qt_phenotypes_have_complete_masks;
+          if(params.profile_step2) {
+            sparse_variants[thread_num]++;
+            if(Gblock.thread_data[thread_num].qt_complete_masks)
+              shared_denom_sparse_qt_variants[thread_num]++;
+          }
+        }
       }
 
       if (params.w_interaction)
@@ -3823,6 +3832,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.variants += bs;
     step2_variant_compute_profile.sparse_variants += std::accumulate(
       sparse_variants.begin(), sparse_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.shared_denom_sparse_qt_variants +=
+      std::accumulate(shared_denom_sparse_qt_variants.begin(),
+        shared_denom_sparse_qt_variants.end(), uint64_t(0));
     step2_variant_compute_profile.unscaled_dense_qt_variants +=
       std::accumulate(unscaled_dense_qt_variants.begin(),
         unscaled_dense_qt_variants.end(), uint64_t(0));
