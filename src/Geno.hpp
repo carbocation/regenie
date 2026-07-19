@@ -177,6 +177,11 @@ struct geno_block {
   std::vector<double> step2_pgen_packed_means;
   std::vector<unsigned char> step2_pgen_packed_unexpanded;
   bool step2_pgen_direct_qt_enabled = false;
+  // Covariates followed by the one phenotype residual, contiguous by sample,
+  // for cache-friendly direct packed scoring.
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    step2_pgen_direct_qt_terms;
+  bool step2_pgen_direct_qt_terms_valid = false;
   // Optional phenotype-by-variant score crossproducts for dense QT blocks.
   Eigen::MatrixXd step2_qt_YtG;
   bool step2_qt_YtG_valid = false;

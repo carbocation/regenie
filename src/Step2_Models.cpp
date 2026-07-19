@@ -381,6 +381,8 @@ static void accumulate_packed_qt(
   const Eigen::Index sample_count = yres.rows();
   const int covariate_count = pheno_data.new_cov.cols();
   const bool intercept_only = covariate_count == 1;
+  const bool use_row_major_terms =
+    gblock.step2_pgen_direct_qt_terms_valid;
   const double intercept_value = intercept_only ?
     pheno_data.new_cov(0, 0) : 0;
 
@@ -400,12 +402,19 @@ static void accumulate_packed_qt(
     squared_norm += genotype * genotype;
     if(intercept_only) {
       genotype_sum += genotype;
+      num(0) += genotype * yres(sample, 0);
+    } else if(use_row_major_terms) {
+      const double* terms =
+        &gblock.step2_pgen_direct_qt_terms(sample, 0);
+      for(int covariate = 0; covariate < covariate_count; ++covariate)
+        XtG(covariate) += genotype * terms[covariate];
+      num(0) += genotype * terms[covariate_count];
     } else {
       for(int covariate = 0; covariate < covariate_count; ++covariate)
         XtG(covariate) +=
           genotype * pheno_data.new_cov(sample, covariate);
+      num(0) += genotype * yres(sample, 0);
     }
-    num(0) += genotype * yres(sample, 0);
   };
 
   const auto& decode_lookup = packed_sparse_qt_decode_lookup();

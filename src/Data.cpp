@@ -414,10 +414,13 @@ void Data::print_step2_profile() {
   print_stage("other", other_ms);
   print_stage("total", step2_profile.end_to_end_ms);
 
-  if(step2_profile.qt_sparse_residual_layout_ms > 0) {
+  if(step2_profile.qt_sparse_residual_layout_ms > 0 ||
+     step2_profile.qt_packed_direct_layout_ms > 0) {
     out << "STEP2_PROFILE scope=qt_score_layout"
         << " sparse_residual_layout_ms="
-        << step2_profile.qt_sparse_residual_layout_ms << "\n";
+        << step2_profile.qt_sparse_residual_layout_ms
+        << " packed_direct_layout_ms="
+        << step2_profile.qt_packed_direct_layout_ms << "\n";
   }
 
   const double measured_setup_ms =
@@ -3579,6 +3582,30 @@ void Data::compute_res(){
     step2_qt_sparse_base_eligible && (params.n_pheno >= 16);
   Gblock.step2_pgen_direct_qt_enabled =
     step2_qt_sparse_base_eligible && (params.n_pheno == 1);
+  Gblock.step2_pgen_direct_qt_terms_valid =
+    Gblock.step2_pgen_direct_qt_enabled &&
+    (pheno_data.new_cov.cols() > 1);
+  if(Gblock.step2_pgen_direct_qt_terms_valid) {
+    const ProfileClock::time_point layout_start = ProfileClock::now();
+    const int covariate_count = pheno_data.new_cov.cols();
+    Gblock.step2_pgen_direct_qt_terms.resize(
+      res.rows(), covariate_count + 1);
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(params.neff_threads) schedule(static)
+#endif
+    for(int sample = 0; sample < res.rows(); ++sample) {
+      for(int covariate = 0; covariate < covariate_count; ++covariate)
+        Gblock.step2_pgen_direct_qt_terms(sample, covariate) =
+          pheno_data.new_cov(sample, covariate);
+      Gblock.step2_pgen_direct_qt_terms(sample, covariate_count) =
+        res(sample, 0);
+    }
+    if(params.profile_step2)
+      step2_profile.qt_packed_direct_layout_ms +=
+        elapsed_ms(layout_start);
+  } else {
+    Gblock.step2_pgen_direct_qt_terms.resize(0, 0);
+  }
   if(Gblock.step2_qt_sparse_residuals_valid) {
     const ProfileClock::time_point layout_start = ProfileClock::now();
     Gblock.step2_qt_sparse_residuals.resize(res.rows(), res.cols());

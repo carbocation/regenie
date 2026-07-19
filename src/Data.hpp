@@ -119,6 +119,7 @@ struct Step2Profile {
   double prediction_read_ms = 0;
   double null_model_ms = 0;
   double qt_sparse_residual_layout_ms = 0;
+  double qt_packed_direct_layout_ms = 0;
   double genotype_io_ms = 0;
   double variant_compute_ms = 0;
   double output_ms = 0;

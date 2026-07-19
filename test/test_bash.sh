@@ -313,6 +313,10 @@ if ! grep -Eq ' packed_direct_dense_qt_variants=[1-9][0-9]* ' \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense.log"
 then
   print_custom_err "Step 2 generic direct packed-PGEN dense-QT scoring was not exercised."
+elif ! grep -q '^STEP2_PROFILE scope=qt_score_layout .* packed_direct_layout_ms=' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN score layout was not exercised."
 elif ! cmp --silent \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_Y1.regenie" \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense_Y1.regenie"
