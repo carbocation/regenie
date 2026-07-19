@@ -3789,14 +3789,31 @@ void check_sparse_G(int const& isnp, int const& thread_num, struct geno_block* g
 
   data_thread* snp_data = &(gblock->thread_data[thread_num]);
   MapArXd Geno ( gblock->Gmat.col(isnp).data(), nsamples, 1);
+  Eigen::Index nonzero_count;
 
-  if (n_zero != -1)
+  if (n_zero != -1) {
+    nonzero_count = static_cast<Eigen::Index>(nsamples) - n_zero;
     snp_data->is_sparse = (n_zero >= (nsamples * prop_zero_thr));
-  else
-    snp_data->is_sparse = (mask && (Geno != 0)).count() <= (nsamples * (1 - prop_zero_thr));
+  } else {
+    nonzero_count = (mask && (Geno != 0)).count();
+    snp_data->is_sparse =
+      nonzero_count <= (nsamples * (1 - prop_zero_thr));
+  }
 
-  if(snp_data->is_sparse) // get nonzero entries
-    snp_data->Gsparse = mask.select(Geno,0).matrix().sparseView();
+  if(snp_data->is_sparse) { // get nonzero entries
+    // The input is already ordered by sample.  Reserving the known carrier
+    // count and appending in that order avoids Eigen's generic dense
+    // expression and repeated sorted insertions.
+    nonzero_count = std::max<Eigen::Index>(0,
+      std::min<Eigen::Index>(nsamples, nonzero_count));
+    snp_data->Gsparse.resize(nsamples);
+    snp_data->Gsparse.setZero();
+    snp_data->Gsparse.reserve(nonzero_count);
+    for(Eigen::Index index = 0; index < nsamples; ++index) {
+      if(mask(index) && Geno(index) != 0)
+        snp_data->Gsparse.insertBack(index) = Geno(index);
+    }
+  }
 
   // for SPA
   if( snp_data->fastSPA ) snp_data->fastSPA = snp_data->is_sparse;
