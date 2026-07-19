@@ -103,7 +103,12 @@ struct PackedHardcallDecodeEntry {
   unsigned char nonmissing = 0;
   unsigned char zeros = 0;
   unsigned char missing = 0;
+  uint64_t packed_stats = 0;
 };
+
+constexpr unsigned int packed_stats_lane_bits = 21;
+constexpr uint64_t packed_stats_lane_mask =
+  (uint64_t(1) << packed_stats_lane_bits) - 1;
 
 using PackedHardcallDecodeLookup =
   std::array<PackedHardcallDecodeEntry, 256>;
@@ -124,6 +129,9 @@ PackedHardcallDecodeLookup build_packed_hardcall_decode_lookup() {
         entry.zeros += (code == 0);
       }
     }
+    entry.packed_stats = entry.allele_sum |
+      (uint64_t(entry.nonmissing) << packed_stats_lane_bits) |
+      (uint64_t(entry.zeros) << (2 * packed_stats_lane_bits));
   }
   return lookup;
 }
@@ -188,6 +196,35 @@ PackedHardcallDecodeStats summarize_packed_hardcalls(
     packed_hardcall_decode_lookup();
   PackedHardcallDecodeStats stats;
   const size_t full_bytes = sample_count / 4;
+
+  // Three 21-bit lanes cannot carry into one another while the allele sum
+  // is below 2^21.  This reduces four dependent lookup accumulations to one
+  // for the common biobank-sized case; larger cohorts retain the generic
+  // path below.
+  if(sample_count < (size_t(1) << (packed_stats_lane_bits - 1))) {
+    uint64_t packed_stats = 0;
+    for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index)
+      packed_stats += lookup[packed[byte_index]].packed_stats;
+    stats.allele_sum = packed_stats & packed_stats_lane_mask;
+    stats.nonmissing = (packed_stats >> packed_stats_lane_bits) &
+      packed_stats_lane_mask;
+    stats.zeros = (packed_stats >> (2 * packed_stats_lane_bits)) &
+      packed_stats_lane_mask;
+    stats.missing = 4 * full_bytes - stats.nonmissing;
+
+    for(size_t sample = 4 * full_bytes; sample < sample_count; ++sample) {
+      const unsigned int code =
+        (packed[full_bytes] >> (2 * (sample - 4 * full_bytes))) & 3;
+      if(code == 3)
+        stats.missing++;
+      else {
+        stats.allele_sum += code;
+        stats.nonmissing++;
+        stats.zeros += (code == 0);
+      }
+    }
+    return stats;
+  }
 
   for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
     const PackedHardcallDecodeEntry& entry = lookup[packed[byte_index]];
