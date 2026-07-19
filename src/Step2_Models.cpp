@@ -376,6 +376,46 @@ packed_sparse_qt_decode_lookup() {
   return lookup;
 }
 
+template<int CovariateCount>
+static void accumulate_fixed_packed_qt_terms(
+    const vector<unsigned char>& packed,
+    const double missing_mean,
+    const Eigen::Index sample_count,
+    const std::array<PackedSparseQtDecodeEntry, 256>& decode_lookup,
+    const double* term_data,
+    VectorXd& XtG,
+    ArrayXd& num,
+    double& squared_norm) {
+  const auto accumulate_sample = [&](const Eigen::Index sample,
+                                     const unsigned int code) {
+    const double genotype = code == 3 ? missing_mean :
+      static_cast<double>(code);
+    squared_norm += genotype * genotype;
+    const double* terms = term_data + sample * (CovariateCount + 1);
+    for(int covariate = 0; covariate < CovariateCount; ++covariate)
+      XtG(covariate) += genotype * terms[covariate];
+    num(0) += genotype * terms[CovariateCount];
+  };
+
+  const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
+  for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+    const unsigned char packed_byte = packed[byte_index];
+    if(packed_byte == 0) continue;
+    const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+    const Eigen::Index first_sample = 4 * byte_index;
+    for(unsigned int carrier = 0; carrier < entry.count; ++carrier)
+      accumulate_sample(first_sample + entry.offsets[carrier],
+        entry.codes[carrier]);
+  }
+  if(sample_count % 4) {
+    const unsigned char packed_byte = packed[full_bytes];
+    for(Eigen::Index offset = 0; offset < sample_count % 4; ++offset) {
+      const unsigned int code = (packed_byte >> (2 * offset)) & 3;
+      if(code != 0) accumulate_sample(4 * full_bytes + offset, code);
+    }
+  }
+}
+
 static void accumulate_packed_qt(
     const int isnp,
     const bool sparse_genotype,
@@ -490,6 +530,42 @@ static void accumulate_packed_qt(
     }
     XtG(0) = genotype_sum * intercept_value;
     return;
+  }
+
+  if(use_row_major_terms) {
+    const double* term_data = gblock.step2_pgen_direct_qt_terms.data();
+    switch(covariate_count) {
+    case 2:
+      accumulate_fixed_packed_qt_terms<2>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 3:
+      accumulate_fixed_packed_qt_terms<3>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 4:
+      accumulate_fixed_packed_qt_terms<4>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 5:
+      accumulate_fixed_packed_qt_terms<5>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 6:
+      accumulate_fixed_packed_qt_terms<6>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 7:
+      accumulate_fixed_packed_qt_terms<7>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 8:
+      accumulate_fixed_packed_qt_terms<8>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    default:
+      break;
+    }
   }
 
   const auto accumulate_sample = [&](const Eigen::Index sample,
