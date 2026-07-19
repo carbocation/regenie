@@ -367,7 +367,7 @@ packed_sparse_qt_decode_lookup() {
   return lookup;
 }
 
-static void accumulate_packed_sparse_qt(
+static void accumulate_packed_qt(
     const int isnp,
     const Ref<const MatrixXd>& yres,
     struct phenodt const& pheno_data,
@@ -376,8 +376,8 @@ static void accumulate_packed_sparse_qt(
     ArrayXd& num,
     double& squared_norm) {
   const vector<unsigned char>& packed =
-    gblock.step2_pgen_sparse_hardcalls[isnp];
-  const double missing_mean = gblock.step2_pgen_sparse_means[isnp];
+    gblock.step2_pgen_packed_hardcalls[isnp];
+  const double missing_mean = gblock.step2_pgen_packed_means[isnp];
   const Eigen::Index sample_count = yres.rows();
   const int covariate_count = pheno_data.new_cov.cols();
   const bool intercept_only = covariate_count == 1;
@@ -385,11 +385,12 @@ static void accumulate_packed_sparse_qt(
     pheno_data.new_cov(0, 0) : 0;
 
   if(yres.cols() != 1)
-    throw "packed sparse QT scoring requires one phenotype";
+    throw "packed QT scoring requires one phenotype";
 
   XtG = VectorXd::Zero(covariate_count);
   num = ArrayXd::Zero(1);
   squared_norm = 0;
+  double genotype_sum = 0;
 
   const auto accumulate_sample = [&](const Eigen::Index sample,
                                      const unsigned int code) {
@@ -398,7 +399,7 @@ static void accumulate_packed_sparse_qt(
     if(genotype == 0) return;
     squared_norm += genotype * genotype;
     if(intercept_only) {
-      XtG(0) += genotype * intercept_value;
+      genotype_sum += genotype;
     } else {
       for(int covariate = 0; covariate < covariate_count; ++covariate)
         XtG(covariate) +=
@@ -426,6 +427,8 @@ static void accumulate_packed_sparse_qt(
       if(code != 0) accumulate_sample(4 * full_bytes + offset, code);
     }
   }
+  if(intercept_only)
+    XtG(0) = genotype_sum * intercept_value;
 }
 
 void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_num, string const& test_string, string const& model_type, const Ref<const MatrixXd>& yres, const Ref<const RowVectorXd>& p_sd_yres, struct param const& params, struct phenodt& pheno_data, struct geno_block& gblock, variant_block* block_info, vector<snp> const& snpinfo, struct in_files& files, mstream& sout){
@@ -464,7 +467,18 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
   }
 
   if( run_full_test ){
-    if(dt_thr->qt_unscaled) {
+    if(dt_thr->qt_packed_direct) {
+      VectorXd XtG;
+      double raw_squared_norm;
+      accumulate_packed_qt(isnp, yres, pheno_data, gblock,
+        XtG, num, raw_squared_norm);
+      num -= (pheno_data.YtX * XtG).array();
+      denum = raw_squared_norm - XtG.squaredNorm();
+      dt_thr->stats = num / sqrt(denum);
+      dt_thr->bhat = dt_thr->stats / sqrt(denum) *
+        pheno_data.scf_sv;
+
+    } else if(dt_thr->qt_unscaled) {
 
       const double genotype_scale = gsc / block_info->scale_fac;
       if(dt_thr->qt_algebraic_projection) {
@@ -498,16 +512,10 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
     } else if( params.strict_mode ) {
 
       if(dt_thr->is_sparse){
-        VectorXd XtG;
-        double sparse_squared_norm;
-        if(dt_thr->qt_packed_direct) {
-          accumulate_packed_sparse_qt(isnp, yres, pheno_data,
-            gblock, XtG, num, sparse_squared_norm);
-        } else {
-          XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse;
-          num = yres.transpose() * dt_thr->Gsparse;
-          sparse_squared_norm = dt_thr->Gsparse.squaredNorm();
-        }
+        VectorXd XtG =
+          pheno_data.new_cov.transpose() * dt_thr->Gsparse;
+        num = yres.transpose() * dt_thr->Gsparse;
+        const double sparse_squared_norm = dt_thr->Gsparse.squaredNorm();
         num -= (pheno_data.YtX * XtG).array();
         denum = sparse_squared_norm - XtG.squaredNorm();
       } else {
@@ -528,31 +536,25 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
 
       // compute GtG for each phenotype (different missing patterns)
       if(dt_thr->is_sparse){
-        VectorXd XtG;
-        double sparse_squared_norm;
-        if(dt_thr->qt_packed_direct) {
-          accumulate_packed_sparse_qt(isnp, yres, pheno_data,
-            gblock, XtG, num, sparse_squared_norm);
-        } else {
-          XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse;
-          sparse_squared_norm = dt_thr->Gsparse.squaredNorm();
-          if(dt_thr->qt_complete_masks &&
-             gblock.step2_qt_sparse_residuals_valid) {
-            num = ArrayXd::Zero(params.n_pheno);
-            for(SpVec::InnerIterator genotype(dt_thr->Gsparse);
-                genotype; ++genotype) {
-              const double* residuals =
-                &gblock.step2_qt_sparse_residuals(genotype.index(), 0);
-              const double genotype_value = genotype.value();
+        VectorXd XtG =
+          pheno_data.new_cov.transpose() * dt_thr->Gsparse;
+        const double sparse_squared_norm = dt_thr->Gsparse.squaredNorm();
+        if(dt_thr->qt_complete_masks &&
+           gblock.step2_qt_sparse_residuals_valid) {
+          num = ArrayXd::Zero(params.n_pheno);
+          for(SpVec::InnerIterator genotype(dt_thr->Gsparse);
+              genotype; ++genotype) {
+            const double* residuals =
+              &gblock.step2_qt_sparse_residuals(genotype.index(), 0);
+            const double genotype_value = genotype.value();
 #if defined(_OPENMP)
 #pragma omp simd
 #endif
-              for(int ph = 0; ph < params.n_pheno; ++ph)
-                num(ph) += genotype_value * residuals[ph];
-            }
-          } else {
-            num = yres.transpose() * dt_thr->Gsparse;
+            for(int ph = 0; ph < params.n_pheno; ++ph)
+              num(ph) += genotype_value * residuals[ph];
           }
+        } else {
+          num = yres.transpose() * dt_thr->Gsparse;
         }
         num -= (pheno_data.YtX * XtG).array();
         double XtG_ss = XtG.squaredNorm();

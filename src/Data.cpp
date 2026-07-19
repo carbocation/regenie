@@ -523,6 +523,8 @@ void Data::print_step2_profile() {
         << step2_variant_compute_profile.packed_sparse_variants
         << " packed_direct_qt_variants="
         << step2_variant_compute_profile.packed_direct_qt_variants
+        << " packed_direct_dense_qt_variants="
+        << step2_variant_compute_profile.packed_direct_dense_qt_variants
         << " shared_denom_sparse_qt_variants="
         << step2_variant_compute_profile.shared_denom_sparse_qt_variants
         << " rowmajor_sparse_qt_variants="
@@ -3575,7 +3577,7 @@ void Data::compute_res(){
     (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
   Gblock.step2_qt_sparse_residuals_valid =
     step2_qt_sparse_base_eligible && (params.n_pheno >= 16);
-  Gblock.step2_pgen_direct_sparse_qt_enabled =
+  Gblock.step2_pgen_direct_qt_enabled =
     step2_qt_sparse_base_eligible && (params.n_pheno == 1);
   if(Gblock.step2_qt_sparse_residuals_valid) {
     const ProfileClock::time_point layout_start = ProfileClock::now();
@@ -3715,6 +3717,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<uint64_t> sparse_variants(profile_threads, 0);
   vector<uint64_t> packed_sparse_variants(profile_threads, 0);
   vector<uint64_t> packed_direct_qt_variants(profile_threads, 0);
+  vector<uint64_t> packed_direct_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> rowmajor_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
@@ -3805,14 +3808,18 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
             sparse_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].sparse_from_packed)
               packed_sparse_variants[thread_num]++;
-            if(Gblock.thread_data[thread_num].qt_packed_direct)
-              packed_direct_qt_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].qt_complete_masks)
               shared_denom_sparse_qt_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].qt_complete_masks &&
                Gblock.step2_qt_sparse_residuals_valid)
               rowmajor_sparse_qt_variants[thread_num]++;
           }
+        }
+        if(params.profile_step2 &&
+           Gblock.thread_data[thread_num].qt_packed_direct) {
+          packed_direct_qt_variants[thread_num]++;
+          if(!Gblock.thread_data[thread_num].is_sparse)
+            packed_direct_dense_qt_variants[thread_num]++;
         }
       }
 
@@ -3829,7 +3836,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         ScopedProfileTimer preprocess_timer(params.profile_step2 ?
           &preprocess_thread_ms[thread_num] : nullptr);
         // for QTs with non-sparse G: residualize and re-scale
-        if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse) {
+        if (!params.skip_cov_res && (params.trait_mode == 0) &&
+            !Gblock.thread_data[thread_num].is_sparse &&
+            !Gblock.thread_data[thread_num].qt_packed_direct) {
           if(use_unscaled_dense_qt) {
             const bool used_algebraic_projection =
               qt_phenotypes_have_complete_masks &&
@@ -3914,6 +3923,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.packed_direct_qt_variants +=
       std::accumulate(packed_direct_qt_variants.begin(),
         packed_direct_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.packed_direct_dense_qt_variants +=
+      std::accumulate(packed_direct_dense_qt_variants.begin(),
+        packed_direct_dense_qt_variants.end(), uint64_t(0));
     step2_variant_compute_profile.shared_denom_sparse_qt_variants +=
       std::accumulate(shared_denom_sparse_qt_variants.begin(),
         shared_denom_sparse_qt_variants.end(), uint64_t(0));
@@ -4377,10 +4389,10 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
       Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs,
       pheno_data.phenotypes_raw, snpinfo, all_snps_info,
       params.profile_step2 ? &step2_pgen_read_profile : nullptr,
-      &Gblock.step2_pgen_sparse_hardcalls,
-      Gblock.step2_pgen_direct_sparse_qt_enabled,
-      &Gblock.step2_pgen_sparse_means,
-      &Gblock.step2_pgen_sparse_unexpanded);
+      &Gblock.step2_pgen_packed_hardcalls,
+      Gblock.step2_pgen_direct_qt_enabled,
+      &Gblock.step2_pgen_packed_means,
+      &Gblock.step2_pgen_packed_unexpanded);
   } else {
 
     snp_data_blocks.resize( n_snps );

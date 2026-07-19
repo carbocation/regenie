@@ -112,6 +112,7 @@ struct Step2VariantComputeProfile {
   uint64_t sparse_variants = 0;
   uint64_t packed_sparse_variants = 0;
   uint64_t packed_direct_qt_variants = 0;
+  uint64_t packed_direct_dense_qt_variants = 0;
   uint64_t shared_denom_sparse_qt_variants = 0;
   uint64_t rowmajor_sparse_qt_variants = 0;
   uint64_t unscaled_dense_qt_variants = 0;
@@ -170,12 +171,12 @@ struct geno_block {
   BgenParser bgen;
   PgenReader pgr;
   Eigen::MatrixXd Gmat;
-  // Retain simple Step 2 PGEN hardcalls so rare-variant carrier vectors can
-  // be constructed from two-bit codes instead of rescanning expanded doubles.
-  std::vector<std::vector<unsigned char>> step2_pgen_sparse_hardcalls;
-  std::vector<double> step2_pgen_sparse_means;
-  std::vector<unsigned char> step2_pgen_sparse_unexpanded;
-  bool step2_pgen_direct_sparse_qt_enabled = false;
+  // Retain simple Step 2 PGEN hardcalls so single-phenotype QT scores can be
+  // accumulated from two-bit codes without materializing sample vectors.
+  std::vector<std::vector<unsigned char>> step2_pgen_packed_hardcalls;
+  std::vector<double> step2_pgen_packed_means;
+  std::vector<unsigned char> step2_pgen_packed_unexpanded;
+  bool step2_pgen_direct_qt_enabled = false;
   // Optional phenotype-by-variant score crossproducts for dense QT blocks.
   Eigen::MatrixXd step2_qt_YtG;
   bool step2_qt_YtG_valid = false;

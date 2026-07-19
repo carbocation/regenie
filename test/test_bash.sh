@@ -293,13 +293,41 @@ then
   print_err
 fi
 
-# Exercise the intercept-only specialization independently of the generic
-# multi-covariate direct packed path above.
-for representation in dense packed; do
-  prop_zero_thr=1
-  if [ "$representation" = "packed" ]; then
-    prop_zero_thr=0
-  fi
+# Exercise the same direct scorer on variants classified as dense while using
+# the generic multi-covariate crossproduct path.
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype.txt \
+  --phenoColList Y1 \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 0.999 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p1_packed_dense"
+
+./$regenie_bin $rgcmd
+
+if ! grep -Eq ' packed_direct_dense_qt_variants=[1-9][0-9]* ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense.log"
+then
+  print_custom_err "Step 2 generic direct packed-PGEN dense-QT scoring was not exercised."
+elif ! cmp --silent \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_Y1.regenie" \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense_Y1.regenie"
+then
+  print_err
+fi
+
+# Exercise direct packed scoring for both dense and sparse variants, including
+# the intercept-only specialization, against the materialized implementation.
+for representation in materialized direct_dense direct_sparse; do
+  case "$representation" in
+    materialized) prop_zero_thr=1 ;;
+    direct_dense) prop_zero_thr=0.999 ;;
+    direct_sparse) prop_zero_thr=0 ;;
+  esac
   rgcmd="--step 2 \
     --pgen ${mntpt}example/example \
     --phenoFile ${mntpt}example/phenotype.txt \
@@ -308,15 +336,24 @@ for representation in dense packed; do
     --bsize 200 \
     --prop-zero-thr $prop_zero_thr \
     --ignore-pred \
+    --step2-profile \
     --out ${mntpt}test/test_bin_out_pgen_qt_p1_intercept_${representation}"
   ./$regenie_bin $rgcmd
 done
 
-if ! cmp --silent \
-  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_dense_Y1.regenie" \
-  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_packed_Y1.regenie"
+for representation in direct_dense direct_sparse; do
+  if ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_materialized_Y1.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_${representation}_Y1.regenie"
+  then
+    print_err
+  fi
+done
+
+if ! grep -Eq ' packed_direct_dense_qt_variants=[1-9][0-9]* ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_direct_dense.log"
 then
-  print_err
+  print_custom_err "Step 2 direct packed-PGEN dense-QT scoring was not exercised."
 fi
 
 
