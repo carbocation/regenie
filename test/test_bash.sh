@@ -261,6 +261,38 @@ elif ! grep -q ' algebraic_dense_qt_variants=1000 ' "${REGENIE_PATH}test/test_bi
   print_custom_err "Step 2 PGEN algebraic dense-QT projection was not exercised."
 fi
 
+# Force one complete quantitative phenotype through the sparse path. The
+# packed PGEN hardcalls should be scored directly without expanding a dense
+# sample vector or materializing an Eigen sparse vector.
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype.txt \
+  --phenoColList Y1 \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 0 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p1_packed"
+
+./$regenie_bin $rgcmd
+
+if ! grep -q ' packed_unexpanded_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN ingestion was not exercised."
+elif ! grep -q ' packed_direct_qt_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN QT scoring was not exercised."
+elif ! cmp --silent \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_Y1.regenie" \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_Y1.regenie"
+then
+  print_err
+fi
+
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"

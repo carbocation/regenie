@@ -90,6 +90,7 @@ struct Step2PgenReadProfile {
   uint64_t fast_path_variants = 0;
   uint64_t packed_hardcall_variants = 0;
   uint64_t packed_hardcall_bytes = 0;
+  uint64_t packed_unexpanded_variants = 0;
   double thread_work_ms = 0;
   double decode_thread_ms = 0;
   double packed_expand_thread_ms = 0;
@@ -110,6 +111,7 @@ struct Step2VariantComputeProfile {
   uint64_t variants = 0;
   uint64_t sparse_variants = 0;
   uint64_t packed_sparse_variants = 0;
+  uint64_t packed_direct_qt_variants = 0;
   uint64_t shared_denom_sparse_qt_variants = 0;
   uint64_t rowmajor_sparse_qt_variants = 0;
   uint64_t unscaled_dense_qt_variants = 0;
@@ -156,6 +158,7 @@ struct data_thread {
   bool fastSPA = true;
   bool is_sparse = false;
   bool sparse_from_packed = false;
+  bool qt_packed_direct = false;
   // QT residual is retained on its raw scale for the dense score path.
   bool qt_unscaled = false;
   bool qt_complete_masks = false;
@@ -170,6 +173,9 @@ struct geno_block {
   // Retain simple Step 2 PGEN hardcalls so rare-variant carrier vectors can
   // be constructed from two-bit codes instead of rescanning expanded doubles.
   std::vector<std::vector<unsigned char>> step2_pgen_sparse_hardcalls;
+  std::vector<double> step2_pgen_sparse_means;
+  std::vector<unsigned char> step2_pgen_sparse_unexpanded;
+  bool step2_pgen_direct_sparse_qt_enabled = false;
   // Optional phenotype-by-variant score crossproducts for dense QT blocks.
   Eigen::MatrixXd step2_qt_YtG;
   bool step2_qt_YtG_valid = false;
@@ -273,7 +279,7 @@ void readChunkFromBGEN(std::istream*,std::vector<uint32_t>&,std::vector<uint32_t
 void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool = false,Step2BgenParseProfile* = nullptr);
 void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool,Step2BgenParseProfile* = nullptr);
 void parseSnpfromBed(const int&,const int&,const std::vector<uchar>&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*);
-void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&,Step2PgenReadProfile* = nullptr,std::vector<std::vector<unsigned char>>* = nullptr);
+void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&,Step2PgenReadProfile* = nullptr,std::vector<std::vector<unsigned char>>* = nullptr,bool = false,std::vector<double>* = nullptr,std::vector<unsigned char>* = nullptr);
 
 void skip_snps(uint64 const&,struct param const*,struct in_files*,struct geno_block*);
 void jumpto_bed(uint64 const&,uint64 const&,std::ifstream&);
