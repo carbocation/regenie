@@ -378,6 +378,7 @@ packed_sparse_qt_decode_lookup() {
 
 static void accumulate_packed_qt(
     const int isnp,
+    const bool sparse_genotype,
     const Ref<const MatrixXd>& yres,
     struct phenodt const& pheno_data,
     struct geno_block const& gblock,
@@ -416,12 +417,23 @@ static void accumulate_packed_qt(
       squared_norm += entry.squared_sum +
         entry.missing_count * missing_squared;
       const Eigen::Index first_sample = 4 * byte_index;
-      for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
-        const unsigned int code = entry.codes[carrier];
-        const double genotype = code == 3 ? missing_mean :
-          static_cast<double>(code);
-        num(0) += genotype *
-          yres(first_sample + entry.offsets[carrier], 0);
+      if(!sparse_genotype && entry.missing_count == 0) {
+        num(0) += static_cast<double>(packed_byte & 3) *
+          yres(first_sample, 0);
+        num(0) += static_cast<double>((packed_byte >> 2) & 3) *
+          yres(first_sample + 1, 0);
+        num(0) += static_cast<double>((packed_byte >> 4) & 3) *
+          yres(first_sample + 2, 0);
+        num(0) += static_cast<double>((packed_byte >> 6) & 3) *
+          yres(first_sample + 3, 0);
+      } else {
+        for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
+          const unsigned int code = entry.codes[carrier];
+          const double genotype = code == 3 ? missing_mean :
+            static_cast<double>(code);
+          num(0) += genotype *
+            yres(first_sample + entry.offsets[carrier], 0);
+        }
       }
     }
     if(sample_count % 4) {
@@ -518,7 +530,7 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
     if(dt_thr->qt_packed_direct) {
       VectorXd XtG;
       double raw_squared_norm;
-      accumulate_packed_qt(isnp, yres, pheno_data, gblock,
+      accumulate_packed_qt(isnp, dt_thr->is_sparse, yres, pheno_data, gblock,
         XtG, num, raw_squared_norm);
       num -= (pheno_data.YtX * XtG).array();
       denum = raw_squared_norm - XtG.squaredNorm();
