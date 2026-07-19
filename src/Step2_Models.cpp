@@ -344,6 +344,9 @@ void compute_score_qt_mcc(int const& isnp, int const& snp_index, int const& thre
 // score test stat for QT
 struct PackedSparseQtDecodeEntry {
   unsigned char count = 0;
+  unsigned char allele_sum = 0;
+  unsigned char squared_sum = 0;
+  unsigned char missing_count = 0;
   std::array<unsigned char, 4> offsets{};
   std::array<unsigned char, 4> codes{};
 };
@@ -360,6 +363,12 @@ packed_sparse_qt_decode_lookup() {
         entry.offsets[entry.count] = offset;
         entry.codes[entry.count] = code;
         entry.count++;
+        if(code == 3)
+          entry.missing_count++;
+        else {
+          entry.allele_sum += code;
+          entry.squared_sum += code * code;
+        }
       }
     }
     return entries;
@@ -394,16 +403,50 @@ static void accumulate_packed_qt(
   squared_norm = 0;
   double genotype_sum = 0;
 
+  const auto& decode_lookup = packed_sparse_qt_decode_lookup();
+  const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
+  if(intercept_only) {
+    const double missing_squared = missing_mean * missing_mean;
+    for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+      const unsigned char packed_byte = packed[byte_index];
+      if(packed_byte == 0) continue;
+      const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+      genotype_sum += entry.allele_sum +
+        entry.missing_count * missing_mean;
+      squared_norm += entry.squared_sum +
+        entry.missing_count * missing_squared;
+      const Eigen::Index first_sample = 4 * byte_index;
+      for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
+        const unsigned int code = entry.codes[carrier];
+        const double genotype = code == 3 ? missing_mean :
+          static_cast<double>(code);
+        num(0) += genotype *
+          yres(first_sample + entry.offsets[carrier], 0);
+      }
+    }
+    if(sample_count % 4) {
+      const unsigned char packed_byte = packed[full_bytes];
+      for(Eigen::Index offset = 0; offset < sample_count % 4; ++offset) {
+        const unsigned int code = (packed_byte >> (2 * offset)) & 3;
+        if(code == 0) continue;
+        const double genotype = code == 3 ? missing_mean :
+          static_cast<double>(code);
+        genotype_sum += genotype;
+        squared_norm += genotype * genotype;
+        num(0) += genotype * yres(4 * full_bytes + offset, 0);
+      }
+    }
+    XtG(0) = genotype_sum * intercept_value;
+    return;
+  }
+
   const auto accumulate_sample = [&](const Eigen::Index sample,
                                      const unsigned int code) {
     const double genotype = code == 3 ? missing_mean :
       static_cast<double>(code);
     if(genotype == 0) return;
     squared_norm += genotype * genotype;
-    if(intercept_only) {
-      genotype_sum += genotype;
-      num(0) += genotype * yres(sample, 0);
-    } else if(use_row_major_terms) {
+    if(use_row_major_terms) {
       const double* terms =
         &gblock.step2_pgen_direct_qt_terms(sample, 0);
       for(int covariate = 0; covariate < covariate_count; ++covariate)
@@ -417,8 +460,6 @@ static void accumulate_packed_qt(
     }
   };
 
-  const auto& decode_lookup = packed_sparse_qt_decode_lookup();
-  const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
   for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
     const unsigned char packed_byte = packed[byte_index];
     if(packed_byte == 0) continue;
@@ -436,8 +477,6 @@ static void accumulate_packed_qt(
       if(code != 0) accumulate_sample(4 * full_bytes + offset, code);
     }
   }
-  if(intercept_only)
-    XtG(0) = genotype_sum * intercept_value;
 }
 
 void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_num, string const& test_string, string const& model_type, const Ref<const MatrixXd>& yres, const Ref<const RowVectorXd>& p_sd_yres, struct param const& params, struct phenodt& pheno_data, struct geno_block& gblock, variant_block* block_info, vector<snp> const& snpinfo, struct in_files& files, mstream& sout){
