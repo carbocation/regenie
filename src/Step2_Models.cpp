@@ -408,31 +408,71 @@ static void accumulate_packed_qt(
   const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
   if(intercept_only) {
     const double missing_squared = missing_mean * missing_mean;
-    for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
-      const unsigned char packed_byte = packed[byte_index];
-      if(packed_byte == 0) continue;
+    const auto accumulate_sparse_byte = [&](const unsigned char packed_byte,
+                                            const Eigen::Index first_sample) {
       const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
       genotype_sum += entry.allele_sum +
         entry.missing_count * missing_mean;
       squared_norm += entry.squared_sum +
         entry.missing_count * missing_squared;
-      const Eigen::Index first_sample = 4 * byte_index;
-      if(!sparse_genotype && entry.missing_count == 0) {
-        num(0) += static_cast<double>(packed_byte & 3) *
-          yres(first_sample, 0);
-        num(0) += static_cast<double>((packed_byte >> 2) & 3) *
-          yres(first_sample + 1, 0);
-        num(0) += static_cast<double>((packed_byte >> 4) & 3) *
-          yres(first_sample + 2, 0);
-        num(0) += static_cast<double>((packed_byte >> 6) & 3) *
-          yres(first_sample + 3, 0);
-      } else {
-        for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
-          const unsigned int code = entry.codes[carrier];
-          const double genotype = code == 3 ? missing_mean :
-            static_cast<double>(code);
-          num(0) += genotype *
-            yres(first_sample + entry.offsets[carrier], 0);
+      for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
+        const unsigned int code = entry.codes[carrier];
+        const double genotype = code == 3 ? missing_mean :
+          static_cast<double>(code);
+        num(0) += genotype *
+          yres(first_sample + entry.offsets[carrier], 0);
+      }
+    };
+
+    if(sparse_genotype) {
+      size_t byte_index = 0;
+      for(; byte_index + sizeof(uint64_t) <= full_bytes;
+          byte_index += sizeof(uint64_t)) {
+        uint64_t packed_word;
+        std::memcpy(&packed_word, packed.data() + byte_index,
+          sizeof(packed_word));
+        if(packed_word == 0) continue;
+        for(size_t byte_offset = 0; byte_offset < sizeof(uint64_t);
+            ++byte_offset) {
+          const unsigned char packed_byte =
+            packed[byte_index + byte_offset];
+          if(packed_byte != 0)
+            accumulate_sparse_byte(packed_byte,
+              4 * (byte_index + byte_offset));
+        }
+      }
+      for(; byte_index < full_bytes; ++byte_index) {
+        const unsigned char packed_byte = packed[byte_index];
+        if(packed_byte != 0)
+          accumulate_sparse_byte(packed_byte, 4 * byte_index);
+      }
+    } else {
+      for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+        const unsigned char packed_byte = packed[byte_index];
+        if(packed_byte == 0) continue;
+        const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+        genotype_sum += entry.allele_sum +
+          entry.missing_count * missing_mean;
+        squared_norm += entry.squared_sum +
+          entry.missing_count * missing_squared;
+        const Eigen::Index first_sample = 4 * byte_index;
+        if(entry.missing_count == 0) {
+          num(0) += static_cast<double>(packed_byte & 3) *
+            yres(first_sample, 0);
+          num(0) += static_cast<double>((packed_byte >> 2) & 3) *
+            yres(first_sample + 1, 0);
+          num(0) += static_cast<double>((packed_byte >> 4) & 3) *
+            yres(first_sample + 2, 0);
+          num(0) += static_cast<double>((packed_byte >> 6) & 3) *
+            yres(first_sample + 3, 0);
+        } else {
+          for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
+            const unsigned int code = entry.codes[carrier];
+            const double genotype = code == 3 ? missing_mean :
+              static_cast<double>(code);
+            num(0) += genotype *
+              yres(first_sample + entry.offsets[carrier], 0);
+          }
         }
       }
     }
