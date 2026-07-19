@@ -110,6 +110,7 @@ struct Step2VariantComputeProfile {
   uint64_t variants = 0;
   uint64_t sparse_variants = 0;
   uint64_t shared_denom_sparse_qt_variants = 0;
+  uint64_t rowmajor_sparse_qt_variants = 0;
   uint64_t unscaled_dense_qt_variants = 0;
   uint64_t shared_denom_dense_qt_variants = 0;
   uint64_t algebraic_dense_qt_variants = 0;
@@ -167,6 +168,11 @@ struct geno_block {
   // Optional phenotype-by-variant score crossproducts for dense QT blocks.
   Eigen::MatrixXd step2_qt_YtG;
   bool step2_qt_YtG_valid = false;
+  // Complete-mask QT residuals laid out contiguously by sample so one sparse
+  // genotype traversal can accumulate every phenotype score.
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    step2_qt_sparse_residuals;
+  bool step2_qt_sparse_residuals_valid = false;
   Eigen::MatrixXd snp_afs;
   std::vector<std::vector<double>> step1_pgen_worker_tiles;
   std::vector<unsigned char> step1_pgen_packed_hardcalls;

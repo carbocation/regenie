@@ -432,7 +432,25 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
       // compute GtG for each phenotype (different missing patterns)
       if(dt_thr->is_sparse){
         VectorXd XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse; // k x 1 - do this for all traits (Geno is only residualized once across traits)
-        num = yres.transpose() * dt_thr->Gsparse - pheno_data.YtX * XtG; // P x 1 
+        if(dt_thr->qt_complete_masks &&
+           gblock.step2_qt_sparse_residuals_valid) {
+          num = ArrayXd::Zero(params.n_pheno);
+          for(SpVec::InnerIterator genotype(dt_thr->Gsparse);
+              genotype; ++genotype) {
+            const double* residuals =
+              &gblock.step2_qt_sparse_residuals(genotype.index(), 0);
+            const double genotype_value = genotype.value();
+#if defined(_OPENMP)
+#pragma omp simd
+#endif
+            for(int ph = 0; ph < params.n_pheno; ++ph)
+              num(ph) += genotype_value * residuals[ph];
+          }
+          num -= (pheno_data.YtX * XtG).array();
+        } else {
+          num = yres.transpose() * dt_thr->Gsparse -
+            pheno_data.YtX * XtG; // P x 1
+        }
         double XtG_ss = XtG.squaredNorm();
         denum_arr.resize(params.n_pheno);
         if(dt_thr->qt_complete_masks) {

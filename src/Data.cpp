@@ -414,6 +414,12 @@ void Data::print_step2_profile() {
   print_stage("other", other_ms);
   print_stage("total", step2_profile.end_to_end_ms);
 
+  if(step2_profile.qt_sparse_residual_layout_ms > 0) {
+    out << "STEP2_PROFILE scope=qt_score_layout"
+        << " sparse_residual_layout_ms="
+        << step2_profile.qt_sparse_residual_layout_ms << "\n";
+  }
+
   const double measured_setup_ms =
     step2_profile.setup_file_initialization_ms +
     step2_profile.setup_phenotype_covariate_ms +
@@ -513,6 +519,8 @@ void Data::print_step2_profile() {
         << step2_variant_compute_profile.sparse_variants
         << " shared_denom_sparse_qt_variants="
         << step2_variant_compute_profile.shared_denom_sparse_qt_variants
+        << " rowmajor_sparse_qt_variants="
+        << step2_variant_compute_profile.rowmajor_sparse_qt_variants
         << " unscaled_dense_qt_variants="
         << step2_variant_compute_profile.unscaled_dense_qt_variants
         << " shared_denom_dense_qt_variants="
@@ -3541,6 +3549,45 @@ void Data::compute_res(){
   res.array().rowwise() /= p_sd_yres.array();
   pheno_data.scf_sv = ( pheno_data.scale_Y.array() * p_sd_yres.array()).matrix().transpose().array();
 
+  Gblock.step2_qt_sparse_residuals_valid =
+    (params.file_type == "pgen") &&
+    (params.trait_mode == 0) &&
+    (params.test_type == 0) &&
+    !params.skip_cov_res &&
+    !params.mcc_test &&
+    !params.w_interaction &&
+    !params.build_mask &&
+    !params.snp_set &&
+    !params.joint_test &&
+    !params.trait_set &&
+    !params.multiphen &&
+    !params.htp_out &&
+    !params.getCorMat &&
+    (pheno_data.new_cov.cols() == params.ncov_analyzed) &&
+    (params.n_pheno >= 16) &&
+    (params.n_variants >= 1000) &&
+    (params.prop_zero_thr < 1) &&
+    (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
+  if(Gblock.step2_qt_sparse_residuals_valid) {
+    const ProfileClock::time_point layout_start = ProfileClock::now();
+    Gblock.step2_qt_sparse_residuals.resize(res.rows(), res.cols());
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(params.neff_threads) schedule(static)
+#endif
+    for(int sample = 0; sample < res.rows(); ++sample) {
+#if defined(_OPENMP)
+#pragma omp simd
+#endif
+      for(int ph = 0; ph < res.cols(); ++ph)
+        Gblock.step2_qt_sparse_residuals(sample, ph) = res(sample, ph);
+    }
+    if(params.profile_step2)
+      step2_profile.qt_sparse_residual_layout_ms +=
+        elapsed_ms(layout_start);
+  } else {
+    Gblock.step2_qt_sparse_residuals.resize(0, 0);
+  }
+
   if(!params.trait_set && !params.multiphen) pheno_data.YtX = res.transpose() * pheno_data.new_cov;
   if(params.w_interaction && (params.trait_mode==0) && !params.no_robust && !params.force_robust) 
     HLM_fitNull(nullHLM, m_ests, pheno_data, files, params, sout);
@@ -3658,6 +3705,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<double> interaction_thread_ms(profile_threads, 0);
   vector<uint64_t> sparse_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_sparse_qt_variants(profile_threads, 0);
+  vector<uint64_t> rowmajor_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> algebraic_dense_qt_variants(profile_threads, 0);
@@ -3746,6 +3794,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
             sparse_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].qt_complete_masks)
               shared_denom_sparse_qt_variants[thread_num]++;
+            if(Gblock.thread_data[thread_num].qt_complete_masks &&
+               Gblock.step2_qt_sparse_residuals_valid)
+              rowmajor_sparse_qt_variants[thread_num]++;
           }
         }
       }
@@ -3845,6 +3896,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.shared_denom_sparse_qt_variants +=
       std::accumulate(shared_denom_sparse_qt_variants.begin(),
         shared_denom_sparse_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.rowmajor_sparse_qt_variants +=
+      std::accumulate(rowmajor_sparse_qt_variants.begin(),
+        rowmajor_sparse_qt_variants.end(), uint64_t(0));
     step2_variant_compute_profile.unscaled_dense_qt_variants +=
       std::accumulate(unscaled_dense_qt_variants.begin(),
         unscaled_dense_qt_variants.end(), uint64_t(0));
