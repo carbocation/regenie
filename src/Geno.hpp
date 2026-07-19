@@ -122,6 +122,8 @@ struct Step2VariantComputeProfile {
   double parse_thread_ms = 0;
   double preprocess_thread_ms = 0;
   double score_thread_ms = 0;
+  double sparse_score_thread_ms = 0;
+  double dense_score_thread_ms = 0;
   double interaction_thread_ms = 0;
 };
 

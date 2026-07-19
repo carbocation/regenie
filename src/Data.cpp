@@ -537,6 +537,10 @@ void Data::print_step2_profile() {
         << step2_variant_compute_profile.preprocess_thread_ms
         << " score_thread_ms="
         << step2_variant_compute_profile.score_thread_ms
+        << " sparse_score_thread_ms="
+        << step2_variant_compute_profile.sparse_score_thread_ms
+        << " dense_score_thread_ms="
+        << step2_variant_compute_profile.dense_score_thread_ms
         << " interaction_thread_ms="
         << step2_variant_compute_profile.interaction_thread_ms
         << " other_thread_ms=" << other_thread_ms
@@ -3649,6 +3653,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<double> parse_thread_ms(profile_threads, 0);
   vector<double> preprocess_thread_ms(profile_threads, 0);
   vector<double> score_thread_ms(profile_threads, 0);
+  vector<double> sparse_score_thread_ms(profile_threads, 0);
+  vector<double> dense_score_thread_ms(profile_threads, 0);
   vector<double> interaction_thread_ms(profile_threads, 0);
   vector<uint64_t> sparse_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_sparse_qt_variants(profile_threads, 0);
@@ -3801,6 +3807,10 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         {
           ScopedProfileTimer score_timer(params.profile_step2 ?
             &score_thread_ms[thread_num] : nullptr);
+          ScopedProfileTimer score_representation_timer(params.profile_step2 ?
+            (Gblock.thread_data[thread_num].is_sparse ?
+              &sparse_score_thread_ms[thread_num] :
+              &dense_score_thread_ms[thread_num]) : nullptr);
           // if ran vc tests, print out results before mask test
           if ((block_info->sum_stats_vc.size() > 0) && !params.p_joint_only)
             print_vc_sumstats(snp_index, "ADD", wgr_string, block_info, snpinfo, files, &params);
@@ -3852,6 +3862,10 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       preprocess_thread_ms.begin(), preprocess_thread_ms.end(), 0.0);
     step2_variant_compute_profile.score_thread_ms += std::accumulate(
       score_thread_ms.begin(), score_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.sparse_score_thread_ms += std::accumulate(
+      sparse_score_thread_ms.begin(), sparse_score_thread_ms.end(), 0.0);
+    step2_variant_compute_profile.dense_score_thread_ms += std::accumulate(
+      dense_score_thread_ms.begin(), dense_score_thread_ms.end(), 0.0);
     step2_variant_compute_profile.interaction_thread_ms += std::accumulate(
       interaction_thread_ms.begin(), interaction_thread_ms.end(), 0.0);
     for(const Step2BgenParseProfile& profile : bgen_profiles) {
