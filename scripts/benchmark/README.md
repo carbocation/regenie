@@ -76,6 +76,7 @@ can be used directly from CI or a batch scheduler.
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
   power, quantitative, binary, and survival workloads, the retained Level 1
   GPU residency changes, the retained small-block Level 0 pipeline, a
-  production-scale cold-cache A100 optimization, and Step 2 thread scaling.
+  production-scale cold-cache A100 optimization, the generalized
+  multi-phenotype Level 0 path, and Step 2 thread scaling.
 - `results/2026-07-19-production.tsv` contains the retained raw run-level
   measurements used by that report.

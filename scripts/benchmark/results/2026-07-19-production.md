@@ -4,10 +4,10 @@ This report began as a performance snapshot of `114ef81` at production-like
 Step 1 scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. It now also
 includes the Cox design-residency change in `50ca3c1` and the resident weighted
 ridge solve in `87270e6`, followed by the small-block Level 0 pipeline in
-`3b285ad` and the production-width GPU pipeline in `dc64b54`. Unless noted
-otherwise, timings are external wall time. Step 1 runs use five-fold
-cross-validation, `--bsize 1000`, `--lowmem`, and the default Level 0 and Level
-1 ridge grids.
+`3b285ad`, the production-width GPU pipeline in `dc64b54`, and the
+multi-phenotype and non-Gaussian extension in `fa7506f`. Unless noted otherwise,
+timings are external wall time. Step 1 runs use five-fold cross-validation,
+`--bsize 1000`, `--lowmem`, and the default Level 0 and Level 1 ridge grids.
 
 ## Test systems and workloads
 
@@ -55,13 +55,19 @@ contiguous PGEN worker partitions were also important for cold input: relative
 to the immediately preceding candidate, aggregate PGEN service time fell from
 102.10 to 64.87 seconds and foreground wait from 14.34 to 0.81 seconds.
 
-The fast path is deliberately narrow: one complete quantitative phenotype in
-low-memory mode. Other trait counts, missingness patterns, and models retain
-their existing paths. Small-fixture output is byte-identical to the control.
-At full scale, 2 of 11,500,023 printed numeric values differ from the earlier
+Commit `fa7506f` retains this single-trait path and extends its Level 0 solve,
+normalization, and asynchronous low-memory output to multiple dense outcomes,
+binary traits, and survival models. Multi-QT input missingness handled by the
+usual per-trait mean imputation is included because the fitted outcomes are
+dense. Phenotype-specific sparse masks still use the established fallback.
+The optimized build passes the CPU, CUDA-auto, and Cox test targets.
+
+Small-fixture single-trait output is byte-identical to the control. At full
+scale, 2 of 11,500,023 printed numeric values differ from the earlier
 CPU-normalized path; the maximum absolute difference is `1e-9` and the maximum
-relative difference is `2.61e-6`. The optimized build passes the CPU,
-CUDA-auto, and Cox test targets.
+relative difference is `2.61e-6`. A 500,000-sample, 20,000-variant regression
+check completed in 7.83 seconds, confirming that the original one-trait path
+still takes the optimized branch.
 
 Each cold row is one run. The per-block timing and utilization trace support
 the mechanism, but another cold repetition is warranted before treating the
@@ -113,46 +119,63 @@ default per-trait mean imputation, so both runs fit dense 50,000-sample traits;
 the second case measures the cost of realistic missing input under that
 default behavior, not phenotype-specific sparse fitting.
 
-| System | Input missingness | Wall | Level 0 | Level 1 | Output | Peak host RSS | Average process CPU |
+| System and revision | Input missingness | Wall | Level 0 | Level 1 | Output | Peak host RSS | Average process CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A100 CUDA, 12 host threads | none | 227.51 s | 120.806 s | 72.085 s | 30.915 s | 2.87 GiB | 124% |
-| A100 CUDA, 12 host threads | 0-10% by trait | 227.44 s | 120.953 s | 71.911 s | 30.888 s | 2.87 GiB | 124% |
-| Eight-core N2 | none | 1,423.27 s | 986.913 s | 410.919 s | 24.080 s | 2.80 GiB | 599% |
-| Eight-core N2 | 0-10% by trait | 1,407.77 s | 981.663 s | 406.551 s | 18.205 s | 2.80 GiB | 617% |
+| A100 CUDA, `114ef81` | none | 227.51 s | 120.806 s | 72.085 s | 30.915 s | 2.87 GiB | 124% |
+| A100 CUDA, `fa7506f` | none | 113.80 s | 54.457 s | 24.387 s | 30.983 s | 2.13 GiB | 161% |
+| A100 CUDA, `114ef81` | 0-10% by trait | 227.44 s | 120.953 s | 71.911 s | 30.888 s | 2.87 GiB | 124% |
+| A100 CUDA, `fa7506f` | 0-10% by trait | 113.30 s | 54.346 s | 24.321 s | 30.943 s | 2.13 GiB | 162% |
+| Eight-core N2, `114ef81` | none | 1,423.27 s | 986.913 s | 410.919 s | 24.080 s | 2.80 GiB | 599% |
+| Eight-core N2, `114ef81` | 0-10% by trait | 1,407.77 s | 981.663 s | 406.551 s | 18.205 s | 2.80 GiB | 617% |
 
-For complete phenotypes, A100 is 6.26x faster end-to-end, 8.17x faster in
-Level 0, and 5.70x faster in Level 1. N2 averages 75.3% busy across its eight
-cores, materially better CPU use than the one-trait run. Prediction output is
-the exception to the CUDA advantage: A100 takes 30.92 seconds versus 24.08
-seconds on N2. Its grouped-prediction path uploads 45.5 GB of design data and
-spends 9.72 seconds uploading for only 67 ms of device compute.
+For complete phenotypes, `fa7506f` cuts A100 wall time by 50.0%, Level 0 by
+54.9%, and Level 1 by 66.2% relative to the original checkpoint. The
+missing-input result is effectively identical: wall time falls by 50.2% and
+Level 0 by 55.1%. The retained path solves all outcomes together, normalizes
+and reorders their predictions on the device, transfers them into registered
+host storage, and writes phenotype-major blocks asynchronously. Level 1 also
+uses the resident-design path without rereading and transforming the same
+low-memory data twice.
 
-The paired A100 runs are indistinguishable: wall time differs by 0.03%, and
-each named phase differs by less than 0.3%. N2's missing-input run is 1.1%
-faster, with Level 0 changing by 0.5%. These single repetitions provide no
-evidence that the default mean-imputation path has a material performance
-cost at this scale.
+The complete and missing `fa7506f` runs differ by only 0.4% in wall time. The
+original paired A100 runs were similarly close, and the N2 missing-input run
+was 1.1% faster. These measurements provide no evidence that default
+multi-QT mean imputation has a material performance cost at this scale.
 
-Both A100 rows above were started after clearing the page cache. An earlier
+The optimized A100 is now 12.5x faster than the eight-core N2 end-to-end,
+18.1x in Level 0, and 16.9x in Level 1. Prediction output remains host-bound:
+it takes 30.98 seconds on A100 versus 24.08 seconds on N2. The grouped output
+path still uploads 45.5 GB of design data for only about 64 ms of device
+compute, so output-side design reuse remains a concrete next opportunity.
+
+All four A100 rows above were started after clearing the page cache. An earlier
 pair mixed cache states and varied mainly in Level 1 and output despite nearly
 identical Level 0 time; those runs are not used here. This is also a reminder
 that one low-memory run is not enough to characterize post-Level-0 timing when
 the generated prediction files remain cacheable in host memory.
 
-| A100 input | Whole-run GPU util. | Level 0 GPU util. | Level 1/output GPU util. | Whole-run power | Level 0 power | Peak memory | GPU energy |
+| A100 revision and input | Whole-run GPU util. | Level 0 GPU util. | Level 1/output GPU util. | Whole-run power | Level 0 power | Peak memory | GPU energy |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Complete | 33.1% | 27.0% | 41.6% | 88.3 W | 69.7 W | 2,138 MiB | 5.58 Wh |
-| 0-10% missing | 32.9% | 26.4% | 41.4% | 87.5 W | 68.8 W | 2,138 MiB | 5.53 Wh |
+| `114ef81`, complete | 33.1% | 27.0% | 41.6% | 88.3 W | 69.7 W | 2,138 MiB | 5.58 Wh |
+| `fa7506f`, complete | 31.0% | 44.3% | 19.6% | 104.0 W | 133.3 W | 5,020 MiB | 3.28 Wh |
+| `114ef81`, 0-10% missing | 32.9% | 26.4% | 41.4% | 87.5 W | 68.8 W | 2,138 MiB | 5.53 Wh |
+| `fa7506f`, 0-10% missing | 31.6% | 45.8% | 19.7% | 95.9 W | 121.0 W | 5,020 MiB | 3.02 Wh |
 
-This lower-sample-size workload leaves most of A100 unused. Level 0 consumes
-only 3.1% of device memory and 17% of the 400 W power limit. Complete-case
-Level 0 utilization stays between 23% and 35% from p10 to p90, with no samples
-at or above 90%. Across genotype preprocessing, CV matrices, and ridge, 22.96
-seconds (19.0%) are device compute, 29.90 seconds (24.8%) are transfers, and
-67.71 seconds (56.1%) are host orchestration. A100 is still substantially
-faster than the optimized N2 run, but batching/residency and the multi-trait
-prediction-output path leave clear performance on the ground at the
-50,000-sample end of the target range.
+The optimized path raises complete-case Level 0 utilization from 27.0% to
+44.3% while more than halving its elapsed time. Whole-run utilization is
+roughly flat because Level 0 and Level 1 finish much sooner and the unchanged
+31-second output phase occupies a larger share of the run. Measured GPU energy
+falls by 41% for the complete case. This is a throughput gain accompanied by
+better Level 0 use of the device, not an attempt to maximize utilization in
+isolation.
+
+Level 0 ridge transfer is now the largest cost inside the generalized solve:
+23.85 of 48.83 seconds for the complete run, versus 21.17 seconds of device
+compute and 3.81 seconds of host work. Registering the destination buffer per
+block reduced that transfer time by 34% and cut full-run wall time by 9.6%
+relative to the first generalized candidate. A reusable pinned staging buffer
+was also tested on a matched 20,000-variant slice, but its extra host copy
+raised transfer time from 0.640 to 1.078 seconds, so it was not retained.
 
 These are single production-thread measurements on the current branch, not a
 thread sweep. No T4 Step 1 or A100 CPU run was added for this workload.
@@ -220,8 +243,10 @@ The control includes Cox design residency but not the resident solve.
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | Binary control | `50ca3c1` | 170.09 s | 72.006 s | 88.020 s | 7.835 s | 7.64 Wh |
 | Binary resident solve | `87270e6` | 146.43 s | 72.725 s | 63.603 s | 7.843 s | 7.32 Wh |
+| Binary generalized Level 0 | `fa7506f` | 95.34 s | 21.602 s | 63.678 s | 7.843 s | 6.33 Wh |
 | Survival control | `50ca3c1` | 232.15 s | 84.748 s | 137.239 s | 7.841 s | 7.05 Wh |
 | Survival resident solve | `87270e6` | 189.98 s | 84.188 s | 95.587 s | 7.868 s | 6.31 Wh |
+| Survival generalized Level 0 | `fa7506f` | 133.90 s | 25.802 s | 97.869 s | 7.849 s | 6.25 Wh |
 
 The committed binary run is 13.9% faster end-to-end and 27.7% faster in Level
 1. Its measured Level 1 transfers fall from 27.74 seconds to 2.86 seconds.
@@ -229,6 +254,21 @@ The committed survival run is 18.2% faster end-to-end and 30.4% faster in Cox
 Level 1, with Level 1 transfers falling from 41.49 seconds to 2.46 seconds.
 Level 0 and output time are effectively controls here; the gain is where the
 round trip was removed.
+
+Commit `fa7506f` then applies the multi-outcome device-normalization and
+asynchronous-output path to both models. Relative to `87270e6`, binary wall
+time falls by 34.9% and Level 0 by 70.3%; survival wall time falls by 29.5% and
+Level 0 by 69.4%. Level 1 and output are effectively unchanged, which isolates
+the improvement to the intended shared front half of Step 1. The binary Level
+0 averages 80.9% GPU utilization, and survival Level 0 averages 76.3%, up from
+36.8% and 33.4% in the corresponding earlier runs.
+
+All eight binary LOCO files are byte-identical to `87270e6`. Four of eight
+survival files are byte-identical; the other four contain five changed printed
+values among 9.6 million, with a maximum absolute difference of `1e-8`. The
+32-trait quantitative comparisons are similarly tight: four changed values
+among 38.4 million for the complete input and three among 38.4 million for the
+missing-input fixture, again with maximum absolute difference at most `1e-8`.
 
 Two additional candidate repetitions took 147.77 and 148.23 seconds for
 binary traits, with Level 1 at 63.559 and 63.536 seconds. The survival
@@ -246,9 +286,11 @@ evidence of a repeatable energy reduction. Survival is more consistent at
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Binary | 52.6% | 36.3% | 67.2% | 248.0 W | 3,920 MiB | 7.86 Wh |
 | Binary with resident solve | 50.0% | 36.8% | 64.7% | 286.2 W | 3,920 MiB | 7.32 Wh |
+| Binary with generalized Level 0 | 68.1% | 80.9% | 66.4% | 257.3 W | 3,960 MiB | 6.33 Wh |
 | Survival before residency | 18.5% | 38.6% | 17.4% | 62.9 W | 3,244 MiB | 22.82 Wh |
 | Survival with residency | 29.4% | 34.1% | 27.3% | 130.5 W | 4,624 MiB | 7.02 Wh |
 | Survival with resident solve | 32.0% | 33.4% | 31.3% | 157.7 W | 4,624 MiB | 6.31 Wh |
+| Survival with generalized Level 0 | 39.0% | 76.3% | 30.5% | 166.9 W | 4,700 MiB | 6.25 Wh |
 
 The resident solve improves throughput without making utilization the target.
 In the final Cox run, Level 1 still spends 63.77 of 95.59 seconds in host
