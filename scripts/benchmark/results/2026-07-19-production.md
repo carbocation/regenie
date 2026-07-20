@@ -4,9 +4,10 @@ This report began as a performance snapshot of `114ef81` at production-like
 Step 1 scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. It now also
 includes the Cox design-residency change in `50ca3c1` and the resident weighted
 ridge solve in `87270e6`, followed by the small-block Level 0 pipeline in
-`3b285ad`. Unless noted otherwise, timings are external wall time. Step 1 runs
-use five-fold cross-validation, `--bsize 1000`, `--lowmem`, and the default
-Level 0 and Level 1 ridge grids.
+`3b285ad` and the production-width GPU pipeline in `dc64b54`. Unless noted
+otherwise, timings are external wall time. Step 1 runs use five-fold
+cross-validation, `--bsize 1000`, `--lowmem`, and the default Level 0 and Level
+1 ridge grids.
 
 ## Test systems and workloads
 
@@ -27,7 +28,46 @@ all three systems and their SHA-256 digests matched before the CPU comparison.
 Every retained run below uses that one phenotype without phenotype or
 covariate missingness unless the multi-phenotype section says otherwise.
 
-## Headline Step 1 results
+## Current cold-cache A100 result
+
+The production-width optimization was measured on the full 500,000-sample,
+700,000-variant fixture after clearing the page cache. The baseline is the
+previous retained implementation at `3b285ad`; the optimized run uses
+`dc64b54`. Both use the same input, model, 12 host threads, and A100 system.
+
+| Cold run | Wall | REGENIE total | Level 0 | Level 1 | Level 0 + 1 | Level 0 GPU util. | Level 0 power |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `3b285ad` | 188.29 s | 185.507 s | 153.885 s | 17.864 s | 171.749 s | 58.1% | 214.8 W |
+| `dc64b54` | 110.34 s | 107.709 s | 90.312 s | 0.533 s | 90.845 s | 93.5% | 308.0 W |
+
+Level 0 plus Level 1 is 47.1% faster, while internal total time falls by
+41.9%. This is a throughput improvement, not a utilization-only result. During
+the optimized Level 0, median utilization is 95%, p10/p90 are 95%/97%, and
+94.2% of samples are at or above 90%. Mean power is 77.0% of the 400 W limit.
+Whole-run utilization is 78.9% because setup, prediction output, and other
+mostly host-side work remain in the trace.
+
+The retained path keeps fold systems and the assembled Level 1 design on the
+device, normalizes each Level 0 prediction block on the GPU, overlaps its
+low-memory file write with the next block, reuses static phenotype and
+preprocessing inputs, and uses registered packed-PGEN buffers. Static,
+contiguous PGEN worker partitions were also important for cold input: relative
+to the immediately preceding candidate, aggregate PGEN service time fell from
+102.10 to 64.87 seconds and foreground wait from 14.34 to 0.81 seconds.
+
+The fast path is deliberately narrow: one complete quantitative phenotype in
+low-memory mode. Other trait counts, missingness patterns, and models retain
+their existing paths. Small-fixture output is byte-identical to the control.
+At full scale, 2 of 11,500,023 printed numeric values differ from the earlier
+CPU-normalized path; the maximum absolute difference is `1e-9` and the maximum
+relative difference is `2.61e-6`. The optimized build passes the CPU,
+CUDA-auto, and Cox test targets.
+
+Each cold row is one run. The per-block timing and utilization trace support
+the mechanism, but another cold repetition is warranted before treating the
+exact 110.34-second wall time as a stable estimate.
+
+## Original cross-system Step 1 snapshot
 
 | Run | Revision | Backend | N | M | Host threads | Wall | REGENIE total | Level 0 | Peak host RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -223,9 +263,11 @@ GPU telemetry was sampled every 0.5 seconds on A100 and every second on T4.
 
 | Run and phase | Mean GPU util. | Median | p10 / p90 | Samples >=90% | Mean power | Mean of limit | Peak device memory |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A100 700k, whole run | 50.6% | 58% | 0% / 64% | 0.3% | 185 W | 46.3% | 6,432 MiB |
-| A100 700k, Level 0 | 58.8% | 58% | 56% / 64% | 0.0% | 212 W | 53.1% | 4,890 MiB |
-| A100 700k, Level 1/output | 15.9% | 0% | 0% / 39.8% | 0.0% | 71 W | 17.8% | 6,432 MiB |
+| A100 700k original, whole run | 50.6% | 58% | 0% / 64% | 0.3% | 185 W | 46.3% | 6,432 MiB |
+| A100 700k original, Level 0 | 58.8% | 58% | 56% / 64% | 0.0% | 212 W | 53.1% | 4,890 MiB |
+| A100 700k original, Level 1/output | 15.9% | 0% | 0% / 39.8% | 0.0% | 71 W | 17.8% | 6,432 MiB |
+| A100 700k optimized cold, whole run | 78.9% | 95% | 0% / 97% | 78.1% | 265 W | 66.3% | 19,000 MiB |
+| A100 700k optimized cold, Level 0 | 93.5% | 95% | 95% / 97% | 94.2% | 308 W | 77.0% | 18,460 MiB |
 | T4 700k, whole run | 97.0% | 100% | 98% / 100% | 95.0% | 65 W | 93.5% | 6,107 MiB |
 | T4 700k, Level 0 | 98.7% | 100% | 99% / 100% | 96.8% | 66 W | 94.3% | 4,567 MiB |
 | T4 700k, Level 1/output | 35.1% | 0% | 0% / 100% | 28.7% | 44 W | 62.5% | 6,107 MiB |
@@ -236,13 +278,19 @@ Level 0 seconds (82.5%) in Gram construction. It physically reads 58.1 GB, but
 0.68 seconds. The host averages 13.6% busy across eight vCPUs. This is a
 device-compute limit, not a host-thread or input-pipeline limit.
 
-The A100 is not saturated. Level 0 uses only about 59% of the GPU and 12% of
-its 40 GB memory. Its utilization is also extremely steady (56% p10, 64% p90),
-which points to a repeated per-block work/transfer/orchestration ceiling rather
-than occasional I/O stalls. Level 1 and prediction output leave the device
-mostly idle. Level 0 power nevertheless reaches 363 W at p90 and 392 W at its
-maximum, so individual kernels can drive the device; the low mean is consistent
-with gaps and lower-intensity work between those bursts, not a low power cap.
+The original A100 path is not saturated. Level 0 uses only about 59% of the GPU
+and 12% of its 40 GB memory. Its utilization is also extremely steady (56% p10,
+64% p90), which points to a repeated per-block work/transfer/orchestration
+ceiling rather than occasional I/O stalls. Level 0 power nevertheless reaches
+363 W at p90 and 392 W at its maximum, so individual kernels can drive the
+device; the low mean reflects gaps and lower-intensity work between those
+bursts, not a low power cap.
+
+The optimized cold run closes that gap during Level 0: mean utilization rises
+to 93.5% and Level 0 plus Level 1 falls from 171.75 to 90.85 seconds. Peak
+Level 0 device memory rises from 4,890 to 18,460 MiB because the Level 1 design
+is retained on the GPU. Level 1 itself is only 0.53 seconds; setup and output,
+not the core fit, now account for most remaining low-utilization samples.
 
 ## A100 Level 0 profile
 
@@ -467,11 +515,11 @@ CPU use, and peak RSS but do not invent phase-level values.
 
 - Every retained run exited successfully. The original current-branch snapshot
   uses `114ef81`; the retained GPU optimization checkpoints are `50ca3c1`,
-  `87270e6`, and `3b285ad`. The upstream CPU anchor is v4.1.2 at
+  `87270e6`, `3b285ad`, and `dc64b54`. The upstream CPU anchor is v4.1.2 at
   `5f924b9bf54c1c7597174345def6eb2f1dee712c`.
 - The original branch binaries passed all three CTest targets on each system.
-  The `87270e6` and `3b285ad` builds passed the CPU, CUDA-auto, and Cox tests on
-  the A100.
+  The `87270e6`, `3b285ad`, and `dc64b54` builds passed the CPU, CUDA-auto, and
+  Cox tests on the A100.
   Dynamic linkage was checked before measurement: all x86 builds use oneMKL
   2026.1, and the GPU builds also link to the expected CUDA libraries. The
   full upstream run reproduced the current ridge scores and numerically
