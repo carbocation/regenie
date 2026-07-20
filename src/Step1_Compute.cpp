@@ -240,6 +240,14 @@ bool Step1ComputeBackend::cache_design_partitions(
   return false;
 }
 
+bool Step1ComputeBackend::cache_design_matrix(
+  const Eigen::Ref<const Eigen::MatrixXd>& design,
+  Step1ComputeTimings* timings) {
+  (void)design;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::predict_cached_design(
   const Eigen::Ref<const Eigen::VectorXd>& coefficients,
   Eigen::VectorXd& predictions,

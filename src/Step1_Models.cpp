@@ -2767,6 +2767,13 @@ void apply_iter_cond(int const& chrom, int const& block, int const& ph, struct r
 
 void ridge_cox_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, struct ests* m_ests, Step1ComputeBackend* compute_backend, mstream& sout) {
   sout << endl << " Level 1 ridge with cox regression..." << endl << flush;
+
+  const auto level1_wall_start = std::chrono::high_resolution_clock::now();
+  Step1ComputeTimings level1_timings;
+  Step1ComputeTimings* profile_timings =
+    params->profile_step1 ? &level1_timings : nullptr;
+  double cache_wall_ms = 0;
+  uint64_t resident_design_phenotypes = 0;
   
   int ph_eff, l0_idx;
   int time_index, event_index;
@@ -2815,13 +2822,28 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
 
     check_l0(time_index, ph_eff, params, l1, pheno_data, sout);
 
+    const auto cache_start = std::chrono::high_resolution_clock::now();
+    const bool resident_design = compute_backend->cache_design_matrix(
+      l1->test_mat_conc[ph_eff], profile_timings);
+    cache_wall_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - cache_start).count();
+    if(resident_design) resident_design_phenotypes++;
+    if(params->profile_step1)
+      sout << "\nSTEP1_LEVEL1_CACHE phenotype=" << time_name
+           << " rows=" << l1->test_mat_conc[ph_eff].rows()
+           << " columns=" << l1->test_mat_conc[ph_eff].cols()
+           << " bytes=" <<
+                static_cast<uint64_t>(l1->test_mat_conc[ph_eff].size()) *
+                  sizeof(double)
+           << " resident_design=" << resident_design << endl;
+
     for(int i = 0; i < params->cv_folds; ++i ) {
       ArrayXb fold_train_mask = (l1->fold_id[time_index].array() != i) && mask;
       ArrayXb fold_test_mask = (l1->fold_id[time_index].array() == i) && mask;
       
       survival_data survivalData_fold;
       survivalData_fold.setup(ph_time, ph_event, fold_train_mask, true);
-      cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true, compute_backend);
+      cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true, compute_backend, resident_design, profile_timings);
       coxRidgePath_fold.fit(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask);
 
       if (!coxRidgePath_fold.converge.all()) {
@@ -2837,10 +2859,41 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
         l1->cumsum_values[5](time_index, l) += coxRidge_test.get_null_deviance();
       }
     }
+    if(resident_design) compute_backend->release_cached_design();
     sout << "done";
     auto ts2 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(ts2 - ts1);
     sout << " (" << duration.count() << "ms) "<< endl;
   }
   sout << endl;
+
+  if(params->profile_step1) {
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() -
+        level1_wall_start).count();
+    const double backend_ms = level1_timings.upload_ms +
+      level1_timings.crossproduct_ms + level1_timings.gram_ms +
+      level1_timings.ridge_ms + level1_timings.download_ms;
+    std::ostringstream profile;
+    profile << std::fixed << std::setprecision(3)
+      << "STEP1_PROFILE scope=level1_cox"
+      << " wall_ms=" << wall_ms
+      << " cache_wall_ms=" << cache_wall_ms
+      << " resident_design_phenotypes=" << resident_design_phenotypes
+      << " resident_design_uploads=" <<
+           level1_timings.resident_design_upload_count
+      << " resident_design_upload_bytes=" <<
+           level1_timings.resident_design_upload_bytes
+      << " resident_design_reuses=" <<
+           level1_timings.resident_design_reuse_count
+      << " upload_ms=" << level1_timings.upload_ms
+      << " gram_ms=" << level1_timings.gram_ms
+      << " crossproduct_ms=" << level1_timings.crossproduct_ms
+      << " ridge_ms=" << level1_timings.ridge_ms
+      << " download_ms=" << level1_timings.download_ms
+      << " host_orchestration_ms=" <<
+           std::max(0.0, wall_ms - backend_ms)
+      << "\n";
+    sout << profile.str();
+  }
 }

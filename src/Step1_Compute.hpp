@@ -182,6 +182,10 @@ class Step1ComputeBackend {
       const std::vector<Eigen::MatrixXd>& partitions,
       Step1ComputeTimings* timings = nullptr);
 
+    virtual bool cache_design_matrix(
+      const Eigen::Ref<const Eigen::MatrixXd>& design,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void predict_cached_design(
       const Eigen::Ref<const Eigen::VectorXd>& coefficients,
       Eigen::VectorXd& predictions,

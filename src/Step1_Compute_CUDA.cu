@@ -1083,6 +1083,70 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       return true;
     }
 
+    bool cache_design_matrix(
+      const Eigen::Ref<const Eigen::MatrixXd>& design,
+      Step1ComputeTimings* timings) override {
+
+      invalidate_resident_design();
+      invalidate_resident_genotypes();
+      const Eigen::Index rows = design.rows();
+      const Eigen::Index columns = design.cols();
+      const long long required_elements_long =
+        static_cast<long long>(rows) * columns;
+      if(required_elements_long < 0 || required_elements_long > INT_MAX ||
+         required_elements_long > level1_resident_max_elements_)
+        return false;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const Eigen::Index required_elements =
+        static_cast<Eigen::Index>(required_elements_long);
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+      (void)total_bytes;
+      const size_t resident_growth = required_elements >
+        static_cast<Eigen::Index>(resident_genotypes_capacity_) ?
+        static_cast<size_t>(required_elements -
+          static_cast<Eigen::Index>(resident_genotypes_capacity_)) *
+            sizeof(double) : 0;
+      const size_t workspace_growth = required_elements >
+        static_cast<Eigen::Index>(projected_capacity_) ?
+        static_cast<size_t>(required_elements -
+          static_cast<Eigen::Index>(projected_capacity_)) *
+            sizeof(double) : 0;
+      const size_t reserve_bytes = size_t(512) * 1000000;
+      if(resident_growth > free_bytes ||
+         workspace_growth > free_bytes - resident_growth ||
+         reserve_bytes > free_bytes - resident_growth - workspace_growth)
+        return false;
+
+      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+        required_elements, "cudaMalloc(resident Level 1 design)");
+      ensure_capacity(d_projected_, projected_capacity_, required_elements,
+        "cudaMalloc(resident Level 1 weighted-design workspace)");
+
+      const Eigen::MatrixXd packed_design =
+        contiguous_copy_if_needed(design);
+      const double* design_data = packed_design.size() ?
+        packed_design.data() : design.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      if(required_elements > 0)
+        copy_host_to_device_staged(d_resident_genotypes_, design_data,
+          static_cast<size_t>(required_elements) * sizeof(double),
+          "copy Level 1 design matrix to CUDA device", timings);
+      if(timings) {
+        timings->upload_ms += elapsed_ms(transfer_start);
+        timings->resident_design_upload_count++;
+        timings->resident_design_upload_bytes +=
+          static_cast<uint64_t>(required_elements) * sizeof(double);
+      }
+      resident_design_rows_ = rows;
+      resident_design_columns_ = columns;
+      resident_design_valid_ = true;
+      return true;
+    }
+
     void predict_cached_design(
       const Eigen::Ref<const Eigen::VectorXd>& coefficients,
       Eigen::VectorXd& predictions,

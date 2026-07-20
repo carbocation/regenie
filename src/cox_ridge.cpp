@@ -11,32 +11,46 @@ namespace {
 Eigen::VectorXd step1_linear_prediction(
     Step1ComputeBackend* compute_backend,
     const Eigen::MatrixXd& design,
-    const Eigen::VectorXd& coefficients) {
+    const Eigen::VectorXd& coefficients,
+    bool resident_design,
+    Step1ComputeTimings* timings) {
     if(!compute_backend) return design * coefficients;
+    if(resident_design) {
+        Eigen::VectorXd prediction;
+        compute_backend->predict_cached_design(
+            coefficients, prediction, timings);
+        return prediction;
+    }
     Eigen::VectorXi group_offset(1), group_size(1);
     group_offset(0) = 0;
     group_size(0) = design.cols();
     Eigen::MatrixXd prediction;
     compute_backend->grouped_predict(
-        design, coefficients, group_offset, group_size, prediction);
+        design, coefficients, group_offset, group_size, prediction, timings);
     return prediction.col(0);
 }
 
 Eigen::VectorXd step1_design_crossproduct(
     Step1ComputeBackend* compute_backend,
     const Eigen::MatrixXd& design,
-    const Eigen::VectorXd& values) {
+    const Eigen::VectorXd& values,
+    bool resident_design,
+    Step1ComputeTimings* timings) {
     if(!compute_backend) return design.transpose() * values;
     const Eigen::MatrixXd outcome = values;
     Eigen::MatrixXd crossproduct;
-    compute_backend->compute_design_crossproduct(
-        design, outcome, crossproduct);
+    if(resident_design)
+        compute_backend->compute_cached_design_crossproduct(
+            outcome, crossproduct, timings);
+    else
+        compute_backend->compute_design_crossproduct(
+            design, outcome, crossproduct, timings);
     return crossproduct.col(0);
 }
 
 }
 
-cox_ridge::cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const double& lambda_val, const int& max_iter, const int& max_inner_iter, const double& tolerance, const bool& verbose_obj, const Eigen::VectorXd& beta_init, const double& null_deviance, Step1ComputeBackend* compute_backend) {
+cox_ridge::cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const double& lambda_val, const int& max_iter, const int& max_inner_iter, const double& tolerance, const bool& verbose_obj, const Eigen::VectorXd& beta_init, const double& null_deviance, Step1ComputeBackend* compute_backend, const bool& resident_design, Step1ComputeTimings* timings) {
     converge = false;
 
     if (beta_init.size() > 0) {
@@ -50,11 +64,14 @@ cox_ridge::cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& X
     _tol = tolerance;
     _verbose = verbose_obj;
     _compute_backend = compute_backend;
+    _resident_design = resident_design;
+    _timings = timings;
     _object.resize(_niter + 1);
     _deviance.resize(_niter + 1);
 
     eta = mask.select(
-        step1_linear_prediction(_compute_backend, Xmat, beta) + offset_val,
+        step1_linear_prediction(_compute_backend, Xmat, beta,
+            _resident_design, _timings) + offset_val,
         0).matrix();
     eta_order = survivalData.permute_mtx * eta;
     
@@ -79,7 +96,8 @@ void cox_ridge::reset(const survival_data& survivalData, const Eigen::MatrixXd& 
 
     // Calculate eta, eta_order, or other necessary calculations
     eta = mask.select(
-        step1_linear_prediction(_compute_backend, Xmat, beta) + offset_val,
+        step1_linear_prediction(_compute_backend, Xmat, beta,
+            _resident_design, _timings) + offset_val,
         0).matrix();
     eta_order = survivalData.permute_mtx * eta;
 
@@ -164,16 +182,23 @@ void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
                 (-_diagHessian.array()).max(0.0), 0.0).matrix();
             const Eigen::MatrixXd working_response = z;
             Eigen::MatrixXd gram, crossproduct, solution;
-            _compute_backend->compute_weighted_design_products(
-                Xmat, weights, working_response, gram, crossproduct);
+            if(_resident_design)
+                _compute_backend->compute_cached_weighted_design_products(
+                    weights, working_response, gram, crossproduct, _timings);
+            else
+                _compute_backend->compute_weighted_design_products(
+                    Xmat, weights, working_response, gram, crossproduct,
+                    _timings);
             Eigen::VectorXd ridge_parameter(1);
             ridge_parameter(0) = lambda;
             const Eigen::VectorXd penalty_multipliers = Eigen::VectorXd::Ones(p);
             _compute_backend->diagonal_penalty_solve(
-                gram, crossproduct, ridge_parameter, penalty_multipliers, solution);
+                gram, crossproduct, ridge_parameter, penalty_multipliers,
+                solution, _timings);
             beta = solution.col(0);
             eta = mask.select(
-                step1_linear_prediction(_compute_backend, Xmat, beta) + offset_val,
+                step1_linear_prediction(_compute_backend, Xmat, beta,
+                    _resident_design, _timings) + offset_val,
                 0).matrix();
         } else {
             for (unsigned int k = 0; k < p; ++k) {
@@ -188,7 +213,8 @@ void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
         _deviance(t) = _coxDeviance(survivalData);
         _object(t) = _deviance(t) + lambda * (beta.array().pow(2).sum())/2;
         const Eigen::VectorXd gradient_crossproduct =
-            step1_design_crossproduct(_compute_backend, Xmat, _gradient);
+            step1_design_crossproduct(_compute_backend, Xmat, _gradient,
+                _resident_design, _timings);
         if (_verbose) {
             std::cout << "Iteration " << t << " objective: " << _object(t) << "; diff: " << _object(t) - _object(t-1) << "; rel diff: " << abs(_object(t) - _object(t - 1)) / (0.1 + abs(_object(t))) << "; score: " << (gradient_crossproduct - lambda * beta).cwiseAbs().maxCoeff() << "\n";
         }
@@ -205,7 +231,8 @@ void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
                 }
                 beta = (beta + beta_old)/2;
                 eta = mask.select(
-                    step1_linear_prediction(_compute_backend, Xmat, beta) + offset_val,
+                    step1_linear_prediction(_compute_backend, Xmat, beta,
+                        _resident_design, _timings) + offset_val,
                     0).matrix();
                 eta_order = survivalData.permute_mtx * eta;
                 _deviance(t) = _coxDeviance(survivalData);
@@ -255,8 +282,10 @@ Eigen::VectorXd cox_ridge::get_deviance_all() {
 }
 
 
-cox_ridge_path::cox_ridge_path(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const int& nlambda, const double& lambda_min_max_ratio, const Eigen::VectorXd& lambda, const int& max_iter, const int& max_inner_iter, const double& tolerance, const bool& verbose_fit, Step1ComputeBackend* compute_backend) {
+cox_ridge_path::cox_ridge_path(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const int& nlambda, const double& lambda_min_max_ratio, const Eigen::VectorXd& lambda, const int& max_iter, const int& max_inner_iter, const double& tolerance, const bool& verbose_fit, Step1ComputeBackend* compute_backend, const bool& resident_design, Step1ComputeTimings* timings) {
     _compute_backend = compute_backend;
+    _resident_design = resident_design;
+    _timings = timings;
     int p = Xmat.cols();
     // set lambda_vec
     if (lambda.size() > 0) {
@@ -308,14 +337,17 @@ cox_ridge_path::cox_ridge_path(const survival_data& survivalData, const Eigen::M
 
 double cox_ridge_path::_getCoxLambdaMax(const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& gradient) {
     Eigen::VectorXd g = step1_design_crossproduct(
-        _compute_backend, Xmat, gradient).array().abs();
+        _compute_backend, Xmat, gradient, _resident_design,
+        _timings).array().abs();
     return g.maxCoeff() / 1e-3;
 }
 
 void cox_ridge_path::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask) {
     int break_pt = 0;
     double cur_lambda = lambda_vec(0);
-    cox_ridge coxRidge(survivalData, Xmat, offset_val, mask, cur_lambda, niter, mxitnr, tol, verbose, Eigen::VectorXd(), -999, _compute_backend);
+    cox_ridge coxRidge(survivalData, Xmat, offset_val, mask, cur_lambda,
+        niter, mxitnr, tol, verbose, Eigen::VectorXd(), -999,
+        _compute_backend, _resident_design, _timings);
     double nulldev_old = -999;
     Eigen::VectorXd beta_old(Xmat.cols());
 

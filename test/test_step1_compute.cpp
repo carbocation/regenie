@@ -1625,6 +1625,23 @@ void run_conformance(Step1ComputeBackend& candidate) {
       throw std::runtime_error(
         "resident design remained reusable after release");
 
+    Step1ComputeTimings resident_matrix_timings;
+    if(!candidate.cache_design_matrix(
+         resident_design, &resident_matrix_timings))
+      throw std::runtime_error(
+        "resident design matrix caching disagreed with partition caching");
+    candidate.predict_cached_design(resident_coefficients,
+      resident_predictions, &resident_matrix_timings);
+    if(relative_error(resident_predictions,
+         expected_resident_predictions) > 5e-12 ||
+       resident_matrix_timings.resident_design_upload_count != 1 ||
+       resident_matrix_timings.resident_design_upload_bytes !=
+         static_cast<uint64_t>(resident_design.size()) * sizeof(double) ||
+       resident_matrix_timings.resident_design_reuse_count != 1)
+      throw std::runtime_error(
+        "resident design matrix operation conformance tolerance exceeded");
+    candidate.release_cached_design();
+
     std::cout << "STEP1_BACKEND_TEST case=resident_design_operations"
               << " supported=1"
               << " prediction_relative_error=" << resident_prediction_error
