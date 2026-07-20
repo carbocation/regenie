@@ -179,7 +179,10 @@ struct geno_block {
   std::vector<unsigned char> step2_pgen_packed_unexpanded;
   Eigen::MatrixXd step2_backend_score_numerators;
   Eigen::MatrixXd step2_backend_score_denominators;
+  Eigen::MatrixXd step2_backend_observed_allele_sums;
+  Eigen::MatrixXd step2_backend_observed_nonmissing_counts;
   bool step2_backend_scores_valid = false;
+  bool step2_backend_trait_counts_valid = false;
   bool step2_pgen_direct_qt_enabled = false;
   // Covariates followed by the one phenotype residual, contiguous by sample,
   // for cache-friendly direct packed scoring.

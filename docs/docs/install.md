@@ -110,6 +110,9 @@ Firth and SPA corrections also run on the CPU after the initial score, so GPU
 utilization can be low when many variants require correction. The Step 2
 backend consumes PGEN's packed hardcalls directly and avoids expanding an
 otherwise-unused dense host genotype block for eligible score-only analyses.
+When phenotype masks differ, it also derives each trait's allele count and
+nonmissing sample count from the packed block on the GPU instead of expanding
+the genotype for host-side bookkeeping.
 Use `--step2-profile` to report whether CUDA was selected, the main Step 2 phase
 times, and the backend's transfer and kernel times.
 

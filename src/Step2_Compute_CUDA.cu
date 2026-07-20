@@ -214,6 +214,38 @@ __global__ void quantitative_missing_score_kernel(
   denominators[output] = denominator;
 }
 
+__global__ void observed_trait_counts_kernel(
+    const unsigned char* packed, int packed_stride,
+    const unsigned char* observed, int samples, int phenotypes,
+    double* observed_allele_sums, double* observed_nonmissing_counts) {
+  const int variant = blockIdx.x;
+  const int phenotype = blockIdx.y;
+  const unsigned char* variant_packed =
+    packed + static_cast<size_t>(variant) * packed_stride;
+  const unsigned char* phenotype_observed =
+    observed + static_cast<size_t>(phenotype) * samples;
+  double terms[2] = {};
+
+  for(int sample = threadIdx.x; sample < samples; sample += blockDim.x) {
+    if(!phenotype_observed[sample]) continue;
+    const unsigned int code =
+      (variant_packed[sample >> 2] >> (2 * (sample & 3))) & 3;
+    if(code == 3) continue;
+    terms[0] += code;
+    terms[1] += 1;
+  }
+
+  extern __shared__ double shared_terms[];
+  reduce_terms(terms, 2, shared_terms);
+  if((threadIdx.x & (warpSize - 1)) != 0 ||
+     threadIdx.x / warpSize != 0) return;
+
+  const size_t output =
+    static_cast<size_t>(variant) * phenotypes + phenotype;
+  observed_allele_sums[output] = terms[0];
+  observed_nonmissing_counts[output] = terms[1];
+}
+
 __global__ void binary_score_kernel(
     const unsigned char* packed, int packed_stride,
     const double* missing_means, const unsigned char* flipped,
@@ -372,11 +404,15 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
   }
 
   bool ready() const override { return mode_ != ScoreMode::none; }
+  bool provides_observed_trait_counts() const override {
+    return ready() && trait_counts_required_;
+  }
 
   void clear() override {
     mode_ = ScoreMode::none;
     attempted_ = false;
     samples_ = phenotypes_ = covariates_ = 0;
+    trait_counts_required_ = false;
   }
 
   bool prepare_quantitative(
@@ -408,6 +444,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     phenotypes_ = static_cast<int>(residuals.cols());
     covariates_ = static_cast<int>(covariates.cols());
     quantitative_complete_masks_ = complete_masks;
+    trait_counts_required_ = !complete_masks;
     active_host_.assign(phenotypes_, 1);
     small_host_.resize(static_cast<size_t>(phenotypes_) * covariates_);
     for(int phenotype = 0; phenotype < phenotypes_; ++phenotype)
@@ -469,6 +506,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>& weights,
       const std::vector<Eigen::MatrixXd>& designs,
       const std::vector<Eigen::VectorXd>& design_residual_products,
+      const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+        Eigen::Dynamic>>& observed_masks,
       const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
         active_phenotypes,
       Step2ComputeTimings* timings) override {
@@ -479,6 +518,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
        weights.cols() != residuals.cols() ||
        designs.size() != static_cast<size_t>(residuals.cols()) ||
        design_residual_products.size() != designs.size() ||
+       observed_masks.rows() != residuals.rows() ||
+       observed_masks.cols() != residuals.cols() ||
        active_phenotypes.size() != residuals.cols())
       return false;
 
@@ -519,6 +560,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     upload_static(residuals.data(), residuals.size(), weights.data(),
       weights.size(), designs_host_.data(), designs_host_.size(), nullptr, 0,
       small_host_.data(), small_host_.size(), nullptr, 0, nullptr, 0);
+    prepare_observed_masks(observed_masks);
     mode_ = ScoreMode::binary;
     if(timings) {
       timings->prepared_chromosomes++;
@@ -534,6 +576,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       const std::vector<Eigen::VectorXd>& projection_scores,
       const std::vector<Eigen::MatrixXd>& projection_grams,
       const Eigen::Ref<const Eigen::VectorXd>& residual_variances,
+      const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+        Eigen::Dynamic>>& observed_masks,
       const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
         active_phenotypes,
       Step2ComputeTimings* timings) override {
@@ -546,6 +590,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
        projection_scores.size() != score_residuals.size() ||
        projection_grams.size() != score_residuals.size() ||
        residual_variances.size() != phenotype_count ||
+       observed_masks.cols() != phenotype_count ||
        active_phenotypes.size() != phenotype_count)
       return false;
 
@@ -558,7 +603,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       break;
     }
     if(sample_count <= 0 || covariate_count <= 0 ||
-       covariate_count > kMaximumCovariates)
+       covariate_count > kMaximumCovariates ||
+       observed_masks.rows() != sample_count)
       return false;
 
     const std::chrono::steady_clock::time_point start =
@@ -617,6 +663,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       projections_host_.data(), projections_host_.size(),
       small_host_.data(), small_host_.size(), grams_host_.data(),
       grams_host_.size(), variances_host_.data(), variances_host_.size());
+    prepare_observed_masks(observed_masks);
     mode_ = ScoreMode::cox;
     if(timings) {
       timings->prepared_chromosomes++;
@@ -633,6 +680,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       Eigen::Index samples,
       Eigen::MatrixXd& numerators,
       Eigen::MatrixXd& denominators,
+      Eigen::MatrixXd& observed_allele_sums,
+      Eigen::MatrixXd& observed_nonmissing_counts,
       Step2ComputeTimings* timings) override {
     if(!ready() || samples != samples_ || packed_hardcalls.empty())
       return false;
@@ -657,8 +706,11 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     }
     if(timings) timings->host_pack_ms += elapsed_ms(pack_start);
 
-    ensure_dynamic(packed_host_.size(), variants,
-      static_cast<size_t>(variants) * phenotypes_);
+    const bool return_trait_counts = trait_counts_required_;
+    const size_t output_count =
+      static_cast<size_t>(variants) * phenotypes_;
+    ensure_dynamic(packed_host_.size(), variants, output_count,
+      return_trait_counts);
     cudaEvent_t start;
     cudaEvent_t stop;
     check_cuda(cudaEventCreate(&start), "create Step 2 CUDA start event");
@@ -716,6 +768,16 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
         d_denominators_);
     }
     check_cuda(cudaGetLastError(), "launch Step 2 packed score kernel");
+    if(return_trait_counts) {
+      const size_t count_shared_bytes =
+        static_cast<size_t>(2 * warp_count) * sizeof(double);
+      observed_trait_counts_kernel<<<grid, threads, count_shared_bytes>>>(
+        d_packed_, static_cast<int>(packed_stride), d_observed_, samples_,
+        phenotypes_, d_observed_allele_sums_,
+        d_observed_nonmissing_counts_);
+      check_cuda(cudaGetLastError(),
+        "launch Step 2 observed trait counts kernel");
+    }
     check_cuda(cudaEventRecord(stop), "record Step 2 score stop");
     check_cuda(cudaEventSynchronize(stop), "synchronize Step 2 score");
     check_cuda(cudaEventElapsedTime(&measured_ms, start, stop),
@@ -724,6 +786,13 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
 
     numerators.resize(phenotypes_, variants);
     denominators.resize(phenotypes_, variants);
+    if(return_trait_counts) {
+      observed_allele_sums.resize(phenotypes_, variants);
+      observed_nonmissing_counts.resize(phenotypes_, variants);
+    } else {
+      observed_allele_sums.resize(0, 0);
+      observed_nonmissing_counts.resize(0, 0);
+    }
     check_cuda(cudaEventRecord(start), "record Step 2 score download start");
     check_cuda(cudaMemcpyAsync(numerators.data(), d_numerators_,
       static_cast<size_t>(variants) * phenotypes_ * sizeof(double),
@@ -731,6 +800,16 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     check_cuda(cudaMemcpyAsync(denominators.data(), d_denominators_,
       static_cast<size_t>(variants) * phenotypes_ * sizeof(double),
       cudaMemcpyDeviceToHost), "download Step 2 score denominators");
+    if(return_trait_counts) {
+      check_cuda(cudaMemcpyAsync(observed_allele_sums.data(),
+        d_observed_allele_sums_, output_count * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "download Step 2 observed allele sums");
+      check_cuda(cudaMemcpyAsync(observed_nonmissing_counts.data(),
+        d_observed_nonmissing_counts_, output_count * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "download Step 2 observed nonmissing counts");
+    }
     check_cuda(cudaEventRecord(stop), "record Step 2 score download stop");
     check_cuda(cudaEventSynchronize(stop),
       "synchronize Step 2 score download");
@@ -796,8 +875,27 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       cudaMemcpyHostToDevice), "upload Step 2 active traits");
   }
 
+  void prepare_observed_masks(
+      const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+        Eigen::Dynamic>>& observed_masks) {
+    trait_counts_required_ = !observed_masks.array().all();
+    observed_host_.clear();
+    if(!trait_counts_required_) return;
+    observed_host_.resize(static_cast<size_t>(samples_) * phenotypes_);
+    for(int phenotype = 0; phenotype < phenotypes_; ++phenotype)
+      for(int sample = 0; sample < samples_; ++sample)
+        observed_host_[static_cast<size_t>(phenotype) * samples_ + sample] =
+          observed_masks(sample, phenotype) ? 1 : 0;
+    replace_buffer(reinterpret_cast<void**>(&d_observed_),
+      &observed_capacity_, observed_host_.size(),
+      "allocate Step 2 observed masks");
+    check_cuda(cudaMemcpy(d_observed_, observed_host_.data(),
+      observed_host_.size(), cudaMemcpyHostToDevice),
+      "upload Step 2 observed masks");
+  }
+
   void ensure_dynamic(size_t packed_bytes, int variants,
-      size_t output_count) {
+      size_t output_count, bool trait_counts) {
     replace_buffer(reinterpret_cast<void**>(&d_packed_), &packed_capacity_,
       packed_bytes, "allocate Step 2 packed hardcalls");
     replace_buffer(reinterpret_cast<void**>(&d_means_), &mean_capacity_,
@@ -813,6 +911,15 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     replace_buffer(reinterpret_cast<void**>(&d_denominators_),
       &denominator_capacity_, output_count * sizeof(double),
       "allocate Step 2 score denominators");
+    if(trait_counts) {
+      replace_buffer(reinterpret_cast<void**>(&d_observed_allele_sums_),
+        &observed_allele_sum_capacity_, output_count * sizeof(double),
+        "allocate Step 2 observed allele sums");
+      replace_buffer(
+        reinterpret_cast<void**>(&d_observed_nonmissing_counts_),
+        &observed_nonmissing_count_capacity_, output_count * sizeof(double),
+        "allocate Step 2 observed nonmissing counts");
+    }
   }
 
   void release(void* pointer) {
@@ -835,6 +942,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     release(d_sparse_);
     release(d_numerators_);
     release(d_denominators_);
+    release(d_observed_allele_sums_);
+    release(d_observed_nonmissing_counts_);
   }
 
   int device_ = 0;
@@ -846,6 +955,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
   int phenotypes_ = 0;
   int covariates_ = 0;
   bool quantitative_complete_masks_ = true;
+  bool trait_counts_required_ = false;
 
   std::vector<unsigned char> active_host_;
   std::vector<unsigned char> observed_host_;
@@ -872,6 +982,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
   unsigned char* d_sparse_ = nullptr;
   double* d_numerators_ = nullptr;
   double* d_denominators_ = nullptr;
+  double* d_observed_allele_sums_ = nullptr;
+  double* d_observed_nonmissing_counts_ = nullptr;
 
   size_t residual_capacity_ = 0;
   size_t weight_capacity_ = 0;
@@ -888,6 +1000,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
   size_t sparse_capacity_ = 0;
   size_t numerator_capacity_ = 0;
   size_t denominator_capacity_ = 0;
+  size_t observed_allele_sum_capacity_ = 0;
+  size_t observed_nonmissing_count_capacity_ = 0;
 };
 
 }  // namespace

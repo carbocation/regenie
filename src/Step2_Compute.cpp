@@ -43,6 +43,7 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
     return "host Step 2 scoring";
   }
   bool ready() const override { return false; }
+  bool provides_observed_trait_counts() const override { return false; }
   void clear() override {}
 
   bool prepare_quantitative(
@@ -60,6 +61,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>&,
       const std::vector<Eigen::MatrixXd>&,
       const std::vector<Eigen::VectorXd>&,
+      const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+        Eigen::Dynamic>>&,
       const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&,
       Step2ComputeTimings*) override {
     return false;
@@ -72,6 +75,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       const std::vector<Eigen::VectorXd>&,
       const std::vector<Eigen::MatrixXd>&,
       const Eigen::Ref<const Eigen::VectorXd>&,
+      const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+        Eigen::Dynamic>>&,
       const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&,
       Step2ComputeTimings*) override {
     return false;
@@ -83,6 +88,7 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       const std::vector<unsigned char>&,
       const std::vector<unsigned char>&,
       Eigen::Index, Eigen::MatrixXd&, Eigen::MatrixXd&,
+      Eigen::MatrixXd&, Eigen::MatrixXd&,
       Step2ComputeTimings*) override {
     return false;
   }

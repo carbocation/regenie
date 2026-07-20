@@ -55,6 +55,7 @@ class Step2ComputeBackend {
   virtual const char* name() const = 0;
   virtual std::string description() const = 0;
   virtual bool ready() const = 0;
+  virtual bool provides_observed_trait_counts() const = 0;
   virtual void clear() = 0;
 
   virtual bool prepare_quantitative(
@@ -71,6 +72,8 @@ class Step2ComputeBackend {
     const Eigen::Ref<const Eigen::MatrixXd>& weights,
     const std::vector<Eigen::MatrixXd>& designs,
     const std::vector<Eigen::VectorXd>& design_residual_products,
+    const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+      Eigen::Dynamic>>& observed_masks,
     const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
       active_phenotypes,
     Step2ComputeTimings* timings = nullptr) = 0;
@@ -82,6 +85,8 @@ class Step2ComputeBackend {
     const std::vector<Eigen::VectorXd>& projection_scores,
     const std::vector<Eigen::MatrixXd>& projection_grams,
     const Eigen::Ref<const Eigen::VectorXd>& residual_variances,
+    const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+      Eigen::Dynamic>>& observed_masks,
     const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
       active_phenotypes,
     Step2ComputeTimings* timings = nullptr) = 0;
@@ -94,6 +99,8 @@ class Step2ComputeBackend {
     Eigen::Index samples,
     Eigen::MatrixXd& numerators,
     Eigen::MatrixXd& denominators,
+    Eigen::MatrixXd& observed_allele_sums,
+    Eigen::MatrixXd& observed_nonmissing_counts,
     Step2ComputeTimings* timings = nullptr) = 0;
 };
 

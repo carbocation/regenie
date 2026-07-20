@@ -296,12 +296,15 @@ Step 1 arguments for the dataset and trait type being analyzed. Add
 
 Step 2 CUDA support is narrower. It accepts additive single-variant tests from
 PGEN hardcalls and computes packed quantitative, binary, or approximate Cox
-score statistics on the GPU. Dosages, exact Cox scores, interactions,
-gene-based tests, and other unsupported workflows use the CPU. Approximate
-Firth and SPA corrections also remain on the CPU after the initial GPU score.
-Consequently, a CUDA build does not imply that a complete Step 2 analysis is
-GPU-bound or faster than a dedicated CPU machine. Use `--step2-profile` to see
-the active backend and phase timings for a particular workload.
+score statistics on the GPU. Phenotype-specific allele counts are computed
+from the same packed data, so eligible score-only analyses remain packed even
+when traits have different missing samples. Dosages, exact Cox scores,
+interactions, gene-based tests, and other unsupported workflows use the CPU.
+Approximate Firth and SPA corrections also remain on the CPU after the initial
+GPU score. Consequently, a CUDA build does not imply that a complete Step 2
+analysis is GPU-bound or faster than a dedicated CPU machine. Use
+`--step2-profile` to see the active backend and phase timings for a particular
+workload.
 
 ## Redistributable Apple Silicon build
 

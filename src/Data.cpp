@@ -3812,6 +3812,7 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
   std::iota(indices.begin(), indices.end(), start);
 
   Gblock.step2_backend_scores_valid = false;
+  Gblock.step2_backend_trait_counts_valid = false;
   if(params.profile_step2) profile_stage_start = ProfileClock::now();
   readChunk(indices, chrom, snp_data_blocks, insize, outsize, all_snps_info);
   if(params.profile_step2) {
@@ -3843,7 +3844,39 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
         Gblock.step2_pgen_packed_means, flipped, sparse,
         params.n_samples, Gblock.step2_backend_score_numerators,
         Gblock.step2_backend_score_denominators,
+        Gblock.step2_backend_observed_allele_sums,
+        Gblock.step2_backend_observed_nonmissing_counts,
         params.profile_step2 ? &step2_compute_timings : nullptr);
+    Gblock.step2_backend_trait_counts_valid =
+      Gblock.step2_backend_scores_valid &&
+      Gblock.step2_backend_observed_allele_sums.rows() == params.n_pheno &&
+      Gblock.step2_backend_observed_allele_sums.cols() == n_snps &&
+      Gblock.step2_backend_observed_nonmissing_counts.rows() ==
+        params.n_pheno &&
+      Gblock.step2_backend_observed_nonmissing_counts.cols() == n_snps;
+    if(Gblock.step2_backend_trait_counts_valid) {
+      for(int variant = 0; variant < n_snps; ++variant) {
+        variant_block& variant_info = all_snps_info[variant];
+        const snp& marker = snpinfo[indices[variant]];
+        const double mac_threshold = marker.apply_diff_MAC_filter ?
+          params.forced_MAC : params.min_MAC;
+        for(int phenotype = 0; phenotype < params.n_pheno; ++phenotype) {
+          const int nonmissing = static_cast<int>(
+            Gblock.step2_backend_observed_nonmissing_counts(
+              phenotype, variant));
+          const double allele_sum =
+            Gblock.step2_backend_observed_allele_sums(phenotype, variant);
+          variant_info.ns(phenotype) = nonmissing;
+          variant_info.af(phenotype) = nonmissing > 0 ?
+            allele_sum / (2.0 * nonmissing) : 0;
+          variant_info.mac(phenotype) = std::min(
+            allele_sum, 2.0 * nonmissing - allele_sum);
+          variant_info.ignored_trait(phenotype) =
+            marker.MAC_fail_if_checked &&
+            variant_info.mac(phenotype) < mac_threshold;
+        }
+      }
+    }
     if(!Gblock.step2_backend_scores_valid &&
        !Gblock.step2_pgen_direct_qt_enabled &&
        std::find(Gblock.step2_pgen_packed_unexpanded.begin(),
@@ -3867,6 +3900,7 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
 void Data::prepare_step2_compute_backend() {
   step2_compute_backend->clear();
   Gblock.step2_backend_scores_valid = false;
+  Gblock.step2_backend_trait_counts_valid = false;
 
   const bool packed_score_eligible =
     (params.file_type == "pgen") &&
@@ -3896,7 +3930,8 @@ void Data::prepare_step2_compute_backend() {
   if(params.trait_mode == 1) {
     step2_compute_backend->prepare_binary(res,
       m_ests.Gamma_sqrt_mask, m_ests.X_Gamma,
-      Gblock.step2_binary_XtY, params.pheno_pass,
+      Gblock.step2_binary_XtY, pheno_data.masked_indivs,
+      params.pheno_pass,
       params.profile_step2 ? &step2_compute_timings : nullptr);
     return;
   }
@@ -3916,7 +3951,7 @@ void Data::prepare_step2_compute_backend() {
     Gblock.step2_cox_score_residual, weighted_designs, projections,
     Gblock.step2_cox_projection_score,
     Gblock.step2_cox_projection_gram, residual_variances,
-    params.pheno_pass,
+    pheno_data.masked_indivs, params.pheno_pass,
     params.profile_step2 ? &step2_compute_timings : nullptr);
 }
 
@@ -4858,7 +4893,9 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
   else if(params.file_type == "pgen") {
     bool backend_score_only_unexpanded =
       step2_compute_backend && step2_compute_backend->ready() &&
-      !params.firth && !params.use_SPA && !in_filters.has_missing.any();
+      !params.firth && !params.use_SPA &&
+      (!in_filters.has_missing.any() ||
+       step2_compute_backend->provides_observed_trait_counts());
     if(backend_score_only_unexpanded && params.skip_dosage_comp) {
       for(const uint64 index : indices) {
         if(in_non_par(chrom, snpinfo[index].physpos, &params)) {
