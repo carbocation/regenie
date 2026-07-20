@@ -49,6 +49,14 @@ measurements, set `MKLROOT` when configuring REGENIE and confirm that
 `binary_libraries.txt` links to oneMKL. A BLAS mismatch can dominate the CPU
 result.
 
+`prepare_multitrait_fixture.py` makes a deterministic multi-phenotype cohort
+from aligned phenotype and covariate files. By default it keeps 10,000 samples
+per population group, generates 32 correlated quantitative traits, and writes
+both a complete-case file and a version whose per-trait missingness increases
+from 0% to 10%. It also writes a PLINK keep file; use that file to make a
+physical PGEN subset so each benchmark reads the same number of samples. The
+helper requires NumPy.
+
 Each invocation creates `LABEL-YYYYMMDDTHHMMSSZ/`. `summary.tsv` is the compact
 run summary, `profile_kv.tsv` preserves the structured REGENIE profile, and
 `gpu.csv` is the raw telemetry. The wrapper exits with REGENIE's status, so it

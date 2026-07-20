@@ -22,6 +22,8 @@ and population structure, but the expanded samples are not real people. It
 has one quantitative phenotype with h2=0.3 and `SUPERPOP` as a categorical
 covariate. The PGEN, PVAR, PSAM, phenotype, and covariate files were copied to
 all three systems and their SHA-256 digests matched before the CPU comparison.
+Every retained run below uses that one phenotype without phenotype or
+covariate missingness unless the multi-phenotype section says otherwise.
 
 ## Headline Step 1 results
 
@@ -51,6 +53,62 @@ own four-physical-core host. That is real acceleration, but modest compared
 with its 25.1x gap from A100. The production-width CPU result also confirms why
 the earlier independent-marker fixture was not a sound anchor: it exercised a
 materially different genotype workload.
+
+## Multi-phenotype Step 1 at 50,000 samples
+
+The multi-phenotype check uses a deterministic, equal-stratum subset of the
+same real-LD fixture: 50,000 samples (10,000 from each of five population
+groups), all 700,000 variants, and 32 standardized quantitative traits. Traits
+2 through 32 have a target correlation of 0.4 with trait 1; their observed
+correlations range from 0.395 to 0.406. The physical PGEN subset and its
+phenotype and covariate files had matching SHA-256 digests on A100 and N2.
+
+The complete phenotype file has no missing values. In the second file,
+per-trait input missingness increases linearly from 0% to 10%, for 80,000
+missing values in total. Of the 50,000 samples, 40,463 have at least one
+missing trait and 9,537 are complete across all 32. Multi-QT Step 1 uses its
+default per-trait mean imputation, so both runs fit dense 50,000-sample traits;
+the second case measures the cost of realistic missing input under that
+default behavior, not phenotype-specific sparse fitting.
+
+| System | Input missingness | Wall | Level 0 | Level 1 | Output | Peak host RSS | Average process CPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A100 CUDA, 12 host threads | none | 270.03 s | 120.175 s | 100.243 s | 47.195 s | 2.87 GiB | 103% |
+| A100 CUDA, 12 host threads | 0-10% by trait | 284.37 s | 120.160 s | 109.332 s | 52.441 s | 2.87 GiB | 98% |
+| Eight-core N2 | none | 1,423.27 s | 986.913 s | 410.919 s | 24.080 s | 2.80 GiB | 599% |
+| Eight-core N2 | 0-10% by trait | 1,407.77 s | 981.663 s | 406.551 s | 18.205 s | 2.80 GiB | 617% |
+
+For complete phenotypes, A100 is 5.27x faster end-to-end, 8.21x faster in
+Level 0, and 4.10x faster in Level 1. N2 averages 75.3% busy across its eight
+cores, materially better CPU use than the one-trait run. Prediction output is
+the exception to the CUDA advantage: A100 takes 47.20 seconds versus 24.08
+seconds on N2. Its grouped-prediction path uploads 45.5 GB of design data and
+spends 9.72 seconds uploading for only 65 ms of device compute.
+
+The missing-input A100 run is 5.3% slower than its complete run, while the N2
+run is 1.1% faster. A100 Level 0 changes by only 15 ms and N2 Level 0 by 0.5%,
+so neither result supports a systematic genotype-stage penalty. With one
+repetition per setting, the opposite end-to-end deltas are best treated as
+ordinary Level 1/output variability rather than a missingness effect.
+
+| A100 input | Whole-run GPU util. | Level 0 GPU util. | Level 1/output GPU util. | Whole-run power | Level 0 power | Peak memory | GPU energy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Complete | 27.5% | 27.0% | 28.3% | 83.6 W | 68.5 W | 2,138 MiB | 6.27 Wh |
+| 0-10% missing | 26.5% | 27.1% | 26.4% | 80.4 W | 67.8 W | 2,138 MiB | 6.35 Wh |
+
+This lower-sample-size workload leaves most of A100 unused. Level 0 consumes
+only 3.1% of device memory and 17% of the 400 W power limit. Complete-case
+Level 0 utilization stays between 23% and 34% from p10 to p90, with no samples
+at or above 90%. Across genotype preprocessing, CV matrices, and ridge, 22.80
+seconds (19.0%) are device compute, 29.51 seconds (24.6%) are transfers, and
+67.66 seconds (56.4%) are host orchestration. A100 is still substantially
+faster than the optimized N2 run, but batching/residency and the multi-trait
+prediction-output path leave clear performance on the ground at the
+50,000-sample end of the target range.
+
+These are single production-thread measurements on the current branch with a
+prewarmed PGEN, not a thread sweep. No T4 Step 1 or A100 CPU run was added for
+this workload.
 
 ## GPU saturation
 
