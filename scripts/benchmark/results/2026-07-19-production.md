@@ -3,9 +3,10 @@
 This report began as a performance snapshot of `114ef81` at production-like
 Step 1 scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. It now also
 includes the Cox design-residency change in `50ca3c1` and the resident weighted
-ridge solve in `87270e6`. Unless noted otherwise, timings are external wall
-time. Step 1 runs use five-fold cross-validation, `--bsize 1000`, `--lowmem`,
-and the default Level 0 and Level 1 ridge grids.
+ridge solve in `87270e6`, followed by the small-block Level 0 pipeline in
+`3b285ad`. Unless noted otherwise, timings are external wall time. Step 1 runs
+use five-fold cross-validation, `--bsize 1000`, `--lowmem`, and the default
+Level 0 and Level 1 ridge grids.
 
 ## Test systems and workloads
 
@@ -263,12 +264,54 @@ The detailed timers show where additional A100 performance is available:
 | CV matrices | 52.93 s | 40.56 s | 7.19 s | 5.19 s |
 | Level 0 ridge | 41.85 s | 6.80 s | 9.59 s | 25.47 s |
 
-The largest near-term opportunity is to keep more Level 0 state resident on
-the device and submit larger units of work. Ridge spends only 16% of its wall
-time in device compute; 61% is host orchestration and another 23% is transfer.
+The profile points toward keeping more Level 0 state resident on the device
+and submitting larger units of work. Ridge spends only 16% of its wall time in
+device compute; 61% is host orchestration and another 23% is transfer.
 Genotype preprocessing uploads 87.5 GB of packed hardcalls and spends almost
-as long transferring them as computing on them. The 40 GB A100 has ample
-unused capacity for deeper block batching or persistent intermediates.
+as long transferring them as computing on them.
+
+### Overlapping the next Level 0 block
+
+Commit `3b285ad` adds a two-block pipeline for smaller resident blocks. While
+one CUDA backend finishes the current block's cross-validation and ridge work,
+a second backend expands and preprocesses the already-prefetched packed
+hardcalls for the next block. The control below used the same binary with the
+pipeline disabled, which follows the `3e07ea3` execution path. Both runs used
+the same warm 50,000-sample, 700,000-variant input and eight binary traits.
+
+| Run | Wall | Level 0 | Level 1 | Level 0 GPU util. | Level 0 power | Level 0 device memory | GPU energy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pipeline disabled | 146.71 s | 72.727 s | 63.746 s | 36.9% | 77.1 W | 1,220 MiB | 7.34 Wh |
+| `3b285ad` | 138.41 s | 64.354 s | 64.016 s | 36.3% | 110.0 W | 2,010 MiB | 7.55 Wh |
+
+This is an 11.5% Level 0 improvement and a 5.7% end-to-end improvement. Two
+earlier candidate repetitions took 138.35 and 138.76 seconds, so the committed
+result is representative rather than a lucky run. The pipeline serviced 710
+next blocks in 6.48 seconds and left only 53 ms on the foreground path. All
+eight LOCO files are byte-for-byte identical to the control.
+
+Mean Level 0 utilization does not move at the 0.5-second sampling resolution,
+but power rises by 43%. The higher power is consistent with useful concurrent
+work that the coarse busy/not-busy utilization sample does not distinguish.
+The speedup, rather than the utilization change, is the reason to retain this
+code. Whole-run peak device memory is effectively unchanged at 3.92 GiB
+because Level 1 already exceeds the pipeline's Level 0 allocation. Measured
+energy rises by 0.21 Wh in this single pair, so this is a throughput win, not a
+demonstrated energy win.
+
+The same approach does not help the 500,000-sample shape. Forcing it on gives
+188.67 seconds wall and 152.756 seconds in Level 0, within the earlier
+186.43-188.14-second wall and 152.824-153.582-second Level 0 ranges. It spends
+51.28 seconds waiting for the next preprocessed block and raises peak device
+memory from 4,890 to 9,350 MiB. The committed default therefore enables the
+pipeline only when one expanded resident block is at most 1 GB; the 50,000-
+sample block is 0.4 GB, while the 500,000-sample block is 4 GB. The environment
+variable `REGENIE_STEP1_LEVEL0_PIPELINE=0` or `1` can override that choice for
+profiling.
+
+For the large-sample workload, the next Level 0 target remains persistent
+intermediates or more fused/batched work within one backend. Running a second
+full preprocessing stream merely competes with the current block.
 
 After Level 0, Level 1 fitting costs 19.34 s and prediction output costs 12.47
 s. Grouped prediction uploads 14.22 GB in 3.19 s for only 14.8 ms of measured
@@ -423,11 +466,12 @@ CPU use, and peak RSS but do not invent phase-level values.
 ## Reproduction and interpretation notes
 
 - Every retained run exited successfully. The original current-branch snapshot
-  uses `114ef81`; the two retained GPU optimization checkpoints are `50ca3c1`
-  and `87270e6`. The upstream CPU anchor is v4.1.2 at
+  uses `114ef81`; the retained GPU optimization checkpoints are `50ca3c1`,
+  `87270e6`, and `3b285ad`. The upstream CPU anchor is v4.1.2 at
   `5f924b9bf54c1c7597174345def6eb2f1dee712c`.
 - The original branch binaries passed all three CTest targets on each system.
-  The `87270e6` build passed the CPU, CUDA-auto, and Cox tests on the A100.
+  The `87270e6` and `3b285ad` builds passed the CPU, CUDA-auto, and Cox tests on
+  the A100.
   Dynamic linkage was checked before measurement: all x86 builds use oneMKL
   2026.1, and the GPU builds also link to the expected CUDA libraries. The
   full upstream run reproduced the current ridge scores and numerically
