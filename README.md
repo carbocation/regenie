@@ -5,12 +5,13 @@ This repository is an ***unofficial***, performance-oriented fork of the [offici
 REGENIE project](https://github.com/rgcgithub/regenie). This is ***not*** an
 official Regeneron Genetics Center distribution. The goal is to preserve the
 upstream command-line interface and statistical behavior while improving
-performance and adding GPU acceleration for Step 1.
+performance and adding GPU acceleration for selected Step 1 and Step 2
+computations.
 
 ## What this fork adds
 
-- An optional NVIDIA CUDA backend for the compute-intensive parts of Step 1.
-  (Note that Step 2 does not use CUDA.)
+- An optional NVIDIA CUDA backend for Step 1 and for a restricted Step 2
+  single-variant score path.
 - Faster Step 1 host I/O, PGEN ingestion, profiling, and LOCO prediction output,
   even for CPU-only runs.
 - Step 2 CPU fast paths for PGEN hardcalls, BGEN dosages, and dense
@@ -22,10 +23,10 @@ performance and adding GPU acceleration for Step 1.
 
 Normal CPU-only builds will build and run without CUDA. To enable CUDA, build
 with `-DREGENIE_WITH_CUDA=ON`. CUDA-enabled builds use `--compute-backend auto`
-by default, selecting an available GPU for Step 1 and falling back to the CPU
-when necessary; see the [CUDA build and runtime
-documentation](docs/docs/install.md#experimental-cuda-step-1-backend) for
-details. The CUDA path has been exercised on NVIDIA T4 and A100 GPUs.
+by default, selecting an available GPU for supported work and falling back to
+the CPU when necessary; see the [CUDA build and runtime
+documentation](docs/docs/install.md#experimental-cuda-backends) for details.
+The CUDA path has been exercised on NVIDIA T4 and A100 GPUs.
 Floating-point implementations can differ in their final printed digits, so
 validation includes numerical comparisons in addition to regression tests.
 
@@ -248,13 +249,12 @@ The oneAPI environment is needed while configuring and linking this build, but
 not at runtime because oneMKL is linked statically. CUDA runtime libraries are
 still required.
 
-### CUDA Usage: Selecting the Step 1 backend when running regenie
+### CUDA usage
 
-Note that CUDA is only relevant for Step 1. If regenie is compiled with CUDA
-support and run on a machine with CUDA, the default backend and device options
-will attempt to use CUDA and will fall back to CPU if not successful. I.e., in
-the most common one-GPU case, the standard REGENIE commands can be used without
-requiring any additional arguments:
+If regenie is compiled with CUDA support and run on a machine with CUDA, the
+default backend and device options attempt to use CUDA for supported work and
+fall back to CPU when necessary. In the common one-GPU case, a normal Step 1
+command therefore needs no additional arguments:
 
 ```bash
 mkdir -p results
@@ -269,13 +269,11 @@ regenie \
   --out results/step1-auto
 ```
 
-CUDA-enabled builds default to `--compute-backend auto`, in which Step 1 tries
-the selected GPU device (default 0) and falls back to the CPU backend when the
-executable starts successfully but no usable CUDA device is available. Use
-`--gpu-device` to select a different visible device, `--compute-backend cpu` to
-prevent GPU use, or `--compute-backend cuda` when the run should fail instead of
-falling back. For example, this quantitative-trait run explicitly requires CUDA
-and specifies GPU 0:
+CUDA-enabled builds default to `--compute-backend auto`. Use `--gpu-device` to
+select a different visible device, `--compute-backend cpu` to prevent GPU use,
+or `--compute-backend cuda` when the run should fail instead of falling back.
+For example, this quantitative-trait run explicitly requires CUDA and specifies
+GPU 0:
 
 ```bash
 mkdir -p results
@@ -295,6 +293,15 @@ regenie \
 The paths and `--qt` option are illustrative; replace them with the normal
 Step 1 arguments for the dataset and trait type being analyzed. Add
 `--compute-backend cpu` to such a command when GPU use is not wanted.
+
+Step 2 CUDA support is narrower. It accepts additive single-variant tests from
+PGEN hardcalls and computes packed quantitative, binary, or approximate Cox
+score statistics on the GPU. Dosages, exact Cox scores, interactions,
+gene-based tests, and other unsupported workflows use the CPU. Approximate
+Firth and SPA corrections also remain on the CPU after the initial GPU score.
+Consequently, a CUDA build does not imply that a complete Step 2 analysis is
+GPU-bound or faster than a dedicated CPU machine. Use `--step2-profile` to see
+the active backend and phase timings for a particular workload.
 
 ## Redistributable Apple Silicon build
 

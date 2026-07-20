@@ -172,7 +172,7 @@ struct geno_block {
   BgenParser bgen;
   PgenReader pgr;
   Eigen::MatrixXd Gmat;
-  // Retain simple Step 2 PGEN hardcalls so single-phenotype QT scores can be
+  // Retain simple Step 2 PGEN hardcalls so packed CPU or CUDA scores can be
   // accumulated from two-bit codes without materializing sample vectors.
   std::vector<std::vector<unsigned char>> step2_pgen_packed_hardcalls;
   std::vector<double> step2_pgen_packed_means;

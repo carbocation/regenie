@@ -288,8 +288,8 @@ Samples with missing LOCO predictions must have their corresponding phenotype va
 |`--threads`| INT | Optional| number of computational threads to use [default=all-1]|
 |`--step1-profile`| FLAG | Optional| output structured timing data for Step 1 Level 0|
 |`--step2-profile`| FLAG | Optional| output structured timing data for Step 2|
-|`--compute-backend`| STRING | Optional| Step 1 compute backend: `cpu`, `cuda`, or `auto` [default=`auto` in CUDA-enabled builds; `cpu` otherwise]|
-|`--gpu-device`| INT | Optional| CUDA device index for the Step 1 compute backend [default=0]|
+|`--compute-backend`| STRING | Optional| Compute backend for Step 1 and eligible Step 2 score tests: `cpu`, `cuda`, or `auto` [default=`auto` in CUDA-enabled builds; `cpu` otherwise]|
+|`--gpu-device`| INT | Optional| CUDA device index for the compute backend [default=0]|
 |`--debug`| FLAG | Optional | debug flag (for use by developers)|
 |`--verbose`| FLAG | Optional| verbose screen output|
 |`--version`| FLAG | Optional| print version number and exit|

@@ -3844,6 +3844,12 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
         params.n_samples, Gblock.step2_backend_score_numerators,
         Gblock.step2_backend_score_denominators,
         params.profile_step2 ? &step2_compute_timings : nullptr);
+    if(!Gblock.step2_backend_scores_valid &&
+       !Gblock.step2_pgen_direct_qt_enabled &&
+       std::find(Gblock.step2_pgen_packed_unexpanded.begin(),
+         Gblock.step2_pgen_packed_unexpanded.end(), 1) !=
+           Gblock.step2_pgen_packed_unexpanded.end())
+      throw "Step 2 packed scoring failed after dense genotype expansion was skipped";
   }
 
   // analyze using openmp
@@ -4850,12 +4856,24 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
   } else if((params.file_type == "bgen") && !params.streamBGEN) 
     readChunkFromBGENFileToG(indices, chrom, snpinfo, &params, Gblock.Gmat, Gblock.bgen, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, all_snps_info, sout);
   else if(params.file_type == "pgen") {
+    bool backend_score_only_unexpanded =
+      step2_compute_backend && step2_compute_backend->ready() &&
+      !params.firth && !params.use_SPA && !in_filters.has_missing.any();
+    if(backend_score_only_unexpanded && params.skip_dosage_comp) {
+      for(const uint64 index : indices) {
+        if(in_non_par(chrom, snpinfo[index].physpos, &params)) {
+          backend_score_only_unexpanded = false;
+          break;
+        }
+      }
+    }
     readChunkFromPGENFileToG(indices, chrom, &params, &in_filters,
       Gblock.Gmat, Gblock.pgr, pheno_data.masked_indivs,
       pheno_data.phenotypes_raw, snpinfo, all_snps_info,
       params.profile_step2 ? &step2_pgen_read_profile : nullptr,
       &Gblock.step2_pgen_packed_hardcalls,
-      Gblock.step2_pgen_direct_qt_enabled,
+      Gblock.step2_pgen_direct_qt_enabled ||
+        backend_score_only_unexpanded,
       &Gblock.step2_pgen_packed_means,
       &Gblock.step2_pgen_packed_unexpanded,
       step2_compute_backend && step2_compute_backend->ready());

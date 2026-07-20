@@ -3082,7 +3082,7 @@ void parseSnpfromBed(const int& isnp, const int &chrom, const vector<uchar>& bed
 
 
 // step 2
-void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile, vector<vector<unsigned char>>* retained_packed_hardcalls, bool retain_unexpanded_qt, vector<double>* retained_packed_means, vector<unsigned char>* retained_packed_unexpanded, bool retain_all_packed_hardcalls){
+void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile, vector<vector<unsigned char>>* retained_packed_hardcalls, bool retain_unexpanded_packed, vector<double>* retained_packed_means, vector<unsigned char>* retained_packed_unexpanded, bool retain_all_packed_hardcalls){
 
   int const bs = indices.size();
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
@@ -3105,8 +3105,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     use_fast_hardcall_base && all_samples_in_analysis &&
     (!has_trait_missingness || packed_backend_with_trait_missingness) &&
     retained_packed_hardcalls;
-  retain_unexpanded_qt = retain_packed_hardcalls &&
-    retain_unexpanded_qt && retained_packed_means &&
+  retain_unexpanded_packed = retain_packed_hardcalls &&
+    retain_unexpanded_packed && retained_packed_means &&
     retained_packed_unexpanded;
   if(retain_packed_hardcalls) {
     retained_packed_hardcalls->clear();
@@ -3115,13 +3115,13 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     retained_packed_hardcalls->clear();
   const bool retain_packed_means = retain_packed_hardcalls &&
     retained_packed_means &&
-    (retain_unexpanded_qt || retain_all_packed_hardcalls);
+    (retain_unexpanded_packed || retain_all_packed_hardcalls);
   if(retain_packed_means) {
     retained_packed_means->assign(bs, 0);
   } else if(retained_packed_means) {
     retained_packed_means->clear();
   }
-  if(retain_unexpanded_qt) {
+  if(retain_unexpanded_packed) {
     retained_packed_unexpanded->assign(bs, 0);
   } else {
     if(retained_packed_unexpanded) retained_packed_unexpanded->clear();
@@ -3174,7 +3174,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       packed_hardcall_variants[thread_num]++;
     bool requires_mean_imputation = true;
     const unsigned char* packed_data = nullptr;
-    bool unexpanded_qt = false;
+    bool unexpanded_packed = false;
     if( params->dosage_mode ) eij2 = 0;
 
     // read genotype data
@@ -3203,7 +3203,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       {
         ScopedThreadWorkTimer packed_expand_timer(
           profile ? &packed_expand_thread_ms[thread_num] : nullptr);
-        if(retain_unexpanded_qt)
+        if(retain_unexpanded_packed)
           packed_stats = summarize_packed_hardcalls(
             packed_data, Geno.size());
         else
@@ -3227,15 +3227,15 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
         snp_data->n_zero >=
           params->n_samples * params->prop_zero_thr;
       if(retain_packed_hardcalls &&
-         (sparse_candidate || retain_unexpanded_qt ||
+         (sparse_candidate || retain_unexpanded_packed ||
           retain_all_packed_hardcalls)) {
         const size_t packed_bytes =
           (static_cast<size_t>(Geno.size()) + 3) / 4;
         (*retained_packed_hardcalls)[j].assign(
           packed_data, packed_data + packed_bytes);
       }
-      if(retain_unexpanded_qt) {
-        unexpanded_qt = true;
+      if(retain_unexpanded_packed) {
+        unexpanded_packed = true;
         (*retained_packed_unexpanded)[j] = 1;
         if(profile) packed_unexpanded_variants[thread_num]++;
       }
@@ -3388,7 +3388,14 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       compute_genocounts(params->trait_mode==1 || params->trait_mode==3, non_par, mac, Geno, snp_data->genocounts, params->sex, filters->case_control_indices);
     
     // for SPA switch effect allele to minor allele
-    flip_geno(total, Geno, snp_data, params);
+    if(unexpanded_packed) {
+      if(params->with_flip) {
+        snp_data->flipped = total > 1;
+        if(snp_data->flipped) total = 2 - total;
+      }
+    } else {
+      flip_geno(total, Geno, snp_data, params);
+    }
 
     // apply dominant/recessive encoding & recompute mean
     // pgen does not contain genotype probs for dosages so convert to hardcalls
@@ -3418,7 +3425,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     }
 
     // impute missing
-    if(!unexpanded_qt && !params->build_mask &&
+    if(!unexpanded_packed && !params->build_mask &&
        (!use_fast_hardcall_path || requires_mean_imputation))
       mean_impute_g(total, Geno, filters->ind_in_analysis);
 
