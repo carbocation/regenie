@@ -1,10 +1,10 @@
 # Production performance checkpoint: 2026-07-19
 
 This report is a performance snapshot of `114ef81` at production-like Step 1
-scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. Unless noted
-otherwise, timings are external wall time. Step 1 runs use quantitative traits,
-five-fold cross-validation, `--bsize 1000`, `--lowmem`, and the default Level 0
-and Level 1 ridge grids.
+scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. It also includes the
+targeted Cox GPU residency change in `50ca3c1`. Unless noted otherwise, timings
+are external wall time. Step 1 runs use five-fold cross-validation,
+`--bsize 1000`, `--lowmem`, and the default Level 0 and Level 1 ridge grids.
 
 ## Test systems and workloads
 
@@ -73,42 +73,107 @@ default behavior, not phenotype-specific sparse fitting.
 
 | System | Input missingness | Wall | Level 0 | Level 1 | Output | Peak host RSS | Average process CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A100 CUDA, 12 host threads | none | 270.03 s | 120.175 s | 100.243 s | 47.195 s | 2.87 GiB | 103% |
-| A100 CUDA, 12 host threads | 0-10% by trait | 284.37 s | 120.160 s | 109.332 s | 52.441 s | 2.87 GiB | 98% |
+| A100 CUDA, 12 host threads | none | 227.51 s | 120.806 s | 72.085 s | 30.915 s | 2.87 GiB | 124% |
+| A100 CUDA, 12 host threads | 0-10% by trait | 227.44 s | 120.953 s | 71.911 s | 30.888 s | 2.87 GiB | 124% |
 | Eight-core N2 | none | 1,423.27 s | 986.913 s | 410.919 s | 24.080 s | 2.80 GiB | 599% |
 | Eight-core N2 | 0-10% by trait | 1,407.77 s | 981.663 s | 406.551 s | 18.205 s | 2.80 GiB | 617% |
 
-For complete phenotypes, A100 is 5.27x faster end-to-end, 8.21x faster in
-Level 0, and 4.10x faster in Level 1. N2 averages 75.3% busy across its eight
+For complete phenotypes, A100 is 6.26x faster end-to-end, 8.17x faster in
+Level 0, and 5.70x faster in Level 1. N2 averages 75.3% busy across its eight
 cores, materially better CPU use than the one-trait run. Prediction output is
-the exception to the CUDA advantage: A100 takes 47.20 seconds versus 24.08
+the exception to the CUDA advantage: A100 takes 30.92 seconds versus 24.08
 seconds on N2. Its grouped-prediction path uploads 45.5 GB of design data and
-spends 9.72 seconds uploading for only 65 ms of device compute.
+spends 9.72 seconds uploading for only 67 ms of device compute.
 
-The missing-input A100 run is 5.3% slower than its complete run, while the N2
-run is 1.1% faster. A100 Level 0 changes by only 15 ms and N2 Level 0 by 0.5%,
-so neither result supports a systematic genotype-stage penalty. With one
-repetition per setting, the opposite end-to-end deltas are best treated as
-ordinary Level 1/output variability rather than a missingness effect.
+The paired A100 runs are indistinguishable: wall time differs by 0.03%, and
+each named phase differs by less than 0.3%. N2's missing-input run is 1.1%
+faster, with Level 0 changing by 0.5%. These single repetitions provide no
+evidence that the default mean-imputation path has a material performance
+cost at this scale.
+
+Both A100 rows above were started after clearing the page cache. An earlier
+pair mixed cache states and varied mainly in Level 1 and output despite nearly
+identical Level 0 time; those runs are not used here. This is also a reminder
+that one low-memory run is not enough to characterize post-Level-0 timing when
+the generated prediction files remain cacheable in host memory.
 
 | A100 input | Whole-run GPU util. | Level 0 GPU util. | Level 1/output GPU util. | Whole-run power | Level 0 power | Peak memory | GPU energy |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Complete | 27.5% | 27.0% | 28.3% | 83.6 W | 68.5 W | 2,138 MiB | 6.27 Wh |
-| 0-10% missing | 26.5% | 27.1% | 26.4% | 80.4 W | 67.8 W | 2,138 MiB | 6.35 Wh |
+| Complete | 33.1% | 27.0% | 41.6% | 88.3 W | 69.7 W | 2,138 MiB | 5.58 Wh |
+| 0-10% missing | 32.9% | 26.4% | 41.4% | 87.5 W | 68.8 W | 2,138 MiB | 5.53 Wh |
 
 This lower-sample-size workload leaves most of A100 unused. Level 0 consumes
 only 3.1% of device memory and 17% of the 400 W power limit. Complete-case
-Level 0 utilization stays between 23% and 34% from p10 to p90, with no samples
-at or above 90%. Across genotype preprocessing, CV matrices, and ridge, 22.80
-seconds (19.0%) are device compute, 29.51 seconds (24.6%) are transfers, and
-67.66 seconds (56.4%) are host orchestration. A100 is still substantially
+Level 0 utilization stays between 23% and 35% from p10 to p90, with no samples
+at or above 90%. Across genotype preprocessing, CV matrices, and ridge, 22.96
+seconds (19.0%) are device compute, 29.90 seconds (24.8%) are transfers, and
+67.71 seconds (56.1%) are host orchestration. A100 is still substantially
 faster than the optimized N2 run, but batching/residency and the multi-trait
 prediction-output path leave clear performance on the ground at the
 50,000-sample end of the target range.
 
-These are single production-thread measurements on the current branch with a
-prewarmed PGEN, not a thread sweep. No T4 Step 1 or A100 CPU run was added for
-this workload.
+These are single production-thread measurements on the current branch, not a
+thread sweep. No T4 Step 1 or A100 CPU run was added for this workload.
+
+## Binary and time-to-event Step 1 at 50,000 samples
+
+The non-Gaussian checks use the same physical 50,000-sample, 700,000-variant
+PGEN and covariates as the quantitative-trait runs. The binary fixture has
+eight traits with exact prevalences of 1%, 2%, 5%, 10%, 20%, 30%, 40%, and
+50%. The survival fixture has eight TIME/EVENT pairs with exact observed event
+fractions from 10% through 80%. Neither fixture has phenotype missingness, and
+the phenotype files matched by checksum across systems.
+
+| Model and system | Revision | Models | Wall | Level 0 | Level 1 | Output | Peak host RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Binary, A100 CUDA | `114ef81` | 8 | 152.55 s | 64.370 s | 76.910 s | 7.724 s | 2.26 GiB |
+| Binary, eight-core N2 | `114ef81` | 8 | 3,308.72 s | 937.320 s | 2,365.552 s | 4.553 s | 2.50 GiB |
+| Survival, eight-core N2 | `114ef81` | 8 | 2,723.69 s | 948.247 s | 1,769.544 s | 4.523 s | 3.32 GiB |
+| Survival, A100 CUDA before residency | `114ef81` | 8 | 1,278.30 s | 70.270 s | 1,196.565 s | 7.705 s | 3.13 GiB |
+| Survival, A100 CUDA with residency | `50ca3c1` | 8 | 232.08 s | 84.424 s | 137.478 s | 7.859 s | 3.23 GiB |
+
+Binary Level 1 makes substantially better use of A100 than the quantitative
+traits: it averages 67.2% GPU utilization and 248 W during the logistic fit.
+A100 is 21.69x faster than N2 end-to-end, 14.56x in Level 0, and 30.76x in
+logistic Level 1. N2 averages 82.6% busy across its eight cores. Output again
+favors the CPU host, at 4.55 seconds versus 7.72 seconds on A100. Within N2
+Level 1, 1,035.82 seconds are measured Gram work and 1,311.62 seconds remain
+in host orchestration, so the CPU opportunity is not just a BLAS substitution.
+
+The original Cox path is the opposite. It repeatedly uploads the same dense
+Level 1 design and averages only 17.4% utilization and 63 W while fitting.
+
+Commit `50ca3c1` keeps that design resident for prediction, weighted products,
+and score calculation. Across eight models it uploads 11.38 GB of resident
+design data and reuses it 1,364 times. Cox Level 1 becomes 8.70x faster, the
+whole run becomes 5.51x faster, and measured GPU energy falls from 22.82 Wh to
+7.02 Wh. All eight LOCO files are byte-for-byte identical before and after the
+change.
+
+The optimized run followed other A100 work and read its PGEN from cache,
+whereas the baseline was storage-backed. That does not account for the gain:
+optimized Level 0 was actually 14.15 seconds slower, and the 1,059-second
+reduction occurs in Cox Level 1.
+
+The original A100 path is 2.13x faster than N2 for survival; residency raises
+that to 11.74x end-to-end and 12.87x in Cox Level 1. N2 averages 82.2% busy
+across eight cores. As in the other multi-model runs, prediction output is
+faster on N2 (4.52 seconds) than on A100 (7.86 seconds). The CPU calculation is
+unchanged by `50ca3c1`, so the `114ef81` N2 result is the matching CPU anchor
+for both A100 rows.
+
+| A100 run | Whole-run GPU util. | Level 0 GPU util. | Level 1 GPU util. | Level 1 power | Peak device memory | GPU energy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Binary | 52.6% | 36.3% | 67.2% | 248.0 W | 3,920 MiB | 7.86 Wh |
+| Survival before residency | 18.5% | 38.6% | 17.4% | 62.9 W | 3,244 MiB | 22.82 Wh |
+| Survival with residency | 29.4% | 34.1% | 27.3% | 130.5 W | 4,624 MiB | 7.02 Wh |
+
+Residency removes the dominant Cox transfer problem but does not saturate the
+GPU. Optimized Level 1 has a 42.5% utilization median and 46% p90, with no
+samples at or above 90%. Its detailed profile still assigns 66.71 seconds to
+host orchestration and 30.89 seconds to downloads, compared with 29.10 seconds
+of Gram, cross-product, and solve compute. Avoiding the Gram round trip and
+reducing host-side gaps are the next Cox opportunities.
 
 ## GPU saturation
 
