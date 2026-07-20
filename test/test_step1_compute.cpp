@@ -625,6 +625,77 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
         "packed hardcall resident batched Cholesky ridge conformance failed");
   }
 
+  double multi_normalized_cached_prediction_error = 0;
+  if(cached_fold_products_supported) {
+    if(!candidate.cache_preprocessed_fold_systems(
+         cached_fold_starts, cached_fold_counts, outcomes))
+      throw std::runtime_error(
+        "multi-outcome normalized cached fold systems were not supported");
+    Eigen::MatrixXd multi_normalized_predictions;
+    Step1ComputeTimings multi_normalized_timings;
+    if(!candidate.ridge_predict_cached_preprocessed_systems_normalized(
+         cached_fold_starts, cached_fold_counts, ridge_parameters,
+         samples, -1, multi_normalized_predictions,
+         &multi_normalized_timings))
+      throw std::runtime_error(
+        "multi-outcome normalized cached ridge prediction was not supported");
+
+    Eigen::MatrixXd expected_multi_normalized_predictions(
+      samples, outcomes.cols() * ridge_parameters.size());
+    const Eigen::MatrixXd total_rhs = imputed * outcomes;
+    for(int fold = 0; fold < cached_fold_count; ++fold) {
+      const Eigen::MatrixXd held_out_genotypes = imputed.middleCols(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd held_out_outcomes = outcomes.middleRows(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd training_gram = expected_gram -
+        held_out_genotypes * held_out_genotypes.transpose();
+      const Eigen::MatrixXd training_rhs = total_rhs -
+        held_out_genotypes * held_out_outcomes;
+      for(Eigen::Index parameter = 0;
+          parameter < ridge_parameters.size(); ++parameter) {
+        Eigen::MatrixXd penalized_gram = training_gram;
+        penalized_gram.diagonal().array() += ridge_parameters(parameter);
+        const Eigen::MatrixXd fold_predictions =
+          held_out_genotypes.transpose() *
+            penalized_gram.llt().solve(training_rhs);
+        for(Eigen::Index outcome = 0; outcome < outcomes.cols(); ++outcome)
+          expected_multi_normalized_predictions.block(
+            cached_fold_starts(fold),
+            outcome * ridge_parameters.size() + parameter,
+            cached_fold_counts(fold), 1) =
+              fold_predictions.col(outcome);
+      }
+    }
+    const Eigen::RowVectorXd multi_means =
+      expected_multi_normalized_predictions.colwise().mean();
+    const Eigen::RowVectorXd multi_inverse_standard_deviations =
+      ((samples - 1.0) /
+       (expected_multi_normalized_predictions.colwise().squaredNorm().array() -
+        samples * multi_means.array().square())).sqrt();
+    expected_multi_normalized_predictions.rowwise() -= multi_means;
+    expected_multi_normalized_predictions.array().rowwise() *=
+      multi_inverse_standard_deviations.array();
+    multi_normalized_cached_prediction_error = relative_error(
+      multi_normalized_predictions,
+      expected_multi_normalized_predictions);
+    if(multi_normalized_cached_prediction_error > 8e-11 ||
+       multi_normalized_timings.resident_reuse_count != cached_fold_count)
+      throw std::runtime_error(
+        "multi-outcome normalized cached ridge conformance tolerance exceeded");
+
+    Eigen::VectorXd negative_ridge_parameters = ridge_parameters;
+    negative_ridge_parameters(0) = -1;
+    std::vector<Eigen::MatrixXd> negative_predictions;
+    std::vector<Eigen::MatrixXd> negative_coefficients;
+    if(candidate.ridge_predict_cached_preprocessed_systems(
+         cached_fold_starts, cached_fold_counts,
+         negative_ridge_parameters, negative_predictions,
+         negative_coefficients))
+      throw std::runtime_error(
+        "cached fold ridge accepted a negative fallback parameter");
+  }
+
   double normalized_cached_prediction_error = 0;
   const bool normalized_cache_initialized =
     cached_fold_products_supported &&
@@ -742,6 +813,8 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
               batched_cholesky_coefficient_error
             << " normalized_cached_prediction_relative_error=" <<
               normalized_cached_prediction_error
+            << " multi_normalized_cached_prediction_relative_error=" <<
+              multi_normalized_cached_prediction_error
             << " status=PASS\n";
 }
 

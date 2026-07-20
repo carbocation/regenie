@@ -275,6 +275,23 @@ __global__ void normalize_design_columns(double* design, int rows,
   }
 }
 
+__global__ void normalize_and_reorder_design_columns(
+  const double* source, double* destination, int rows, int count,
+  int outcome_count, int parameter_count, const double* means,
+  const double* inverse_standard_deviations) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < count) {
+    const int source_column = index / rows;
+    const int row = index - source_column * rows;
+    const int parameter = source_column / outcome_count;
+    const int outcome = source_column - parameter * outcome_count;
+    const int destination_column = outcome * parameter_count + parameter;
+    destination[destination_column * rows + row] =
+      (source[index] - means[source_column]) *
+        inverse_standard_deviations[source_column];
+  }
+}
+
 __global__ void square_elements(const double* input, double* output, int count) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if(index < count) output[index] = input[index] * input[index];
@@ -551,7 +568,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         d_ridge_parameters_(nullptr), d_inverse_(nullptr), d_scaled_rhs_(nullptr),
         d_predictions_(nullptr), d_outcomes_(nullptr), d_projected_(nullptr),
         d_level1_design_(nullptr), d_level1_ones_(nullptr),
-        d_level0_phenotypes_(nullptr),
+        d_level0_phenotypes_(nullptr), d_level0_prediction_block_(nullptr),
+        d_level0_normalized_predictions_(nullptr),
         d_squared_(nullptr), d_leverage_(nullptr),
         d_preprocess_covariates_(nullptr), d_preprocess_weights_(nullptr),
         d_preprocess_coefficients_(nullptr), d_preprocess_scales_(nullptr),
@@ -627,6 +645,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(d_level1_design_) cudaFree(d_level1_design_);
       if(d_level1_ones_) cudaFree(d_level1_ones_);
       if(d_level0_phenotypes_) cudaFree(d_level0_phenotypes_);
+      if(d_level0_prediction_block_) cudaFree(d_level0_prediction_block_);
+      if(d_level0_normalized_predictions_)
+        cudaFree(d_level0_normalized_predictions_);
       if(d_outcomes_) cudaFree(d_outcomes_);
       if(d_predictions_) cudaFree(d_predictions_);
       if(d_scaled_rhs_) cudaFree(d_scaled_rhs_);
@@ -2597,21 +2618,26 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& normalized_predictions,
       Step1ComputeTimings* timings) override {
 
+      const bool cache_level1_design = level1_start_column >= 0;
       if(!resident_fold_systems_valid_ ||
          resident_fold_systems_design_orientation_ ||
-         resident_fold_rhs_count_ != 1 || !d_level1_design_ ||
-         level1_design_rows_ <= 0 ||
-         level1_start_column != level1_design_cached_columns_ ||
-         ridge_parameters.size() >
-           level1_design_columns_ - level1_start_column ||
-         effective_sample_count != level1_design_rows_)
+         resident_fold_rhs_count_ <= 0 ||
+         effective_sample_count != resident_columns_)
+        return false;
+      if(cache_level1_design &&
+         (resident_fold_rhs_count_ != 1 || !d_level1_design_ ||
+          level1_design_rows_ <= 0 ||
+          level1_start_column != level1_design_cached_columns_ ||
+          ridge_parameters.size() >
+            level1_design_columns_ - level1_start_column ||
+          effective_sample_count != level1_design_rows_))
         return false;
       Eigen::Index covered_rows = 0;
       for(Eigen::Index fold = 0; fold < start_columns.size(); ++fold) {
         if(start_columns(fold) != covered_rows) return false;
         covered_rows += column_counts(fold);
       }
-      if(covered_rows != level1_design_rows_) return false;
+      if(covered_rows != resident_columns_) return false;
 
       std::vector<Eigen::MatrixXd> unused_predictions;
       std::vector<Eigen::MatrixXd> unused_coefficients;
@@ -2622,8 +2648,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        level1_design_rows_, "normalized Level 0 prediction row count");
-      const int columns = checked_int(ridge_parameters.size(),
+        resident_columns_, "normalized Level 0 prediction row count");
+      const int parameter_count = checked_int(ridge_parameters.size(),
+        "normalized Level 0 prediction parameter count");
+      const int outcome_count = checked_int(resident_fold_rhs_count_,
+        "normalized Level 0 prediction outcome count");
+      const int columns = checked_int(
+        ridge_parameters.size() * resident_fold_rhs_count_,
         "normalized Level 0 prediction column count");
       const int element_count = checked_element_count(
         rows, columns, "normalized Level 0 predictions");
@@ -2635,8 +2666,16 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       ComputeClock::time_point phase_start;
       if(timings) phase_start = ComputeClock::now();
-      double* destination = d_level1_design_ +
-        level1_start_column * level1_design_rows_;
+      double* assembled_predictions = nullptr;
+      if(cache_level1_design) {
+        assembled_predictions = d_level1_design_ +
+          level1_start_column * level1_design_rows_;
+      } else {
+        ensure_capacity(d_level0_prediction_block_,
+          level0_prediction_block_capacity_, element_count,
+          "cudaMalloc(Level 0 prediction block)");
+        assembled_predictions = d_level0_prediction_block_;
+      }
       for(Eigen::Index fold = 0; fold < start_columns.size(); ++fold) {
         const int fold_rows = checked_int(column_counts(fold),
           "normalized Level 0 fold row count");
@@ -2644,7 +2683,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CudaLevel0CholeskyLane& lane =
           level0_cholesky_lanes_[static_cast<size_t>(fold)];
         check_cuda(cudaMemcpy2DAsync(
-          destination + start_columns(fold),
+          assembled_predictions + start_columns(fold),
           static_cast<size_t>(rows) * sizeof(double),
           lane.predictions,
           static_cast<size_t>(fold_rows) * sizeof(double),
@@ -2666,7 +2705,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       std::vector<double> means(columns);
       std::vector<double> inverse_standard_deviations(columns);
       for(int column = 0; column < columns; ++column) {
-        const double* values = destination +
+        const double* values = assembled_predictions +
           static_cast<Eigen::Index>(column) * rows;
         double sum = 0.0;
         double sum_of_squares = 0.0;
@@ -2699,23 +2738,54 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         static_cast<size_t>(columns) * sizeof(double),
         cudaMemcpyHostToDevice),
         "copy Level 0 prediction inverse standard deviations to CUDA device");
-      normalize_design_columns<<<
-        (element_count + threads - 1) / threads, threads>>>(
-          destination, rows, element_count,
-          d_inverse_, d_eigenvalues_);
-      check_cuda(cudaGetLastError(),
-        "normalize Level 0 prediction columns kernel");
+      double* normalized_destination = assembled_predictions;
+      if(outcome_count == 1) {
+        normalize_design_columns<<<
+          (element_count + threads - 1) / threads, threads>>>(
+            assembled_predictions, rows, element_count,
+            d_inverse_, d_eigenvalues_);
+        check_cuda(cudaGetLastError(),
+          "normalize Level 0 prediction columns kernel");
+      } else {
+        ensure_capacity(d_level0_normalized_predictions_,
+          level0_normalized_predictions_capacity_, element_count,
+          "cudaMalloc(normalized Level 0 prediction block)");
+        normalized_destination = d_level0_normalized_predictions_;
+        normalize_and_reorder_design_columns<<<
+          (element_count + threads - 1) / threads, threads>>>(
+            assembled_predictions, normalized_destination, rows,
+            element_count, outcome_count, parameter_count,
+            d_inverse_, d_eigenvalues_);
+        check_cuda(cudaGetLastError(),
+          "normalize and reorder Level 0 prediction columns kernel");
+      }
       check_cuda(cudaDeviceSynchronize(),
         "finish Level 0 prediction normalization");
       if(timings) timings->ridge_ms += elapsed_ms(phase_start);
 
       if(timings) phase_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(normalized_predictions.data(), destination,
-        static_cast<size_t>(element_count) * sizeof(double),
+      const size_t normalized_bytes =
+        static_cast<size_t>(element_count) * sizeof(double);
+      bool unregister_normalized_predictions = false;
+      const cudaError_t registration_status = cudaHostRegister(
+        normalized_predictions.data(), normalized_bytes,
+        cudaHostRegisterPortable);
+      if(registration_status == cudaSuccess) {
+        unregister_normalized_predictions = true;
+      } else {
+        cudaGetLastError();
+      }
+      check_cuda(cudaMemcpy(normalized_predictions.data(),
+        normalized_destination,
+        normalized_bytes,
         cudaMemcpyDeviceToHost),
         "copy normalized Level 0 predictions from CUDA device");
+      if(unregister_normalized_predictions)
+        check_cuda(cudaHostUnregister(normalized_predictions.data()),
+          "cudaHostUnregister(normalized Level 0 predictions)");
       if(timings) timings->download_ms += elapsed_ms(phase_start);
-      level1_design_cached_columns_ += columns;
+      if(cache_level1_design)
+        level1_design_cached_columns_ += parameter_count;
       return true;
     }
 
@@ -2739,9 +2809,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          column_counts.size() != resident_fold_system_count_)
         throw std::invalid_argument(
           "Step 1 cached fold ridge prediction received incompatible systems");
-      if((ridge_parameters.array() < 0).any())
-        throw std::invalid_argument(
-          "Step 1 cached fold ridge parameters must be non-negative");
+      if((ridge_parameters.array() < 0).any()) return false;
       if((ridge_parameters.array() == 0).any()) return false;
       for(size_t system = 0; system < system_count; ++system) {
         const Eigen::Index fold = static_cast<Eigen::Index>(system);
@@ -5541,6 +5609,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     double* d_level1_design_;
     double* d_level1_ones_;
     double* d_level0_phenotypes_;
+    double* d_level0_prediction_block_;
+    double* d_level0_normalized_predictions_;
     double* d_squared_;
     double* d_leverage_;
     double* d_preprocess_covariates_;
@@ -5597,6 +5667,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     size_t level1_design_capacity_ = 0;
     size_t level1_ones_capacity_ = 0;
     size_t level0_phenotypes_capacity_ = 0;
+    size_t level0_prediction_block_capacity_ = 0;
+    size_t level0_normalized_predictions_capacity_ = 0;
     size_t squared_capacity_ = 0;
     size_t leverage_capacity_ = 0;
     size_t preprocess_covariates_capacity_ = 0;

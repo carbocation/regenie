@@ -581,17 +581,24 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   vector<MatrixXd> fold_predictions;
   vector<MatrixXd> fold_coefficients;
   Step1ComputeTimings batched_timings;
+  bool all_phenotypes_complete = true;
+  for(int ph = 0; ph < params->n_pheno; ++ph) {
+    if(!params->pheno_pass(ph)) continue;
+    all_phenotypes_complete = all_phenotypes_complete &&
+      pheno_data->Neff(ph) == params->n_samples &&
+      pheno_data->masked_indivs.col(ph).all();
+  }
   const bool normalize_cached_predictions = prepare_batched_systems &&
-    cache_level1_design && params->n_pheno == 1 &&
+    params->write_l0_pred && all_phenotypes_complete &&
     !params->print_block_betas && !params->debug &&
-    pheno_data->Neff(0) == params->n_samples &&
-    pheno_data->masked_indivs.col(0).all();
+    params->n_pheno > 0;
   const bool used_normalized_cached_cholesky =
     normalize_cached_predictions &&
     compute_backend->ridge_predict_cached_preprocessed_systems_normalized(
       fold_starts, fold_counts, ridge_parameters,
       pheno_data->Neff(0),
-      static_cast<Eigen::Index>(block) * params->n_ridge_l0,
+      cache_level1_design ?
+        static_cast<Eigen::Index>(block) * params->n_ridge_l0 : -1,
       Xout, params->profile_step1 ? &batched_timings : nullptr);
   const bool used_cached_cholesky = used_normalized_cached_cholesky ||
     (prepare_batched_systems &&
@@ -629,25 +636,53 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     if(block == 0) {
       cum_size_folds = 0;
       for(int fold = 0; fold < params->cv_folds; ++fold) {
-        l1->test_pheno[0][fold].col(0) =
-          pheno_data->phenotypes.block(
-            cum_size_folds, 0, params->cv_sizes(fold), 1);
+        for(int ph = 0; ph < params->n_pheno; ++ph) {
+          if(!params->pheno_pass(ph)) continue;
+          if(params->trait_mode != 3) {
+            l1->test_pheno[ph][fold].col(0) =
+              pheno_data->phenotypes.block(
+                cum_size_folds, ph, params->cv_sizes(fold), 1);
+            if(params->trait_mode != 0) {
+              l1->test_pheno_raw[ph][fold].col(0) =
+                pheno_data->phenotypes_raw.block(
+                  cum_size_folds, ph, params->cv_sizes(fold), 1);
+              l1->test_offset[ph][fold].col(0) =
+                m_ests->offset_nullreg.block(
+                  cum_size_folds, ph, params->cv_sizes(fold), 1);
+            }
+          } else {
+            l1->fold_id[ph](seqN(
+              cum_size_folds, params->cv_sizes(fold))) =
+                Eigen::VectorXi::Constant(params->cv_sizes(fold), fold);
+          }
+        }
         cum_size_folds += params->cv_sizes(fold);
       }
     }
     finish_l0_write(l1);
-    std::ofstream* output_file = files->write_preds_files[0].get();
+    std::vector<std::ofstream*> output_files(params->n_pheno, nullptr);
+    for(int ph = 0; ph < params->n_pheno; ++ph)
+      if(params->pheno_pass(ph))
+        output_files[ph] = files->write_preds_files[ph].get();
     std::shared_ptr<Eigen::MatrixXd> predictions(
       new Eigen::MatrixXd());
     predictions->swap(Xout);
+    const Eigen::Index prediction_rows = params->n_samples;
+    const Eigen::Index phenotype_columns = params->n_ridge_l0;
     l1->l0_write_future = std::async(std::launch::async,
-      [output_file, predictions] () {
-        output_file->write(
-          reinterpret_cast<char*>(predictions->data()),
-          predictions->size() * sizeof(double));
-        if(output_file->fail())
-          throw std::runtime_error(
-            "cannot successfully write temporary level 0 predictions to disk");
+      [output_files, predictions, prediction_rows,
+       phenotype_columns] () {
+        const Eigen::Index phenotype_elements =
+          prediction_rows * phenotype_columns;
+        for(size_t ph = 0; ph < output_files.size(); ++ph) {
+          if(!output_files[ph]) continue;
+          output_files[ph]->write(reinterpret_cast<char*>(
+            predictions->data() + ph * phenotype_elements),
+            phenotype_elements * sizeof(double));
+          if(output_files[ph]->fail())
+            throw std::runtime_error(
+              "cannot successfully write temporary level 0 predictions to disk");
+        }
       });
     sout << "done";
     const auto t3 = std::chrono::high_resolution_clock::now();
@@ -1024,16 +1059,16 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
     int bs_l1 = params->total_n_block * params->n_ridge_l0;
 
     bool persistent_level1_design = false;
-    if(params->write_l0_pred && !params->select_l0) {
-      check_l0(ph, ph_eff, params, l1, pheno_data, sout);
+    if(params->write_l0_pred && !params->select_l0)
       persistent_level1_design =
         compute_backend->activate_level1_design_cache(
           params->n_samples, bs_l1);
-    }
     if(!persistent_level1_design) {
       if(params->write_l0_pred)
         read_l0(ph, ph_eff, files, params, l1, sout);
-      check_l0(ph, ph_eff, params, l1, pheno_data, sout);
+    }
+    check_l0(ph, ph_eff, params, l1, pheno_data, sout);
+    if(!persistent_level1_design) {
       bs_l1 = kfold_level1_design_columns(
         l1, ph_eff, params->cv_folds);
     }
@@ -1084,7 +1119,6 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
     if(persistent_level1_design && !resident_fold_systems) {
       compute_backend->release_level1_design_cache();
       read_l0(ph, ph_eff, files, params, l1, sout);
-      check_l0(ph, ph_eff, params, l1, pheno_data, sout);
       bs_l1 = kfold_level1_design_columns(
         l1, ph_eff, params->cv_folds);
       persistent_level1_design = false;
