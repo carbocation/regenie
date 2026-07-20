@@ -57,6 +57,13 @@ from 0% to 10%. It also writes a PLINK keep file; use that file to make a
 physical PGEN subset so each benchmark reads the same number of samples. The
 helper requires NumPy.
 
+`prepare_nongaussian_fixture.py` derives binary and time-to-event outcomes
+from the complete quantitative-trait table. Its defaults create eight binary
+traits spanning 1% to 50% prevalence and eight survival traits spanning 10% to
+80% observed events. Counts are exact and generation is deterministic, which
+makes it straightforward to reproduce the same phenotype files on different
+machines and verify them by checksum.
+
 Each invocation creates `LABEL-YYYYMMDDTHHMMSSZ/`. `summary.tsv` is the compact
 run summary, `profile_kv.tsv` preserves the structured REGENIE profile, and
 `gpu.csv` is the raw telemetry. The wrapper exits with REGENIE's status, so it
