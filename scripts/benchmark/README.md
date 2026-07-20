@@ -75,7 +75,8 @@ can be used directly from CI or a batch scheduler.
   multi-trait Step 2 work on an eight-core CPU and matched end-to-end CPU/CUDA
   comparisons on T4 and A100. It includes quantitative traits with and without
   missingness, binary traits, survival traits, approximate Firth correction,
-  GPU telemetry, numerical checks, and the automatic backend policy.
+  full-fixture placement and fan-out measurements, GPU telemetry, numerical
+  checks, and the automatic backend policy.
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
@@ -87,5 +88,7 @@ can be used directly from CI or a batch scheduler.
   measurements used by that report.
 - `results/2026-07-20-step2.tsv`,
   `results/2026-07-20-step2-integrated.tsv`, and
-  `results/2026-07-20-step2-cuda.tsv` contain the CPU, integrated CPU/CUDA, and
-  standalone-kernel measurements used by the Step 2 report.
+  `results/2026-07-20-step2-steady-state.tsv` contain the CPU, integrated
+  CPU/CUDA, and full-fixture measurements used by the Step 2 report.
+- `results/2026-07-20-step2-cuda.tsv` contains the earlier standalone-kernel
+  diagnostic measurements.
