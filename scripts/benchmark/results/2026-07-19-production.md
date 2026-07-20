@@ -1,10 +1,11 @@
 # Production performance checkpoint: 2026-07-19
 
-This report is a performance snapshot of `114ef81` at production-like Step 1
-scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. It also includes the
-targeted Cox GPU residency change in `50ca3c1`. Unless noted otherwise, timings
-are external wall time. Step 1 runs use five-fold cross-validation,
-`--bsize 1000`, `--lowmem`, and the default Level 0 and Level 1 ridge grids.
+This report began as a performance snapshot of `114ef81` at production-like
+Step 1 scale, with upstream v4.1.2 (`5f924b9`) as a CPU baseline. It now also
+includes the Cox design-residency change in `50ca3c1` and the resident weighted
+ridge solve in `87270e6`. Unless noted otherwise, timings are external wall
+time. Step 1 runs use five-fold cross-validation, `--bsize 1000`, `--lowmem`,
+and the default Level 0 and Level 1 ridge grids.
 
 ## Test systems and workloads
 
@@ -162,18 +163,58 @@ faster on N2 (4.52 seconds) than on A100 (7.86 seconds). The CPU calculation is
 unchanged by `50ca3c1`, so the `114ef81` N2 result is the matching CPU anchor
 for both A100 rows.
 
+### Keeping the weighted ridge solve on the GPU
+
+Once the design matrix was resident, each IRLS iteration still copied its
+weighted Gram matrix and right-hand side to the host, then immediately copied
+them back for the penalized Cholesky solve. Commit `87270e6` adds an optional
+backend operation that carries the weighted products directly into the solve
+on the device. The CPU fallback and the older two-call backend interface remain
+available.
+
+The following controls and committed runs were paired on the same warm input.
+The control includes Cox design residency but not the resident solve.
+
+| Model | Revision | Wall | Level 0 | Level 1 | Output | GPU energy |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Binary control | `50ca3c1` | 170.09 s | 72.006 s | 88.020 s | 7.835 s | 7.64 Wh |
+| Binary resident solve | `87270e6` | 146.43 s | 72.725 s | 63.603 s | 7.843 s | 7.32 Wh |
+| Survival control | `50ca3c1` | 232.15 s | 84.748 s | 137.239 s | 7.841 s | 7.05 Wh |
+| Survival resident solve | `87270e6` | 189.98 s | 84.188 s | 95.587 s | 7.868 s | 6.31 Wh |
+
+The committed binary run is 13.9% faster end-to-end and 27.7% faster in Level
+1. Its measured Level 1 transfers fall from 27.74 seconds to 2.86 seconds.
+The committed survival run is 18.2% faster end-to-end and 30.4% faster in Cox
+Level 1, with Level 1 transfers falling from 41.49 seconds to 2.46 seconds.
+Level 0 and output time are effectively controls here; the gain is where the
+round trip was removed.
+
+Two additional candidate repetitions took 147.77 and 148.23 seconds for
+binary traits, with Level 1 at 63.559 and 63.536 seconds. The survival
+repetitions took 191.89 and 191.64 seconds, with Level 1 at 96.361 and 96.110
+seconds. The final committed runs fall within the same narrow range. All eight
+binary and all eight survival LOCO files are byte-for-byte identical between
+the paired control and `87270e6`.
+
+Binary energy is noisier than timing: the three resident-solve measurements
+range from 7.14 to 8.17 Wh, so the 7.32-versus-7.64 Wh committed pair is not
+evidence of a repeatable energy reduction. Survival is more consistent at
+6.31-6.49 Wh versus 7.05 Wh for the paired control.
+
 | A100 run | Whole-run GPU util. | Level 0 GPU util. | Level 1 GPU util. | Level 1 power | Peak device memory | GPU energy |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Binary | 52.6% | 36.3% | 67.2% | 248.0 W | 3,920 MiB | 7.86 Wh |
+| Binary with resident solve | 50.0% | 36.8% | 64.7% | 286.2 W | 3,920 MiB | 7.32 Wh |
 | Survival before residency | 18.5% | 38.6% | 17.4% | 62.9 W | 3,244 MiB | 22.82 Wh |
 | Survival with residency | 29.4% | 34.1% | 27.3% | 130.5 W | 4,624 MiB | 7.02 Wh |
+| Survival with resident solve | 32.0% | 33.4% | 31.3% | 157.7 W | 4,624 MiB | 6.31 Wh |
 
-Residency removes the dominant Cox transfer problem but does not saturate the
-GPU. Optimized Level 1 has a 42.5% utilization median and 46% p90, with no
-samples at or above 90%. Its detailed profile still assigns 66.71 seconds to
-host orchestration and 30.89 seconds to downloads, compared with 29.10 seconds
-of Gram, cross-product, and solve compute. Avoiding the Gram round trip and
-reducing host-side gaps are the next Cox opportunities.
+The resident solve improves throughput without making utilization the target.
+In the final Cox run, Level 1 still spends 63.77 of 95.59 seconds in host
+orchestration. Mean Level 1 utilization is 31.3%, with a 16.5% median and 76%
+p90. Moving Cox risk-set and IRLS vector work to the device is now the clearest
+Level 1 opportunity. Level 0 batching and prediction-output design reuse remain
+the broader Step 1 opportunities described below.
 
 ## GPU saturation
 
@@ -381,14 +422,16 @@ CPU use, and peak RSS but do not invent phase-level values.
 
 ## Reproduction and interpretation notes
 
-- Every retained run exited successfully. Current-branch runs use `114ef81`;
-  the upstream CPU anchor is v4.1.2 at
+- Every retained run exited successfully. The original current-branch snapshot
+  uses `114ef81`; the two retained GPU optimization checkpoints are `50ca3c1`
+  and `87270e6`. The upstream CPU anchor is v4.1.2 at
   `5f924b9bf54c1c7597174345def6eb2f1dee712c`.
-- The current binaries passed all three CTest targets on each system. Dynamic
-  linkage was checked before measurement: all x86 builds use oneMKL 2026.1,
-  and the GPU builds also link to the expected CUDA libraries. The full
-  upstream run reproduced the current ridge scores and numerically equivalent
-  LOCO predictions.
+- The original branch binaries passed all three CTest targets on each system.
+  The `87270e6` build passed the CPU, CUDA-auto, and Cox tests on the A100.
+  Dynamic linkage was checked before measurement: all x86 builds use oneMKL
+  2026.1, and the GPU builds also link to the expected CUDA libraries. The
+  full upstream run reproduced the current ridge scores and numerically
+  equivalent LOCO predictions.
 - The upstream Level 0 value is the sum of its legacy rounded per-block timers;
   v4.1.2 does not emit the structured phase records used by the current build.
 - GPU telemetry is based on `nvidia-smi`, so sub-second kernel gaps are averaged
