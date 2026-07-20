@@ -64,6 +64,14 @@ traits spanning 1% to 50% prevalence and eight survival traits spanning 10% to
 makes it straightforward to reproduce the same phenotype files on different
 machines and verify them by checksum.
 
+`prepare_step2_trait_matrix.py` is the wider Step 2 fixture used for the
+32-trait placement comparison. It takes matched complete and missing
+quantitative panels, cycles the same prevalence and event-rate targets across
+all traits, and carries each quantitative missingness mask into the derived
+binary and survival outcomes. It writes complete and missing panels for both
+models plus a compact trait summary. Generating the panels independently on
+the CPU and GPU benchmark machines produced identical SHA-256 checksums.
+
 Each invocation creates `LABEL-YYYYMMDDTHHMMSSZ/`. `summary.tsv` is the compact
 run summary, `profile_kv.tsv` preserves the structured REGENIE profile, and
 `gpu.csv` is the raw telemetry. The wrapper exits with REGENIE's status, so it
@@ -75,8 +83,10 @@ can be used directly from CI or a batch scheduler.
   multi-trait Step 2 work on an eight-core CPU and matched end-to-end CPU/CUDA
   comparisons on T4 and A100. It includes quantitative traits with and without
   missingness, binary traits, survival traits, approximate Firth correction,
-  full-fixture placement and fan-out measurements, GPU telemetry, numerical
-  checks, and the automatic backend policy.
+  full-fixture placement and fan-out measurements, GPU telemetry, and the
+  automatic backend policy. The cost-aware follow-up adds 8- and 32-trait
+  score-only placements, on-demand A100 versus Spot N2 break-even analysis,
+  and a phase-based projection to the 10-million-variant production range.
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
@@ -90,5 +100,10 @@ can be used directly from CI or a batch scheduler.
   `results/2026-07-20-step2-integrated.tsv`, and
   `results/2026-07-20-step2-steady-state.tsv` contain the CPU, integrated
   CPU/CUDA, and full-fixture measurements used by the Step 2 report.
+- `results/2026-07-20-step2-trait-matrix.tsv` contains the 8- and 32-trait
+  score-only timing, phase, memory, and GPU telemetry rows. The companion
+  `results/2026-07-20-step2-cost-projection.tsv` records the explicitly
+  compute-only 10-million-variant placement arithmetic, and
+  `results/2026-07-20-step2-prices.tsv` records the price snapshot.
 - `results/2026-07-20-step2-cuda.tsv` contains the earlier standalone-kernel
   diagnostic measurements.

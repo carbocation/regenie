@@ -1,0 +1,5 @@
+snapshot_date	machine_type	region	provisioning	hourly_usd	benchmark_role	source
+2026-07-20	a2-highgpu-1g	us-central1	on_demand	3.673385	measured_a100	https://cloud.google.com/products/compute/pricing/accelerator-optimized
+2026-07-20	n2-standard-16	us-west1	on_demand	0.776944	measured_n2	https://cloud.google.com/products/compute/pricing/general-purpose
+2026-07-20	n2-standard-16	us-west1	spot	0.335008	measured_n2	https://cloud.google.com/spot-vms/pricing
+2026-07-20	n2-highcpu-16	us-west1	spot	0.247312	unmeasured_cost_sensitivity	https://cloud.google.com/spot-vms/pricing
