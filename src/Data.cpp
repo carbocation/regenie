@@ -170,6 +170,15 @@ bool step1_pgen_packed_hardcalls_enabled() {
     "REGENIE_STEP1_PGEN_PACKED must be '0' or '1'");
 }
 
+int step1_level0_pipeline_mode() {
+  const char* value = std::getenv("REGENIE_STEP1_LEVEL0_PIPELINE");
+  if(!value || !*value) return -1;
+  if(std::string(value) == "0") return 0;
+  if(std::string(value) == "1") return 1;
+  throw std::invalid_argument(
+    "REGENIE_STEP1_LEVEL0_PIPELINE must be '0' or '1'");
+}
+
 uint64_t step1_prediction_output_threads(const int configured_threads) {
   const char* value = std::getenv("REGENIE_STEP1_OUTPUT_THREADS");
   if(!value || !*value)
@@ -213,6 +222,17 @@ struct Step1PgenPrefetchBuffer {
 struct Step1PgenPrefetchResult {
   Step1PgenReadProfile profile;
   double service_ms = 0;
+};
+
+struct Step1Level0PipelineResult {
+  Step1PgenPrefetchResult prefetch;
+  Step1ComputeTimings preprocess;
+  Eigen::VectorXd row_scales;
+  double prefetch_wait_ms = 0;
+  double data_setup_ms = 0;
+  double preprocess_wall_ms = 0;
+  double service_ms = 0;
+  bool processed = false;
 };
 
 void build_step1_prediction_groups(
@@ -1182,9 +1202,33 @@ void Data::level_0_calculations() {
       sizeof(double);
   const bool pgen_prefetch_enabled = pgen_cuda_backend &&
     pgen_prefetch_limit > 0 && pgen_block_bytes <= pgen_prefetch_limit;
+  const int level0_pipeline_mode = step1_level0_pipeline_mode();
+  const uint64_t level0_pipeline_auto_limit_bytes =
+    uint64_t(1000) * 1000000;
+  const bool level0_expanded_block_size_valid = params.block_size >= 0 &&
+    static_cast<uint64_t>(params.block_size) <=
+      std::numeric_limits<uint64_t>::max() /
+        std::max<uint64_t>(1, static_cast<uint64_t>(params.n_samples)) /
+        sizeof(double);
+  const uint64_t level0_expanded_block_bytes =
+    level0_expanded_block_size_valid ?
+      static_cast<uint64_t>(params.block_size) *
+        static_cast<uint64_t>(params.n_samples) * sizeof(double) :
+      std::numeric_limits<uint64_t>::max();
+  const bool level0_pipeline_selected = level0_pipeline_mode == 1 ||
+    (level0_pipeline_mode < 0 && level0_expanded_block_bytes <=
+      level0_pipeline_auto_limit_bytes);
+  const bool level0_pipeline_enabled = level0_pipeline_selected &&
+    pgen_packed_hardcalls && pgen_prefetch_enabled;
   Step1PgenPrefetchBuffer pgen_prefetch_buffer;
   std::future<Step1PgenPrefetchResult> pgen_prefetch_future;
   bool pgen_prefetch_pending = false;
+  std::unique_ptr<Step1ComputeBackend> level0_pipeline_backend;
+  std::future<Step1Level0PipelineResult> level0_pipeline_future;
+  bool level0_pipeline_pending = false;
+  if(level0_pipeline_enabled)
+    level0_pipeline_backend = make_step1_compute_backend(
+      "cuda", params.gpu_device);
   if(pgen_cuda_backend) {
     sout << " - Step 1 PGEN block prefetch : [" <<
       (pgen_prefetch_enabled ? "enabled" : "disabled") << "]";
@@ -1194,6 +1238,16 @@ void Data::level_0_calculations() {
     else if(pgen_prefetch_limit > 0)
       sout << " block_mb=" << (pgen_block_bytes / 1000000.0) <<
         " limit_mb=" << (pgen_prefetch_limit / 1000000.0);
+    sout << "\n";
+    sout << " - Step 1 Level 0 two-block pipeline : [" <<
+      (level0_pipeline_enabled ? "enabled" : "disabled") << "]";
+    if(level0_pipeline_selected && !level0_pipeline_enabled)
+      sout << " reason=requires_packed_prefetch";
+    else if(level0_pipeline_mode < 0 && !level0_pipeline_selected)
+      sout << " reason=resident_block_size"
+        << " block_mb=" << (level0_expanded_block_bytes / 1000000.0)
+        << " automatic_limit_mb=" <<
+          (level0_pipeline_auto_limit_bytes / 1000000.0);
     sout << "\n";
   }
 
@@ -1222,7 +1276,84 @@ void Data::level_0_calculations() {
       ProfileClock::time_point stage_start;
       if(params.profile_step1) stage_start = ProfileClock::now();
       Gblock.step1_pgen_packed_block = false;
-      if(pgen_prefetch_pending) {
+      bool block_preprocessed_by_pipeline = false;
+      if(level0_pipeline_pending) {
+        const ProfileClock::time_point wait_start = ProfileClock::now();
+        Step1Level0PipelineResult result = level0_pipeline_future.get();
+        const double wait_ms = elapsed_ms(wait_start);
+        level0_pipeline_pending = false;
+        if(!result.processed)
+          throw std::runtime_error(
+            "Step 1 pipelined packed PGEN block could not be preprocessed by the selected backend");
+
+        step1_compute_backend.swap(level0_pipeline_backend);
+        Gblock.Gmat.resize(bs, 0);
+        Gblock.step1_pgen_packed_hardcalls.clear();
+        Gblock.step1_pgen_packed_stride_bytes = 0;
+        Gblock.step1_pgen_packed_block = true;
+        scale_G.swap(result.row_scales);
+        pgen_prefetch_buffer.packed_hardcalls.clear();
+        pgen_prefetch_buffer.packed_stride_bytes = 0;
+        block_preprocessed_by_pipeline = true;
+
+        MatrixXd::Index min_index;
+        if(scale_G.array().minCoeff(&min_index) < params.numtol)
+          throw "!! Uh-oh, SNP " +
+            snpinfo[in_filters.step1_snp_count + min_index].ID +
+            " has low variance (= " + to_string(scale_G(min_index, 0)) +
+            ").";
+
+        if(pgen_profile)
+          accumulate_step1_pgen_profile(
+            *pgen_profile, result.prefetch.profile);
+        if(params.profile_step1) {
+          const Step1ComputeTimings& timings = result.preprocess;
+          step1_profile.pgen_prefetched_blocks++;
+          step1_profile.pgen_prefetch_service_ms +=
+            result.prefetch.service_ms;
+          step1_profile.pgen_prefetch_wait_ms +=
+            result.prefetch_wait_ms;
+          step1_profile.level0_pipelined_blocks++;
+          step1_profile.level0_pipeline_service_ms += result.service_ms;
+          step1_profile.level0_pipeline_wait_ms += wait_ms;
+          step1_profile.preprocess_wall_ms +=
+            result.preprocess_wall_ms;
+          step1_profile.preprocess_backend_compute_ms +=
+            timings.preprocess_ms;
+          step1_profile.preprocess_upload_ms += timings.upload_ms;
+          step1_profile.preprocess_download_ms += timings.download_ms;
+          step1_profile.preprocess_data_setup_ms +=
+            result.data_setup_ms;
+          step1_profile.preprocess_backend_wall_ms +=
+            timings.packed_hardcall_backend_wall_ms;
+          step1_profile.preprocess_pinned_staging_upload_count +=
+            timings.pinned_staging_upload_count;
+          step1_profile.preprocess_pinned_staging_upload_bytes +=
+            timings.pinned_staging_upload_bytes;
+          step1_profile.preprocess_packed_hardcall_blocks +=
+            timings.packed_hardcall_upload_count;
+          step1_profile.preprocess_packed_hardcall_upload_bytes +=
+            timings.packed_hardcall_upload_bytes;
+          step1_profile.preprocess_packed_hardcall_expand_ms +=
+            timings.packed_hardcall_expand_ms;
+          step1_profile.preprocess_packed_hardcall_validation_ms +=
+            timings.packed_hardcall_validation_ms;
+          step1_profile.preprocess_packed_hardcall_allocation_ms +=
+            timings.packed_hardcall_allocation_ms;
+          step1_profile.preprocess_packed_hardcall_host_prepare_ms +=
+            timings.packed_hardcall_host_prepare_ms;
+          step1_profile.preprocess_packed_hardcall_backend_wall_ms +=
+            timings.packed_hardcall_backend_wall_ms;
+          step1_profile.preprocess_backend_blocks++;
+          step1_profile.preprocess_host_orchestration_ms += std::max(
+            0.0, result.preprocess_wall_ms - timings.preprocess_ms -
+              timings.upload_ms - timings.download_ms);
+        }
+        sout << " block [" << block + 1 << "] : " << bs <<
+          " snps (" << static_cast<long long>(
+            result.prefetch.service_ms) << "ms prefetched; " <<
+          static_cast<long long>(wait_ms) << "ms pipeline wait)" << endl;
+      } else if(pgen_prefetch_pending) {
         const ProfileClock::time_point wait_start = ProfileClock::now();
         Step1PgenPrefetchResult result = pgen_prefetch_future.get();
         const double wait_ms = elapsed_ms(wait_start);
@@ -1349,9 +1480,12 @@ void Data::level_0_calculations() {
       }
 
       // residualize and scale genotypes
-      if(params.profile_step1) stage_start = ProfileClock::now();
-      residualize_genotypes();
-      if(params.profile_step1) step1_profile.residualize_ms += elapsed_ms(stage_start);
+      if(!block_preprocessed_by_pipeline) {
+        if(params.profile_step1) stage_start = ProfileClock::now();
+        residualize_genotypes();
+        if(params.profile_step1)
+          step1_profile.residualize_ms += elapsed_ms(stage_start);
+      }
 
       // calc working matrices for ridge regressions across folds
       ProfileClock::time_point cv_start;
@@ -1386,6 +1520,42 @@ void Data::level_0_calculations() {
         step1_profile.cv_transfer_ms += cv_transfer_ms;
         step1_profile.cv_host_orchestration_ms += std::max(
           0.0, cv_wall_ms - cv_backend_compute_ms - cv_transfer_ms);
+      }
+
+      if(level0_pipeline_enabled && pgen_prefetch_pending) {
+        pgen_prefetch_pending = false;
+        level0_pipeline_pending = true;
+        level0_pipeline_future = std::async(std::launch::async,
+          [this, next_bs, &pgen_prefetch_buffer,
+           &pgen_prefetch_future, &level0_pipeline_backend]() {
+            Step1Level0PipelineResult result;
+            const ProfileClock::time_point service_start =
+              ProfileClock::now();
+            const ProfileClock::time_point prefetch_wait_start =
+              ProfileClock::now();
+            result.prefetch = pgen_prefetch_future.get();
+            result.prefetch_wait_ms = elapsed_ms(prefetch_wait_start);
+
+            const ProfileClock::time_point preprocess_start =
+              ProfileClock::now();
+            const ProfileClock::time_point data_setup_start =
+              ProfileClock::now();
+            const VectorXd sample_weights =
+              in_filters.ind_in_analysis.matrix().cast<double>();
+            result.data_setup_ms = elapsed_ms(data_setup_start);
+            result.processed =
+              level0_pipeline_backend->preprocess_packed_hardcalls(
+                pgen_prefetch_buffer.packed_hardcalls.data(),
+                pgen_prefetch_buffer.packed_hardcalls.size(),
+                pgen_prefetch_buffer.packed_stride_bytes,
+                next_bs, params.n_samples, pheno_data.new_cov,
+                sample_weights, params.n_analyzed - params.ncov,
+                params.numtol, result.row_scales,
+                params.profile_step1 ? &result.preprocess : nullptr);
+            result.preprocess_wall_ms = elapsed_ms(preprocess_start);
+            result.service_ms = elapsed_ms(service_start);
+            return result;
+          });
       }
 
       // test association for block
@@ -1595,7 +1765,8 @@ void Data::print_step1_profile() {
   const double measured_ms = step1_profile.decode_ms + step1_profile.residualize_ms +
     step1_profile.gram_ms + step1_profile.gty_ms + step1_profile.eigensolve_ms +
     step1_profile.backend_upload_ms + step1_profile.backend_download_ms +
-    step1_profile.association_ms + step1_profile.ridge_ms;
+    step1_profile.association_ms + step1_profile.ridge_ms +
+    step1_profile.level0_pipeline_wait_ms;
   const double other_ms = std::max(0.0, step1_profile.total_ms - measured_ms);
   const double denominator = step1_profile.total_ms > 0 ? step1_profile.total_ms : 1;
 
@@ -1623,6 +1794,8 @@ void Data::print_step1_profile() {
   print_stage("eigensolve_transform", step1_profile.eigensolve_ms);
   print_stage("association", step1_profile.association_ms);
   print_stage("ridge", step1_profile.ridge_ms);
+  print_stage("level0_pipeline_wait",
+    step1_profile.level0_pipeline_wait_ms);
   print_stage("other", other_ms);
   print_stage("block_total", step1_profile.total_ms);
   if(step1_pgen_read_profile.variants > 0) {
@@ -1668,6 +1841,17 @@ void Data::print_step1_profile() {
         << " prefetched_blocks=" << step1_profile.pgen_prefetched_blocks
         << " service_ms=" << step1_profile.pgen_prefetch_service_ms
         << " wait_ms=" << step1_profile.pgen_prefetch_wait_ms
+        << " estimated_overlap_ms=" << overlap_ms
+        << "\n";
+  }
+  if(step1_profile.level0_pipelined_blocks > 0) {
+    const double overlap_ms = std::max(0.0,
+      step1_profile.level0_pipeline_service_ms -
+        step1_profile.level0_pipeline_wait_ms);
+    out << "STEP1_PROFILE scope=level0_pipeline"
+        << " blocks=" << step1_profile.level0_pipelined_blocks
+        << " service_ms=" << step1_profile.level0_pipeline_service_ms
+        << " wait_ms=" << step1_profile.level0_pipeline_wait_ms
         << " estimated_overlap_ms=" << overlap_ms
         << "\n";
   }

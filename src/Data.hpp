@@ -88,6 +88,9 @@ struct Step1Profile {
   uint64_t pgen_prefetched_blocks = 0;
   double pgen_prefetch_service_ms = 0;
   double pgen_prefetch_wait_ms = 0;
+  uint64_t level0_pipelined_blocks = 0;
+  double level0_pipeline_service_ms = 0;
+  double level0_pipeline_wait_ms = 0;
   double initialization_ms = 0;
   double level0_wall_ms = 0;
   double level1_prepare_ms = 0;
