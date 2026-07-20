@@ -553,6 +553,64 @@ byte-identical to each other and to the current N2 output. Because v4.1.2 does
 not emit structured Step 2 phase records, its checked-in rows retain wall time,
 CPU use, and peak RSS but do not invent phase-level values.
 
+### Realistic multi-phenotype Step 2
+
+The full Step 2 benchmark uses 50,000 samples and all 700,000 variants from the
+shared real-LD-derived PGEN. It ran on eight physical N2 cores with oneMKL,
+1,000-variant blocks, matching LOCO predictions, and an empty page cache. The
+quantitative panels contain 32 traits. One is fully observed; the other has
+trait-specific missingness increasing from 0% to 10% and uses Step 2's default
+per-trait deletion. The binary panel contains eight traits with prevalences
+from 1% to 50%. The survival panel contains eight models with event fractions
+from 10% to 80%. Binary and survival tests use approximate Firth correction at
+`p < 0.01`.
+
+| Panel | Tests | Wall | Prediction read | Null model | Genotype stage | Variant compute | Output | Tests/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 quantitative, complete | 22.4M | 109.84 s | 16.43 s | 0.16 s | 23.46 s | 63.20 s | 4.21 s | 203,933 |
+| 32 quantitative, 0–10% missing | 22.4M | 783.62 s | 16.44 s | 0.15 s | 415.53 s | 345.13 s | 4.04 s | 28,585 |
+| 8 binary, approximate Firth | 5.6M | 307.40 s | 4.16 s | 3.27 s | 23.08 s | 274.28 s | 1.13 s | 18,217 |
+| 8 survival, approximate Firth | 5.6M | 433.29 s | 4.23 s | 7.39 s | 23.02 s | 395.78 s | 1.27 s | 12,924 |
+
+Complete quantitative traits are not read-bound: variant computation accounts
+for 57.6% of wall time, PGEN ingestion for 21.4%, and LOCO prediction reads for
+15.0%. Even free PGEN ingestion would improve end-to-end time by only 1.27x.
+The 32-trait run sustains about 204,000 association tests per second.
+
+Default trait-specific deletion is the clear performance outlier. It is 7.13x
+slower than the complete panel and keeps the eight cores 97.9% busy. Although
+415.53 seconds is charged to the genotype stage, the PGEN subprofile attributes
+only 1.2% of aggregate worker time to decoding and 98.8% to post-decode sample
+and trait accounting. Missingness currently disables retained packed hardcalls,
+shared denominators, row-major sparse residuals, and dense block scoring for the
+whole panel. A 16,000-variant diagnostic using documented mean imputation
+completed in 5.44 seconds, essentially matching the 5.59-second complete-trait
+run and far below the 20.99-second default-deletion run. This control changes
+the statistical treatment of missing observations, so it diagnoses the fast
+path rather than replacing the default benchmark.
+
+Binary and survival runs are even more compute-heavy: their variant phases are
+89.2% and 91.4% of wall time, respectively. The binary run applied 59,904 Firth
+corrections and the survival run applied 2,827,678, with no failures. Short
+score-only controls show that correction adds about 20% to binary variant time
+and 11% to survival variant time; the ordinary score calculation remains the
+larger target.
+
+There is no Step 2 CUDA backend in these measurements. The profiles do not
+support a large gain from offloading variant reads alone: eliminating the full
+genotype stage has end-to-end ceilings of 1.27x for complete quantitative
+traits, 1.08x for binary traits, and 1.06x for survival. The credible larger
+opportunity is to evaluate blocks of variants and phenotypes together. For
+missing quantitative traits this means retaining packed hardcalls and computing
+mask-aware numerators and denominators without per-sample/per-trait bookkeeping.
+For binary and survival traits it means batching weighted score numerators,
+norms, and covariate projections before applying correction only to selected
+tests. These transformations should be validated with CPU BLAS first. A CUDA
+implementation becomes attractive if it accepts packed genotypes directly and
+keeps phenotype masks, residuals, weights, and null-model terms resident; a
+standalone decoder or isolated GEMM offload cannot deliver the same end-to-end
+gain.
+
 ## Reproduction and interpretation notes
 
 - Every retained run exited successfully. The original current-branch snapshot
