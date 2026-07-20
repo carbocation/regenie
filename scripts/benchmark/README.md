@@ -58,7 +58,7 @@ can be used directly from CI or a batch scheduler.
 
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
-  fixture, including the v4.1.2 CPU anchor, GPU utilization and power, phase
-  bottlenecks, and Step 2 thread scaling.
+  fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
+  power, phase bottlenecks, and Step 2 thread scaling.
 - `results/2026-07-19-production.tsv` contains the retained raw run-level
   measurements used by that report.

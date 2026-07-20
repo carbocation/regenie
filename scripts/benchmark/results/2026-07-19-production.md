@@ -236,6 +236,26 @@ The fixed 2.2–3.2-second setup cost is already 27–33% of the fastest runs;
 it will matter less when more Step 2 variants are processed. Results are
 bit-for-bit stable across thread counts within each system.
 
+### Upstream v4.1.2 on N2
+
+The N2 sweep was repeated with upstream v4.1.2 using the same oneMKL 2026.1
+runtime, exact variant subset, and current prediction file. Holding the
+prediction input fixed isolates Step 2 implementation performance.
+
+| Threads | Current wall | v4.1.2 wall | Current speedup | Current peak RSS | v4.1.2 peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 54.73 s | 194.32 s | 3.55x | 0.33 GiB | 3.89 GiB |
+| 2 | 26.04 s | 99.69 s | 3.83x | 0.33 GiB | 3.91 GiB |
+| 4 | 13.51 s | 52.33 s | 3.87x | 0.33 GiB | 3.94 GiB |
+| 8 | 7.58 s | 27.99 s | 3.69x | 0.33 GiB | 4.01 GiB |
+
+The current branch is 3.55–3.87x faster across the sweep and uses about
+one-twelfth of the memory. It also scales slightly better from one to eight
+threads: 7.22x versus 6.94x upstream. All four upstream result files are
+byte-identical to each other and to the current N2 output. Because v4.1.2 does
+not emit structured Step 2 phase records, its checked-in rows retain wall time,
+CPU use, and peak RSS but do not invent phase-level values.
+
 ## Reproduction and interpretation notes
 
 - Every retained run exited successfully. Current-branch runs use `114ef81`;
