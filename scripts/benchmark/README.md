@@ -72,9 +72,10 @@ can be used directly from CI or a batch scheduler.
 ## Recorded checkpoints
 
 - [`results/2026-07-20-step2.md`](results/2026-07-20-step2.md) covers realistic
-  multi-trait Step 2 work on an eight-core CPU, the retained CPU scoring
-  optimizations, and a packed-input CUDA feasibility study on T4 and A100.
-  The CUDA figures are kernel-level bounds, not end-to-end REGENIE timings.
+  multi-trait Step 2 work on an eight-core CPU and matched end-to-end CPU/CUDA
+  comparisons on T4 and A100. It includes quantitative traits with and without
+  missingness, binary traits, survival traits, approximate Firth correction,
+  GPU telemetry, numerical checks, and the automatic backend policy.
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
@@ -84,6 +85,7 @@ can be used directly from CI or a batch scheduler.
   multi-phenotype Level 0 path, and Step 2 thread scaling.
 - `results/2026-07-19-production.tsv` contains the retained raw run-level
   measurements used by that report.
-- `results/2026-07-20-step2.tsv` and
-  `results/2026-07-20-step2-cuda.tsv` contain the measurements used by the
-  Step 2 report.
+- `results/2026-07-20-step2.tsv`,
+  `results/2026-07-20-step2-integrated.tsv`, and
+  `results/2026-07-20-step2-cuda.tsv` contain the CPU, integrated CPU/CUDA, and
+  standalone-kernel measurements used by the Step 2 report.
