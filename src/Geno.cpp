@@ -2493,7 +2493,7 @@ void readChunkFromBGENFileToG(vector<uint64> const& indices, const int& chrom, v
           snp_data->ns1++;
 
           // counts by trait
-          if(filters->has_missing(index)) update_trait_counts(index, ds, mval, lval, ival, snp_data, masked_indivs);
+          if(filters->has_missing(index)) update_trait_counts(index, ds, mval, lval, ival, snp_data, filters->missing_pheno_indices[index]);
 
           /* // get genotype counts (convert to hardcall)
           if( params->htp_out ) {
@@ -2852,7 +2852,7 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
       snp_data->ns1++;
 
       // counts by trait
-      if(filters->has_missing(index)) update_trait_counts(index, Geno(index), mval, lval, ival, snp_data, masked_indivs);
+      if(filters->has_missing(index)) update_trait_counts(index, Geno(index), mval, lval, ival, snp_data, filters->missing_pheno_indices[index]);
 
       /* // get genotype counts (convert to hardcall)
       if( params->htp_out ) {
@@ -3015,7 +3015,7 @@ void parseSnpfromBed(const int& isnp, const int &chrom, const vector<uchar>& bed
         snp_data->ns1++;
 
         // counts by trait
-        if(filters->has_missing(index)) update_trait_counts(index, Geno(index), mval, lval, 0, snp_data, masked_indivs);
+        if(filters->has_missing(index)) update_trait_counts(index, Geno(index), mval, lval, 0, snp_data, filters->missing_pheno_indices[index]);
 
         /* // get genotype counts
         if( params->htp_out ) 
@@ -3266,7 +3266,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
           if(genotype == 0) snp_data->n_zero++;
           if(has_trait_missingness && filters->has_missing(index))
             update_trait_counts(index, genotype, genotype, 0, 0,
-              snp_data, masked_indivs);
+              snp_data, filters->missing_pheno_indices[index]);
         }
       }
       if(oob_err(j)) continue;
@@ -3320,7 +3320,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
           // counts by trait
           if(filters->has_missing(index))
             update_trait_counts(index, Geno(index), mval, lval, ival,
-              snp_data, masked_indivs);
+              snp_data, filters->missing_pheno_indices[index]);
 
        /* // get genotype counts
         if( params->htp_out ) {
@@ -3682,16 +3682,20 @@ void reset_stats(variant_block* snp_data, struct param const& params){
 
 }
 
-void update_trait_counts(int const& index, double const& genoValue, double const& macValue, int const& sexValue, double const& infoValue, variant_block* snp_data, const Ref<const MatrixXb>& mask){
+void update_trait_counts(int const&, double const& genoValue,
+    double const& macValue, int const& sexValue, double const& infoValue,
+    variant_block* snp_data, const vector<int>& missing_phenotypes){
 
-  ArrayXi imask = 1 - mask.row(index).cast<int>().array(); // get masked samples
-
-  // will subtract from total computed on all analyzed samples (masked & unmasked)
-  snp_data->af -= genoValue * imask.cast<double>();
-  snp_data->mac -= macValue * imask.cast<double>();
-  snp_data->info -= infoValue * imask.cast<double>();
-  snp_data->nmales -= imask * sexValue;
-  snp_data->ns -= imask;
+  // The caller has already established that this sample is missing at least
+  // one phenotype. Update only those entries rather than materializing and
+  // applying full phenotype-length arrays for every genotype.
+  for(int ph : missing_phenotypes) {
+    snp_data->af(ph) -= genoValue;
+    snp_data->mac(ph) -= macValue;
+    snp_data->info(ph) -= infoValue;
+    snp_data->nmales(ph) -= sexValue;
+    snp_data->ns(ph)--;
+  }
 
 }
 

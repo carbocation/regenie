@@ -117,6 +117,7 @@ struct Step2VariantComputeProfile {
   uint64_t rowmajor_sparse_qt_variants = 0;
   uint64_t unscaled_dense_qt_variants = 0;
   uint64_t shared_denom_dense_qt_variants = 0;
+  uint64_t missing_denom_dense_qt_variants = 0;
   uint64_t algebraic_dense_qt_variants = 0;
   uint64_t dense_qt_score_candidates = 0;
   uint64_t batched_dense_qt_blocks = 0;
@@ -190,6 +191,19 @@ struct geno_block {
   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
     step2_qt_sparse_residuals;
   bool step2_qt_sparse_residuals_valid = false;
+  Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    step2_qt_observed_masks;
+  bool step2_qt_observed_masks_valid = false;
+  const std::vector<std::vector<int>>*
+    step2_qt_missing_pheno_indices = nullptr;
+  // X'Y terms for the weighted binary-trait score projection. These let the
+  // dense path evaluate the score without materializing an N-sample Gres.
+  std::vector<Eigen::VectorXd> step2_binary_XtY;
+  // Cached terms for the default Cox score approximation. The projected
+  // genotype norm and score can then be formed from small crossproducts.
+  std::vector<Eigen::MatrixXd> step2_cox_projection_gram;
+  std::vector<Eigen::VectorXd> step2_cox_projection_score;
+  std::vector<Eigen::VectorXd> step2_cox_score_residual;
   Eigen::MatrixXd snp_afs;
   std::vector<std::vector<double>> step1_pgen_worker_tiles;
   std::vector<unsigned char> step1_pgen_packed_hardcalls;
@@ -294,7 +308,7 @@ void prep_snp_stats(variant_block*,struct param const*);
 void initialize_thread_data(std::vector<data_thread>&,struct param const&);
 void reset_thread(data_thread*,struct param const&);
 void reset_stats(variant_block*,struct param const&);
-void update_trait_counts(int const&,double const&,double const&,int const&,double const&,variant_block*,const Eigen::Ref<const MatrixXb>&);
+void update_trait_counts(int const&,double const&,double const&,int const&,double const&,variant_block*,const std::vector<int>&);
 void update_genocounts(bool const&,int const&,int const&,Eigen::MatrixXd&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&);
 void compute_genocounts(bool const&,bool const&,double const&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXi>,const Eigen::Ref<const Eigen::ArrayXi>&,std::vector<std::vector<Eigen::ArrayXi>> const&);
 void update_genocounts(bool const&,bool const&,Eigen::Ref<Eigen::VectorXi>,const Eigen::Ref<const Eigen::ArrayXi>&,const Eigen::Ref<const Eigen::ArrayXd>&,std::vector<Eigen::ArrayXi> const&);

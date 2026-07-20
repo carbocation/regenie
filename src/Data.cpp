@@ -556,6 +556,8 @@ void Data::print_step2_profile() {
         << step2_variant_compute_profile.unscaled_dense_qt_variants
         << " shared_denom_dense_qt_variants="
         << step2_variant_compute_profile.shared_denom_dense_qt_variants
+        << " missing_denom_dense_qt_variants="
+        << step2_variant_compute_profile.missing_denom_dense_qt_variants
         << " algebraic_dense_qt_variants="
         << step2_variant_compute_profile.algebraic_dense_qt_variants
         << " dense_qt_score_candidates="
@@ -3809,6 +3811,8 @@ void Data::compute_res(){
   res.array().rowwise() /= p_sd_yres.array();
   pheno_data.scf_sv = ( pheno_data.scale_Y.array() * p_sd_yres.array()).matrix().transpose().array();
 
+  const bool step2_qt_masks_complete =
+    (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
   const bool step2_qt_sparse_base_eligible =
     (params.file_type == "pgen") &&
     (params.trait_mode == 0) &&
@@ -3825,12 +3829,12 @@ void Data::compute_res(){
     !params.getCorMat &&
     (pheno_data.new_cov.cols() == params.ncov_analyzed) &&
     (params.n_variants >= 1000) &&
-    (params.prop_zero_thr < 1) &&
-    (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
+    (params.prop_zero_thr < 1);
   Gblock.step2_qt_sparse_residuals_valid =
     step2_qt_sparse_base_eligible && (params.n_pheno >= 16);
   Gblock.step2_pgen_direct_qt_enabled =
-    step2_qt_sparse_base_eligible && (params.n_pheno == 1);
+    step2_qt_sparse_base_eligible && step2_qt_masks_complete &&
+    (params.n_pheno == 1);
   Gblock.step2_pgen_direct_qt_terms_valid =
     Gblock.step2_pgen_direct_qt_enabled &&
     (pheno_data.new_cov.cols() > 1);
@@ -3873,6 +3877,24 @@ void Data::compute_res(){
         elapsed_ms(layout_start);
   } else {
     Gblock.step2_qt_sparse_residuals.resize(0, 0);
+  }
+  Gblock.step2_qt_observed_masks_valid =
+    Gblock.step2_qt_sparse_residuals_valid && !step2_qt_masks_complete;
+  Gblock.step2_qt_missing_pheno_indices =
+    Gblock.step2_qt_observed_masks_valid ?
+      &in_filters.missing_pheno_indices : nullptr;
+  if(Gblock.step2_qt_observed_masks_valid) {
+    Gblock.step2_qt_observed_masks.resize(
+      pheno_data.masked_indivs.rows(), pheno_data.masked_indivs.cols());
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(params.neff_threads) schedule(static)
+#endif
+    for(int sample = 0; sample < pheno_data.masked_indivs.rows(); ++sample)
+      for(int ph = 0; ph < pheno_data.masked_indivs.cols(); ++ph)
+        Gblock.step2_qt_observed_masks(sample, ph) =
+          pheno_data.masked_indivs(sample, ph);
+  } else {
+    Gblock.step2_qt_observed_masks.resize(0, 0);
   }
 
   if(!params.trait_set && !params.multiphen) pheno_data.YtX = res.transpose() * pheno_data.new_cov;
@@ -3920,6 +3942,14 @@ void Data::compute_res_bin(int const& chrom){
   res.array() /= m_ests.Gamma_sqrt.array();
   res.array() *= pheno_data.masked_indivs.array().cast<double>();
 
+  Gblock.step2_binary_XtY.resize(params.n_pheno);
+  for(int ph = 0; ph < params.n_pheno; ++ph) {
+    MapcMatXd XWsqrt(m_ests.X_Gamma[ph].data(), params.n_samples,
+      m_ests.X_Gamma[ph].cols());
+    Gblock.step2_binary_XtY[ph].noalias() =
+      XWsqrt.transpose() * res.col(ph);
+  }
+
   // if using firth approximation, fit null penalized model with only covariates and store the estimates (to be used as offset when computing LRT in full model)
   if(params.firth_approx) fit_null_firth(false, chrom, &firth_est, &pheno_data, &m_ests, &files, &params, sout);
   else if(params.firth){ // get estimates of covs without tested snp
@@ -3943,6 +3973,22 @@ void Data::compute_res_count(int const& chrom){
 void Data::compute_res_cox(int const& chrom){
 
   fit_null_cox(false, chrom, &params, &pheno_data, &m_ests, &files, sout); // for all phenotypes
+
+  Gblock.step2_cox_projection_gram.resize(params.n_pheno);
+  Gblock.step2_cox_projection_score.resize(params.n_pheno);
+  Gblock.step2_cox_score_residual.resize(params.n_pheno);
+  for(int ph = 0; ph < params.n_pheno; ++ph) {
+    if(!params.pheno_pass(ph)) continue;
+    const MatrixXd& projection =
+      m_ests.cox_MLE_NULL[ph].X1_X1WX1inv;
+    Gblock.step2_cox_score_residual[ph] =
+      m_ests.cox_MLE_NULL[ph].residual.array() *
+      pheno_data.masked_indivs.col(ph).cast<double>().array();
+    Gblock.step2_cox_projection_gram[ph].noalias() =
+      projection.transpose() * projection;
+    Gblock.step2_cox_projection_score[ph].noalias() =
+      projection.transpose() * Gblock.step2_cox_score_residual[ph];
+  }
 
   if(params.firth_approx) fit_null_firth_cox(false, chrom, &firth_est, &pheno_data, &m_ests, &files, &params, sout);
 
@@ -3998,6 +4044,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   vector<uint64_t> rowmajor_sparse_qt_variants(profile_threads, 0);
   vector<uint64_t> unscaled_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> shared_denom_dense_qt_variants(profile_threads, 0);
+  vector<uint64_t> missing_denom_dense_qt_variants(profile_threads, 0);
   vector<uint64_t> algebraic_dense_qt_variants(profile_threads, 0);
   vector<Step2BgenParseProfile> bgen_profiles(profile_threads);
 
@@ -4086,8 +4133,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
               packed_sparse_variants[thread_num]++;
             if(Gblock.thread_data[thread_num].qt_complete_masks)
               shared_denom_sparse_qt_variants[thread_num]++;
-            if(Gblock.thread_data[thread_num].qt_complete_masks &&
-               Gblock.step2_qt_sparse_residuals_valid)
+            if(Gblock.step2_qt_sparse_residuals_valid)
               rowmajor_sparse_qt_variants[thread_num]++;
           }
         }
@@ -4142,6 +4188,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
           unscaled_dense_qt_variants[thread_num]++;
           if(Gblock.thread_data[thread_num].qt_complete_masks)
             shared_denom_dense_qt_variants[thread_num]++;
+          else if(Gblock.step2_qt_missing_pheno_indices != nullptr)
+            missing_denom_dense_qt_variants[thread_num]++;
         }
 
         // skip SNP if fails filters
@@ -4214,6 +4262,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
     step2_variant_compute_profile.shared_denom_dense_qt_variants +=
       std::accumulate(shared_denom_dense_qt_variants.begin(),
         shared_denom_dense_qt_variants.end(), uint64_t(0));
+    step2_variant_compute_profile.missing_denom_dense_qt_variants +=
+      std::accumulate(missing_denom_dense_qt_variants.begin(),
+        missing_denom_dense_qt_variants.end(), uint64_t(0));
     step2_variant_compute_profile.algebraic_dense_qt_variants +=
       std::accumulate(algebraic_dense_qt_variants.begin(),
         algebraic_dense_qt_variants.end(), uint64_t(0));

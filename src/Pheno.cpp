@@ -885,6 +885,16 @@ void setMasks(struct param* params, struct filter* filters, struct phenodt* phen
 
   // identify individuals masked for at least 1 trait
   filters->has_missing = !(pheno_data->masked_indivs.array().rowwise().all());
+  filters->missing_pheno_indices.clear();
+  filters->missing_pheno_indices.resize(params->n_samples);
+  for(uint32_t sample = 0; sample < params->n_samples; ++sample) {
+    if(!filters->has_missing(sample)) continue;
+    std::vector<int>& missing = filters->missing_pheno_indices[sample];
+    missing.reserve(params->n_pheno -
+      pheno_data->masked_indivs.row(sample).count());
+    for(int ph = 0; ph < params->n_pheno; ++ph)
+      if(!pheno_data->masked_indivs(sample, ph)) missing.push_back(ph);
+  }
   //for(int i = 0; i <5; i++) cerr << std::boolalpha << filters->has_missing(i) << endl;
 
   // check sample size
