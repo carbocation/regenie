@@ -153,6 +153,16 @@ bool Step1ComputeBackend::preprocess_packed_hardcalls(
   return false;
 }
 
+bool Step1ComputeBackend::register_packed_hardcall_buffer(
+  unsigned char* buffer, size_t bytes) {
+  (void)buffer;
+  (void)bytes;
+  return false;
+}
+
+void Step1ComputeBackend::release_packed_hardcall_buffers() {
+}
+
 void Step1ComputeBackend::compute_preprocessed_products(
   Eigen::Index start_column,
   Eigen::Index column_count,
@@ -170,6 +180,18 @@ void Step1ComputeBackend::compute_preprocessed_products(
   (void)timings;
   throw std::runtime_error(
     "Step 1 backend has no resident preprocessed genotype block");
+}
+
+bool Step1ComputeBackend::cache_preprocessed_fold_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+  Step1ComputeTimings* timings) {
+  (void)start_columns;
+  (void)column_counts;
+  (void)phenotypes;
+  (void)timings;
+  return false;
 }
 
 void Step1ComputeBackend::ridge_predict_preprocessed(
@@ -229,6 +251,40 @@ bool Step1ComputeBackend::ridge_predict_preprocessed_systems(
   return false;
 }
 
+bool Step1ComputeBackend::ridge_predict_cached_preprocessed_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  std::vector<Eigen::MatrixXd>& predictions,
+  std::vector<Eigen::MatrixXd>& coefficients,
+  Step1ComputeTimings* timings) {
+  (void)start_columns;
+  (void)column_counts;
+  (void)ridge_parameters;
+  (void)predictions;
+  (void)coefficients;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::ridge_predict_cached_preprocessed_systems_normalized(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  double effective_sample_count,
+  Eigen::Index level1_start_column,
+  Eigen::MatrixXd& normalized_predictions,
+  Step1ComputeTimings* timings) {
+  (void)start_columns;
+  (void)column_counts;
+  (void)ridge_parameters;
+  (void)effective_sample_count;
+  (void)level1_start_column;
+  (void)normalized_predictions;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 
@@ -244,6 +300,46 @@ bool Step1ComputeBackend::cache_design_matrix(
   const Eigen::Ref<const Eigen::MatrixXd>& design,
   Step1ComputeTimings* timings) {
   (void)design;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::initialize_level1_design_cache(
+  Eigen::Index rows, Eigen::Index columns) {
+  (void)rows;
+  (void)columns;
+  return false;
+}
+
+void Step1ComputeBackend::append_level1_design_cache(
+  Eigen::Index start_column,
+  const Eigen::Ref<const Eigen::MatrixXd>& columns,
+  Step1ComputeTimings* timings) {
+  (void)start_column;
+  (void)columns;
+  (void)timings;
+  throw std::runtime_error(
+    "Step 1 backend has no persistent Level 1 design cache");
+}
+
+bool Step1ComputeBackend::activate_level1_design_cache(
+  Eigen::Index rows, Eigen::Index columns) {
+  (void)rows;
+  (void)columns;
+  return false;
+}
+
+void Step1ComputeBackend::release_level1_design_cache() {
+}
+
+bool Step1ComputeBackend::cache_resident_design_fold_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_rows,
+  const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+  const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+  Step1ComputeTimings* timings) {
+  (void)start_rows;
+  (void)row_counts;
+  (void)outcomes;
   (void)timings;
   return false;
 }

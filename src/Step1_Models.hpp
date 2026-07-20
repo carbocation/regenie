@@ -27,6 +27,8 @@
 #ifndef MODELS_H
 #define MODELS_H
 
+#include <future>
+
 #define ETAMINTHR -30.0
 #define ETAMAXTHR 30.0
 
@@ -80,6 +82,7 @@ struct ridgel1 {
   Eigen::ArrayXd ridge_param_mult;
   Eigen::MatrixXd beta_snp_step1; // MxR
   std::vector<Eigen::MatrixXd> top_snp_pgs;
+  std::future<void> l0_write_future;
 };
 
 
@@ -95,9 +98,10 @@ void fit_null_cox(bool const&, const int&, struct param*, struct phenodt*, struc
 double getCoxLambdaMax(const Eigen::MatrixXd&, const Eigen::VectorXd&,
   Step1ComputeBackend* compute_backend = nullptr);
 
-void ridge_level_0(const int&,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,std::vector<MatrixXb>&,Step1ComputeBackend*,mstream&);
+void ridge_level_0(const int&,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,std::vector<MatrixXb>&,Step1ComputeBackend*,bool,mstream&);
 void ridge_level_0_loocv(const int,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,Step1ComputeBackend*,mstream&);
 void write_l0_file(std::ofstream*,Eigen::MatrixXd&,mstream&);
+void finish_l0_write(struct ridgel1*);
 
 void set_mem_l1(struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,struct ridgel1*,std::vector<MatrixXb>&,mstream&);
 void ridge_level_1(struct in_files*,struct param*,struct phenodt*,struct ridgel1*,Step1ComputeBackend*,mstream&);

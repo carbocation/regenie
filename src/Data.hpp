@@ -80,6 +80,8 @@ struct Step1Profile {
   uint64_t preprocess_pinned_staging_upload_bytes = 0;
   uint64_t preprocess_packed_hardcall_blocks = 0;
   uint64_t preprocess_packed_hardcall_upload_bytes = 0;
+  uint64_t preprocess_registered_packed_uploads = 0;
+  uint64_t preprocess_registered_packed_upload_bytes = 0;
   double preprocess_packed_hardcall_expand_ms = 0;
   double preprocess_packed_hardcall_validation_ms = 0;
   double preprocess_packed_hardcall_allocation_ms = 0;
@@ -164,6 +166,7 @@ class Data {
     Eigen::MatrixXd res, stats, W_hat;
     Eigen::RowVectorXd p_sd_yres;
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
+    Eigen::VectorXd step1_sample_weights;
     MultiPhen mphen;
     Step1Profile step1_profile;
     Step1PgenReadProfile step1_pgen_read_profile;

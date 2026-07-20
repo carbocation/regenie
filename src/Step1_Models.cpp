@@ -542,7 +542,7 @@ double getCoxLambdaMax(const Eigen::MatrixXd& Xmat,
 /////////////////////////////////////////////////
 /////////////////////////////////////////////////
 
-void ridge_level_0(const int& block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, Step1ComputeBackend* compute_backend, mstream& sout) {
+void ridge_level_0(const int& block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, Step1ComputeBackend* compute_backend, bool cache_level1_design, mstream& sout) {
 
   sout << "   -calc level 0 ridge..." << flush;
   auto t2 = std::chrono::high_resolution_clock::now();
@@ -566,10 +566,6 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   }
 
   const bool prepare_batched_systems = Gblock->step1_pgen_packed_block;
-  vector<MatrixXd> fold_grams(
-    prepare_batched_systems ? params->cv_folds : 0);
-  vector<MatrixXd> fold_right_hand_sides(
-    prepare_batched_systems ? params->cv_folds : 0);
   VectorXi fold_starts(params->cv_folds);
   VectorXi fold_counts(params->cv_folds);
   uint32_t cum_size_folds = 0;
@@ -577,10 +573,6 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     masked_in_folds[i] = pheno_data->masked_indivs.block(
       cum_size_folds, 0, params->cv_sizes(i),
       pheno_data->masked_indivs.cols());
-    if(prepare_batched_systems) {
-      fold_grams[i] = l0->GGt - l0->G_folds[i];
-      fold_right_hand_sides[i] = l0->GTY - l0->GtY[i];
-    }
     fold_starts(i) = cum_size_folds;
     fold_counts(i) = params->cv_sizes(i);
     cum_size_folds += params->cv_sizes(i);
@@ -589,12 +581,40 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   vector<MatrixXd> fold_predictions;
   vector<MatrixXd> fold_coefficients;
   Step1ComputeTimings batched_timings;
-  const bool used_batched_cholesky =
-    prepare_batched_systems &&
+  const bool normalize_cached_predictions = prepare_batched_systems &&
+    cache_level1_design && params->n_pheno == 1 &&
+    !params->print_block_betas && !params->debug &&
+    pheno_data->Neff(0) == params->n_samples &&
+    pheno_data->masked_indivs.col(0).all();
+  const bool used_normalized_cached_cholesky =
+    normalize_cached_predictions &&
+    compute_backend->ridge_predict_cached_preprocessed_systems_normalized(
+      fold_starts, fold_counts, ridge_parameters,
+      pheno_data->Neff(0),
+      static_cast<Eigen::Index>(block) * params->n_ridge_l0,
+      Xout, params->profile_step1 ? &batched_timings : nullptr);
+  const bool used_cached_cholesky = used_normalized_cached_cholesky ||
+    (prepare_batched_systems &&
+    compute_backend->ridge_predict_cached_preprocessed_systems(
+      fold_starts, fold_counts, ridge_parameters,
+      fold_predictions, fold_coefficients,
+      params->profile_step1 ? &batched_timings : nullptr));
+  vector<MatrixXd> fold_grams;
+  vector<MatrixXd> fold_right_hand_sides;
+  if(prepare_batched_systems && !used_cached_cholesky) {
+    fold_grams.resize(params->cv_folds);
+    fold_right_hand_sides.resize(params->cv_folds);
+    for(int i = 0; i < params->cv_folds; ++i) {
+      fold_grams[i] = l0->GGt - l0->G_folds[i];
+      fold_right_hand_sides[i] = l0->GTY - l0->GtY[i];
+    }
+  }
+  const bool used_batched_cholesky = used_cached_cholesky ||
+    (prepare_batched_systems &&
     compute_backend->ridge_predict_preprocessed_systems(
       fold_grams, fold_right_hand_sides, fold_starts, fold_counts,
       ridge_parameters, fold_predictions, fold_coefficients,
-      params->profile_step1 ? &batched_timings : nullptr);
+      params->profile_step1 ? &batched_timings : nullptr));
   if(params->profile_step1 && used_batched_cholesky) {
     l0->profile_eigensolve_ms +=
       batched_timings.eigensolve_ms + batched_timings.transform_ms;
@@ -603,6 +623,38 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     l0->profile_backend_ridge_compute_ms += batched_timings.ridge_ms;
     l0->profile_cholesky_ridge_folds += params->cv_folds;
     l0->profile_batched_cholesky_ridge_blocks++;
+  }
+
+  if(used_normalized_cached_cholesky) {
+    if(block == 0) {
+      cum_size_folds = 0;
+      for(int fold = 0; fold < params->cv_folds; ++fold) {
+        l1->test_pheno[0][fold].col(0) =
+          pheno_data->phenotypes.block(
+            cum_size_folds, 0, params->cv_sizes(fold), 1);
+        cum_size_folds += params->cv_sizes(fold);
+      }
+    }
+    finish_l0_write(l1);
+    std::ofstream* output_file = files->write_preds_files[0].get();
+    std::shared_ptr<Eigen::MatrixXd> predictions(
+      new Eigen::MatrixXd());
+    predictions->swap(Xout);
+    l1->l0_write_future = std::async(std::launch::async,
+      [output_file, predictions] () {
+        output_file->write(
+          reinterpret_cast<char*>(predictions->data()),
+          predictions->size() * sizeof(double));
+        if(output_file->fail())
+          throw std::runtime_error(
+            "cannot successfully write temporary level 0 predictions to disk");
+      });
+    sout << "done";
+    const auto t3 = std::chrono::high_resolution_clock::now();
+    const auto duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2);
+    sout << " (" << duration.count() << "ms) " << endl;
+    return;
   }
 
   cum_size_folds = 0;
@@ -737,6 +789,14 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
 
     // write predictions to file if specified
     if(params->write_l0_pred) {
+      if(cache_level1_design) {
+        Step1ComputeTimings cache_timings;
+        compute_backend->append_level1_design_cache(
+          static_cast<Eigen::Index>(block) * params->n_ridge_l0,
+          Xout, params->profile_step1 ? &cache_timings : nullptr);
+        if(params->profile_step1)
+          l0->profile_backend_upload_ms += cache_timings.upload_ms;
+      }
       write_l0_file(files->write_preds_files[ph].get(), Xout, sout);
       //if(block ==0 && ph == 0 ) sout << endl << "Out " << endl <<  Xout.block(0, 0, 3, 3) << endl;
     }
@@ -892,6 +952,10 @@ void write_l0_file(ofstream* ofs, MatrixXd& Xout, mstream& sout){
 
 }
 
+void finish_l0_write(struct ridgel1* l1) {
+  if(l1->l0_write_future.valid()) l1->l0_write_future.get();
+}
+
 
 /////////////////////////////////////////////////
 /////////////////////////////////////////////////
@@ -932,6 +996,13 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
 
   sout << endl << " Level 1 ridge..." << endl << flush;
 
+  const auto level1_wall_start = std::chrono::high_resolution_clock::now();
+  Step1ComputeTimings level1_timings;
+  Step1ComputeTimings* profile_timings =
+    params->profile_step1 ? &level1_timings : nullptr;
+  uint64_t resident_design_phenotypes = 0;
+  uint64_t resident_fold_system_phenotypes = 0;
+
   string in_pheno;
   ifstream infile;
   MatrixXd X1, X2, beta_l1, p1;
@@ -952,22 +1023,81 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
     int ph_eff = params->write_l0_pred ? 0 : ph;
     int bs_l1 = params->total_n_block * params->n_ridge_l0;
 
-    // read in level 0 predictions from file
-    if(params->write_l0_pred)
-      read_l0(ph, ph_eff, files, params, l1, sout);
-    check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    bs_l1 = kfold_level1_design_columns(
-      l1, ph_eff, params->cv_folds);
+    bool persistent_level1_design = false;
+    if(params->write_l0_pred && !params->select_l0) {
+      check_l0(ph, ph_eff, params, l1, pheno_data, sout);
+      persistent_level1_design =
+        compute_backend->activate_level1_design_cache(
+          params->n_samples, bs_l1);
+    }
+    if(!persistent_level1_design) {
+      if(params->write_l0_pred)
+        read_l0(ph, ph_eff, files, params, l1, sout);
+      check_l0(ph, ph_eff, params, l1, pheno_data, sout);
+      bs_l1 = kfold_level1_design_columns(
+        l1, ph_eff, params->cv_folds);
+    }
     bool use_simple_ridge = (l1->ridge_param_mult == 1).all();
 
+    bool resident_fold_systems = false;
+    std::vector<MatrixXd> resident_predictions;
+    std::vector<MatrixXd> resident_coefficients;
+    if(!params->within_sample_l0 && use_simple_ridge) {
+      VectorXi fold_starts(params->cv_folds);
+      VectorXi fold_sizes(params->cv_folds);
+      Eigen::Index total_rows = 0;
+      for(int fold = 0; fold < params->cv_folds; ++fold) {
+        fold_starts(fold) = static_cast<int>(total_rows);
+        fold_sizes(fold) = persistent_level1_design ?
+          params->cv_sizes(fold) : static_cast<int>(
+            l1->test_mat[ph_eff][fold].rows());
+        total_rows += fold_sizes(fold);
+      }
+      MatrixXd folded_outcomes(total_rows, 1);
+      for(int fold = 0; fold < params->cv_folds; ++fold)
+        folded_outcomes.middleRows(fold_starts(fold), fold_sizes(fold)) =
+          l1->test_pheno[ph][fold];
+
+      const bool resident_design = persistent_level1_design ||
+        compute_backend->cache_design_partitions(
+          l1->test_mat[ph_eff], profile_timings);
+      if(resident_design) {
+        resident_design_phenotypes++;
+        resident_fold_systems =
+          compute_backend->cache_resident_design_fold_systems(
+            fold_starts, fold_sizes, folded_outcomes, profile_timings);
+        if(resident_fold_systems) {
+          const VectorXd ridge_parameters = params->tau[ph].matrix();
+          resident_fold_systems =
+            compute_backend->ridge_predict_cached_preprocessed_systems(
+              fold_starts, fold_sizes, ridge_parameters,
+              resident_predictions, resident_coefficients,
+              profile_timings);
+          if(resident_fold_systems)
+            resident_fold_system_phenotypes++;
+        }
+        if(!resident_fold_systems)
+          compute_backend->release_cached_design();
+      }
+    }
+
+    if(persistent_level1_design && !resident_fold_systems) {
+      compute_backend->release_level1_design_cache();
+      read_l0(ph, ph_eff, files, params, l1, sout);
+      check_l0(ph, ph_eff, params, l1, pheno_data, sout);
+      bs_l1 = kfold_level1_design_columns(
+        l1, ph_eff, params->cv_folds);
+      persistent_level1_design = false;
+    }
+
     // compute XtX and Xty for each fold and cum. sum using test_mat's
-    if (!params->within_sample_l0){
+    if (!params->within_sample_l0 && !resident_fold_systems){
       XtX_sum.setZero(bs_l1, bs_l1);
       XtY_sum.setZero(bs_l1, 1);
       for( int i = 0; i < params->cv_folds; ++i ) {
         compute_backend->compute_design_products(
           l1->test_mat[ph_eff][i], l1->test_pheno[ph][i],
-          l1->X_folds[i], l1->XtY[i]);
+          l1->X_folds[i], l1->XtY[i], profile_timings);
         XtX_sum += l1->X_folds[i];
         XtY_sum += l1->XtY[i];
       }
@@ -977,25 +1107,30 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
     for(int i = 0; i < params->cv_folds; ++i ) {
 
       // use either in-sample or out-of-sample predictions
-      if (params->within_sample_l0) { // DEPRECATED
+      if(resident_fold_systems) {
+        p1 = resident_predictions[i];
+        beta_l1 = resident_coefficients[i];
+      } else if (params->within_sample_l0) { // DEPRECATED
         compute_backend->compute_design_products(
-          l1->pred_mat[ph][i], l1->pred_pheno[ph][i], X1, X2);
+          l1->pred_mat[ph][i], l1->pred_pheno[ph][i], X1, X2,
+          profile_timings);
       } else{
         X1 = XtX_sum - l1->X_folds[i];
         X2 = XtY_sum - l1->XtY[i];
       }
 
-      if(use_simple_ridge){
-        compute_backend->factorize_ridge_system(X1, X2);
+      if(!resident_fold_systems && use_simple_ridge){
+        compute_backend->factorize_ridge_system(X1, X2, profile_timings);
         const VectorXd ridge_parameters = params->tau[ph].matrix();
         compute_backend->ridge_predict_factorized(
           l1->test_mat[ph_eff][i], false,
-          ridge_parameters, no_outcomes, false, p1, beta_l1);
-      } else {
+          ridge_parameters, no_outcomes, false, p1, beta_l1,
+          profile_timings);
+      } else if(!resident_fold_systems) {
         compute_backend->diagonal_penalty_predict(
           X1, X2, l1->test_mat[ph_eff][i], false,
           params->tau[ph].matrix(), l1->ridge_param_mult.matrix(),
-          no_outcomes, false, p1, beta_l1);
+          no_outcomes, false, p1, beta_l1, profile_timings);
       }
       if(!params->within_sample_l0) l1->beta_hat_level_1[ph][i] = beta_l1;
       // p1 is Nfold x nridge_l1 matrix
@@ -1016,6 +1151,11 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
       cum_size_folds += params->cv_sizes(i);
     }
 
+    if(resident_fold_systems)
+      compute_backend->release_cached_design();
+    if(persistent_level1_design)
+      compute_backend->release_level1_design_cache();
+
     sout << "done";
     auto ts2 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(ts2 - ts1);
@@ -1023,6 +1163,36 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
   }
 
   sout << endl;
+
+  if(params->profile_step1) {
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() -
+        level1_wall_start).count();
+    const double backend_ms = level1_timings.upload_ms +
+      level1_timings.crossproduct_ms + level1_timings.gram_ms +
+      level1_timings.ridge_ms + level1_timings.download_ms;
+    std::ostringstream profile;
+    profile << std::fixed << std::setprecision(3)
+      << "STEP1_PROFILE scope=level1_quantitative"
+      << " wall_ms=" << wall_ms
+      << " resident_design_phenotypes=" << resident_design_phenotypes
+      << " resident_fold_system_phenotypes=" <<
+           resident_fold_system_phenotypes
+      << " resident_design_uploads=" <<
+           level1_timings.resident_design_upload_count
+      << " resident_design_upload_bytes=" <<
+           level1_timings.resident_design_upload_bytes
+      << " resident_design_reuses=" <<
+           level1_timings.resident_design_reuse_count
+      << " upload_ms=" << level1_timings.upload_ms
+      << " gram_ms=" << level1_timings.gram_ms
+      << " crossproduct_ms=" << level1_timings.crossproduct_ms
+      << " ridge_ms=" << level1_timings.ridge_ms
+      << " download_ms=" << level1_timings.download_ms
+      << " backend_ms=" << backend_ms
+      << " host_orchestration_ms=" << std::max(0.0, wall_ms - backend_ms);
+    sout << profile.str() << endl;
+  }
 }
 
 

@@ -53,6 +53,8 @@ struct Step1ComputeTimings {
   uint64_t pinned_staging_upload_bytes = 0;
   uint64_t packed_hardcall_upload_count = 0;
   uint64_t packed_hardcall_upload_bytes = 0;
+  uint64_t registered_packed_upload_count = 0;
+  uint64_t registered_packed_upload_bytes = 0;
   double packed_hardcall_expand_ms = 0;
   double packed_hardcall_validation_ms = 0;
   double packed_hardcall_allocation_ms = 0;
@@ -102,6 +104,11 @@ class Step1ComputeBackend {
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings = nullptr);
 
+    virtual bool register_packed_hardcall_buffer(
+      unsigned char* buffer, size_t bytes);
+
+    virtual void release_packed_hardcall_buffers();
+
     virtual void compute_preprocessed_products(
       Eigen::Index start_column,
       Eigen::Index column_count,
@@ -109,6 +116,12 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& gram,
       Eigen::MatrixXd& crossproduct,
       Step1GramMode mode,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool cache_preprocessed_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
       Step1ComputeTimings* timings = nullptr);
 
     virtual void ridge_predict_preprocessed(
@@ -137,6 +150,23 @@ class Step1ComputeBackend {
       const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
       std::vector<Eigen::MatrixXd>& predictions,
       std::vector<Eigen::MatrixXd>& coefficients,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool ridge_predict_cached_preprocessed_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      std::vector<Eigen::MatrixXd>& predictions,
+      std::vector<Eigen::MatrixXd>& coefficients,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool ridge_predict_cached_preprocessed_systems_normalized(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      double effective_sample_count,
+      Eigen::Index level1_start_column,
+      Eigen::MatrixXd& normalized_predictions,
       Step1ComputeTimings* timings = nullptr);
 
     virtual void release_preprocessed_genotypes();
@@ -184,6 +214,25 @@ class Step1ComputeBackend {
 
     virtual bool cache_design_matrix(
       const Eigen::Ref<const Eigen::MatrixXd>& design,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool initialize_level1_design_cache(
+      Eigen::Index rows, Eigen::Index columns);
+
+    virtual void append_level1_design_cache(
+      Eigen::Index start_column,
+      const Eigen::Ref<const Eigen::MatrixXd>& columns,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool activate_level1_design_cache(
+      Eigen::Index rows, Eigen::Index columns);
+
+    virtual void release_level1_design_cache();
+
+    virtual bool cache_resident_design_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_rows,
+      const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Step1ComputeTimings* timings = nullptr);
 
     virtual void predict_cached_design(

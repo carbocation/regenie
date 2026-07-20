@@ -2249,7 +2249,7 @@ void readChunkFromPGENFileToPackedHardcalls(const int& bs,
   vector<double> reader_call_thread_ms(profile ? worker_count : 0, 0);
 
 #if defined(_OPENMP)
-#pragma omp parallel for num_threads(worker_count) schedule(dynamic)
+#pragma omp parallel for num_threads(worker_count) schedule(static)
 #endif
   for(int variant = 0; variant < bs; ++variant) {
 #if defined(_OPENMP)

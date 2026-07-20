@@ -301,6 +301,10 @@ void accumulate_timings(Step1ComputeTimings& destination,
     source.packed_hardcall_upload_count;
   destination.packed_hardcall_upload_bytes +=
     source.packed_hardcall_upload_bytes;
+  destination.registered_packed_upload_count +=
+    source.registered_packed_upload_count;
+  destination.registered_packed_upload_bytes +=
+    source.registered_packed_upload_bytes;
   destination.packed_hardcall_expand_ms +=
     source.packed_hardcall_expand_ms;
   destination.packed_hardcall_validation_ms +=
@@ -474,6 +478,82 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
     throw std::runtime_error(
       "packed hardcall resident ridge conformance failed");
 
+  const int cached_fold_count = 3;
+  Eigen::VectorXi cached_fold_starts(cached_fold_count);
+  Eigen::VectorXi cached_fold_counts(cached_fold_count);
+  const int base_fold_size = samples / cached_fold_count;
+  int cached_fold_start = 0;
+  for(int fold = 0; fold < cached_fold_count; ++fold) {
+    cached_fold_starts(fold) = cached_fold_start;
+    cached_fold_counts(fold) = fold == cached_fold_count - 1 ?
+      samples - cached_fold_start : base_fold_size;
+    cached_fold_start += cached_fold_counts(fold);
+  }
+  Step1ComputeTimings cached_fold_product_timings;
+  const bool cached_fold_products_supported =
+    candidate.cache_preprocessed_fold_systems(
+      cached_fold_starts, cached_fold_counts, outcomes,
+      &cached_fold_product_timings);
+  std::vector<Eigen::MatrixXd> cached_fold_predictions;
+  std::vector<Eigen::MatrixXd> cached_fold_coefficients;
+  Step1ComputeTimings cached_fold_ridge_timings;
+  const bool cached_fold_ridge_supported =
+    candidate.ridge_predict_cached_preprocessed_systems(
+      cached_fold_starts, cached_fold_counts, ridge_parameters,
+      cached_fold_predictions, cached_fold_coefficients,
+      &cached_fold_ridge_timings);
+  double cached_fold_prediction_error = 0;
+  double cached_fold_coefficient_error = 0;
+  if(cached_fold_products_supported != cached_fold_ridge_supported)
+    throw std::runtime_error(
+      "packed hardcall cached fold support was inconsistent");
+  if(cached_fold_ridge_supported) {
+    if(cached_fold_predictions.size() != cached_fold_count ||
+       cached_fold_coefficients.size() != cached_fold_count ||
+       cached_fold_product_timings.resident_reuse_count !=
+         cached_fold_count ||
+       cached_fold_ridge_timings.resident_reuse_count !=
+         cached_fold_count)
+      throw std::runtime_error(
+        "packed hardcall cached fold ridge returned invalid metadata");
+    for(int fold = 0; fold < cached_fold_count; ++fold) {
+      const Eigen::MatrixXd held_out_genotypes = imputed.middleCols(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd held_out_outcomes = outcomes.middleRows(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd training_gram = expected_gram -
+        held_out_genotypes * held_out_genotypes.transpose();
+      const Eigen::MatrixXd training_crossproduct = expected_crossproduct -
+        held_out_genotypes * held_out_outcomes;
+      oracle->factorize_ridge_system(
+        training_gram, training_crossproduct);
+      oracle->ridge_predict_factorized(
+        held_out_genotypes, true, ridge_parameters, no_outcomes, false,
+        expected_predictions, expected_coefficients);
+      cached_fold_prediction_error = std::max(
+        cached_fold_prediction_error,
+        relative_error(cached_fold_predictions[fold],
+          expected_predictions));
+      cached_fold_coefficient_error = std::max(
+        cached_fold_coefficient_error,
+        relative_error(cached_fold_coefficients[fold],
+          expected_coefficients));
+    }
+    if(cached_fold_prediction_error > preprocessing_tolerance ||
+       cached_fold_coefficient_error > preprocessing_tolerance ||
+       !std::isfinite(cached_fold_product_timings.gram_ms) ||
+       cached_fold_product_timings.gram_ms <= 0 ||
+       !std::isfinite(cached_fold_ridge_timings.ridge_ms) ||
+       cached_fold_ridge_timings.ridge_ms <= 0)
+      throw std::runtime_error(
+        "packed hardcall cached fold ridge conformance failed");
+  }
+
+  oracle->factorize_ridge_system(expected_gram, expected_crossproduct);
+  oracle->ridge_predict_factorized(imputed, true,
+    ridge_parameters, no_outcomes, false,
+    expected_predictions, expected_coefficients);
+
   Eigen::MatrixXd cholesky_predictions, cholesky_coefficients;
   Step1ComputeTimings cholesky_timings;
   const bool cholesky_supported =
@@ -544,6 +624,72 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
       throw std::runtime_error(
         "packed hardcall resident batched Cholesky ridge conformance failed");
   }
+
+  double normalized_cached_prediction_error = 0;
+  const bool normalized_cache_initialized =
+    cached_fold_products_supported &&
+    candidate.initialize_level1_design_cache(
+      samples, ridge_parameters.size());
+  if(normalized_cache_initialized) {
+    const Eigen::MatrixXd normalized_outcomes = outcomes.leftCols(1);
+    if(!candidate.cache_preprocessed_fold_systems(
+         cached_fold_starts, cached_fold_counts,
+         normalized_outcomes))
+      throw std::runtime_error(
+        "normalized cached ridge fold systems were not supported");
+    Eigen::MatrixXd normalized_predictions;
+    Step1ComputeTimings normalized_timings;
+    if(!candidate.ridge_predict_cached_preprocessed_systems_normalized(
+         cached_fold_starts, cached_fold_counts, ridge_parameters,
+         samples, 0, normalized_predictions, &normalized_timings))
+      throw std::runtime_error(
+        "normalized cached ridge prediction was not supported");
+
+    Eigen::MatrixXd expected_normalized_predictions(
+      samples, ridge_parameters.size());
+    const Eigen::MatrixXd normalized_total_rhs =
+      imputed * normalized_outcomes;
+    for(int fold = 0; fold < cached_fold_count; ++fold) {
+      const Eigen::MatrixXd held_out_genotypes = imputed.middleCols(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd held_out_outcomes =
+        normalized_outcomes.middleRows(
+          cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd training_gram = expected_gram -
+        held_out_genotypes * held_out_genotypes.transpose();
+      const Eigen::MatrixXd training_rhs = normalized_total_rhs -
+        held_out_genotypes * held_out_outcomes;
+      for(Eigen::Index parameter = 0;
+          parameter < ridge_parameters.size(); ++parameter) {
+        Eigen::MatrixXd penalized_gram = training_gram;
+        penalized_gram.diagonal().array() +=
+          ridge_parameters(parameter);
+        expected_normalized_predictions.block(
+          cached_fold_starts(fold), parameter,
+          cached_fold_counts(fold), 1) =
+            held_out_genotypes.transpose() *
+              penalized_gram.llt().solve(training_rhs);
+      }
+    }
+    const Eigen::RowVectorXd normalized_means =
+      expected_normalized_predictions.colwise().mean();
+    const Eigen::RowVectorXd normalized_inverse_standard_deviations =
+      ((samples - 1.0) /
+       (expected_normalized_predictions.colwise().squaredNorm().array() -
+        samples * normalized_means.array().square())).sqrt();
+    expected_normalized_predictions.rowwise() -= normalized_means;
+    expected_normalized_predictions.array().rowwise() *=
+      normalized_inverse_standard_deviations.array();
+    normalized_cached_prediction_error = relative_error(
+      normalized_predictions, expected_normalized_predictions);
+    if(normalized_cached_prediction_error > 8e-11 ||
+       normalized_timings.resident_reuse_count != cached_fold_count ||
+       !candidate.activate_level1_design_cache(
+         samples, ridge_parameters.size()))
+      throw std::runtime_error(
+        "normalized cached ridge conformance tolerance exceeded");
+    candidate.release_level1_design_cache();
+  }
   candidate.release_preprocessed_genotypes();
 
   bool rejected_negative_weight = false;
@@ -578,6 +724,11 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
             << " crossproduct_relative_error=" << crossproduct_error
             << " prediction_relative_error=" << prediction_error
             << " coefficient_relative_error=" << coefficient_error
+            << " cached_fold_supported=" << cached_fold_ridge_supported
+            << " cached_fold_prediction_relative_error=" <<
+              cached_fold_prediction_error
+            << " cached_fold_coefficient_relative_error=" <<
+              cached_fold_coefficient_error
             << " cholesky_supported=" << cholesky_supported
             << " cholesky_prediction_relative_error=" <<
               cholesky_prediction_error
@@ -589,6 +740,119 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
               batched_cholesky_prediction_error
             << " batched_cholesky_coefficient_relative_error=" <<
               batched_cholesky_coefficient_error
+            << " normalized_cached_prediction_relative_error=" <<
+              normalized_cached_prediction_error
+            << " status=PASS\n";
+}
+
+void check_persistent_level1_design_cache(
+  Step1ComputeBackend& candidate) {
+
+  const int rows = 23;
+  const int features = 6;
+  const Eigen::MatrixXd design =
+    deterministic_matrix(rows, features, -0.13);
+  if(!candidate.initialize_level1_design_cache(rows, features)) {
+    std::cout << "STEP1_BACKEND_TEST case=persistent_level1_design_cache"
+              << " supported=0 status=PASS\n";
+    return;
+  }
+
+  Step1ComputeTimings timings;
+  candidate.append_level1_design_cache(
+    0, design.leftCols(2), &timings);
+  candidate.append_level1_design_cache(
+    2, design.rightCols(features - 2), &timings);
+  if(!candidate.activate_level1_design_cache(rows, features))
+    throw std::runtime_error(
+      "persistent Level 1 design cache did not activate after complete append");
+
+  const Eigen::VectorXd prediction_coefficients =
+    deterministic_matrix(features, 1, 0.29).col(0);
+  Eigen::VectorXd predictions;
+  candidate.predict_cached_design(
+    prediction_coefficients, predictions, &timings);
+  const double direct_prediction_error = relative_error(
+    predictions, design * prediction_coefficients);
+
+  Eigen::VectorXi fold_starts(3);
+  fold_starts << 0, 7, 18;
+  Eigen::VectorXi fold_sizes(3);
+  fold_sizes << 7, 11, 5;
+  const Eigen::MatrixXd outcomes =
+    deterministic_matrix(rows, 2, -0.71);
+  if(!candidate.cache_resident_design_fold_systems(
+       fold_starts, fold_sizes, outcomes, &timings))
+    throw std::runtime_error(
+      "persistent Level 1 design fold systems were not supported");
+
+  Eigen::VectorXd ridge_parameters(2);
+  ridge_parameters << 0.15, 0.9;
+  std::vector<Eigen::MatrixXd> fold_predictions;
+  std::vector<Eigen::MatrixXd> fold_coefficients;
+  if(!candidate.ridge_predict_cached_preprocessed_systems(
+       fold_starts, fold_sizes, ridge_parameters,
+       fold_predictions, fold_coefficients, &timings))
+    throw std::runtime_error(
+      "persistent Level 1 design ridge prediction was not supported");
+
+  const Eigen::MatrixXd total_gram = design.transpose() * design;
+  const Eigen::MatrixXd total_rhs = design.transpose() * outcomes;
+  double fold_prediction_error = 0;
+  double fold_coefficient_error = 0;
+  for(Eigen::Index fold = 0; fold < fold_starts.size(); ++fold) {
+    const Eigen::MatrixXd fold_design = design.middleRows(
+      fold_starts(fold), fold_sizes(fold));
+    const Eigen::MatrixXd fold_outcomes = outcomes.middleRows(
+      fold_starts(fold), fold_sizes(fold));
+    Eigen::MatrixXd training_gram = total_gram -
+      fold_design.transpose() * fold_design;
+    const Eigen::MatrixXd training_rhs = total_rhs -
+      fold_design.transpose() * fold_outcomes;
+    Eigen::MatrixXd expected_coefficients(
+      features, outcomes.cols() * ridge_parameters.size());
+    for(Eigen::Index parameter = 0;
+        parameter < ridge_parameters.size(); ++parameter) {
+      Eigen::MatrixXd penalized_gram = training_gram;
+      penalized_gram.diagonal().array() += ridge_parameters(parameter);
+      expected_coefficients.middleCols(
+        parameter * outcomes.cols(), outcomes.cols()) =
+          penalized_gram.llt().solve(training_rhs);
+    }
+    fold_prediction_error = std::max(fold_prediction_error,
+      relative_error(fold_predictions[fold],
+        fold_design * expected_coefficients));
+    fold_coefficient_error = std::max(fold_coefficient_error,
+      relative_error(fold_coefficients[fold], expected_coefficients));
+  }
+
+  if(direct_prediction_error > 5e-12 ||
+     fold_prediction_error > 5e-12 ||
+     fold_coefficient_error > 5e-12 ||
+     timings.resident_design_upload_count != 2 ||
+     timings.resident_design_upload_bytes !=
+       static_cast<uint64_t>(design.size()) * sizeof(double))
+    throw std::runtime_error(
+      "persistent Level 1 design cache conformance tolerance exceeded");
+
+  candidate.release_level1_design_cache();
+  bool rejected_released_design = false;
+  try {
+    candidate.predict_cached_design(prediction_coefficients, predictions);
+  } catch(const std::invalid_argument&) {
+    rejected_released_design = true;
+  }
+  if(!rejected_released_design ||
+     candidate.activate_level1_design_cache(rows, features))
+    throw std::runtime_error(
+      "persistent Level 1 design cache remained active after release");
+
+  std::cout << "STEP1_BACKEND_TEST case=persistent_level1_design_cache"
+            << " supported=1"
+            << " prediction_relative_error=" << direct_prediction_error
+            << " fold_prediction_relative_error=" << fold_prediction_error
+            << " fold_coefficient_relative_error=" << fold_coefficient_error
+            << " upload_bytes=" << timings.resident_design_upload_bytes
             << " status=PASS\n";
 }
 
@@ -1471,6 +1735,7 @@ void run_conformance(Step1ComputeBackend& candidate) {
 
   check_genotype_preprocessing(candidate);
   check_packed_hardcall_preprocessing(candidate);
+  check_persistent_level1_design_cache(candidate);
 
   check_case(candidate, *oracle, genotypes, phenotypes,
     Step1GramMode::full_product, "contiguous_full_product");
@@ -1575,6 +1840,75 @@ void run_conformance(Step1ComputeBackend& candidate) {
         0.1 + std::fmod(0.19 * static_cast<double>(row + 1), 1.3);
     const Eigen::MatrixXd resident_outcomes =
       deterministic_matrix(23, 2, -0.8);
+
+    Eigen::VectorXi resident_fold_starts(3);
+    resident_fold_starts << 0, 7, 18;
+    Eigen::VectorXi resident_fold_sizes(3);
+    resident_fold_sizes << 7, 11, 5;
+    Step1ComputeTimings resident_fold_timings;
+    const bool resident_fold_supported =
+      candidate.cache_resident_design_fold_systems(
+        resident_fold_starts, resident_fold_sizes, resident_outcomes,
+        &resident_fold_timings);
+    if(std::string(candidate.name()) == "cuda" &&
+       !resident_fold_supported)
+      throw std::runtime_error(
+        "CUDA backend did not support resident design fold systems");
+    double resident_fold_prediction_error = 0.0;
+    double resident_fold_coefficient_error = 0.0;
+    if(resident_fold_supported) {
+      Eigen::VectorXd fold_ridge_parameters(2);
+      fold_ridge_parameters << 0.15, 0.9;
+      std::vector<Eigen::MatrixXd> fold_predictions;
+      std::vector<Eigen::MatrixXd> fold_coefficients;
+      if(!candidate.ridge_predict_cached_preprocessed_systems(
+           resident_fold_starts, resident_fold_sizes,
+           fold_ridge_parameters, fold_predictions, fold_coefficients,
+           &resident_fold_timings))
+        throw std::runtime_error(
+          "resident design fold ridge prediction was not supported");
+
+      const Eigen::MatrixXd total_design_gram =
+        resident_design.transpose() * resident_design;
+      const Eigen::MatrixXd total_design_rhs =
+        resident_design.transpose() * resident_outcomes;
+      for(Eigen::Index fold = 0; fold < resident_fold_starts.size(); ++fold) {
+        const Eigen::MatrixXd fold_design = resident_design.middleRows(
+          resident_fold_starts(fold), resident_fold_sizes(fold));
+        const Eigen::MatrixXd fold_outcomes = resident_outcomes.middleRows(
+          resident_fold_starts(fold), resident_fold_sizes(fold));
+        const Eigen::MatrixXd training_gram =
+          total_design_gram - fold_design.transpose() * fold_design;
+        const Eigen::MatrixXd training_rhs =
+          total_design_rhs - fold_design.transpose() * fold_outcomes;
+        Eigen::MatrixXd expected_coefficients(
+          resident_design.cols(),
+          resident_outcomes.cols() * fold_ridge_parameters.size());
+        for(Eigen::Index parameter = 0;
+            parameter < fold_ridge_parameters.size(); ++parameter) {
+          Eigen::MatrixXd penalized_gram = training_gram;
+          penalized_gram.diagonal().array() +=
+            fold_ridge_parameters(parameter);
+          expected_coefficients.middleCols(
+            parameter * resident_outcomes.cols(),
+            resident_outcomes.cols()) =
+              penalized_gram.llt().solve(training_rhs);
+        }
+        const Eigen::MatrixXd expected_predictions =
+          fold_design * expected_coefficients;
+        resident_fold_prediction_error = std::max(
+          resident_fold_prediction_error,
+          relative_error(fold_predictions[fold], expected_predictions));
+        resident_fold_coefficient_error = std::max(
+          resident_fold_coefficient_error,
+          relative_error(fold_coefficients[fold], expected_coefficients));
+      }
+      if(resident_fold_prediction_error > 5e-12 ||
+         resident_fold_coefficient_error > 5e-12)
+        throw std::runtime_error(
+          "resident design fold ridge conformance tolerance exceeded");
+    }
+
     Eigen::MatrixXd resident_gram, resident_crossproduct;
     candidate.compute_cached_weighted_design_products(
       resident_weights, resident_outcomes, resident_gram,
@@ -1631,7 +1965,9 @@ void run_conformance(Step1ComputeBackend& candidate) {
        resident_design_timings.resident_design_upload_bytes !=
          static_cast<uint64_t>(resident_design.size()) * sizeof(double) ||
        resident_design_timings.resident_design_reuse_count !=
-         static_cast<uint64_t>(3 + resident_solve_supported))
+         static_cast<uint64_t>(3 + resident_solve_supported) ||
+       (resident_fold_supported &&
+         resident_fold_timings.resident_design_reuse_count != 3))
       throw std::runtime_error(
         "resident design operation conformance tolerance exceeded");
 
@@ -1673,6 +2009,10 @@ void run_conformance(Step1ComputeBackend& candidate) {
               << " fused_solve_supported=" << resident_solve_supported
               << " fused_solve_relative_error=" << resident_solve_error
               << " crossproduct_relative_error=" << resident_score_error
+              << " fold_prediction_relative_error=" <<
+                   resident_fold_prediction_error
+              << " fold_coefficient_relative_error=" <<
+                   resident_fold_coefficient_error
               << " upload_bytes=" <<
                    resident_design_timings.resident_design_upload_bytes
               << " reuses=" <<

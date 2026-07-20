@@ -651,8 +651,7 @@ void Data::residualize_genotypes() {
   sout << "   -residualizing and scaling genotypes..." << flush;
   const ProfileClock::time_point t1 = ProfileClock::now();
 
-  const VectorXd sample_weights =
-    in_filters.ind_in_analysis.matrix().cast<double>();
+  const VectorXd& sample_weights = step1_sample_weights;
   VectorXd row_multipliers;
   if(params.alpha_prior != -1)
     row_multipliers = pow(
@@ -741,6 +740,10 @@ void Data::residualize_genotypes() {
       timings.packed_hardcall_upload_count;
     step1_profile.preprocess_packed_hardcall_upload_bytes +=
       timings.packed_hardcall_upload_bytes;
+    step1_profile.preprocess_registered_packed_uploads +=
+      timings.registered_packed_upload_count;
+    step1_profile.preprocess_registered_packed_upload_bytes +=
+      timings.registered_packed_upload_bytes;
     step1_profile.preprocess_packed_hardcall_expand_ms +=
       timings.packed_hardcall_expand_ms;
     step1_profile.preprocess_packed_hardcall_validation_ms +=
@@ -1220,12 +1223,32 @@ void Data::level_0_calculations() {
       level0_pipeline_auto_limit_bytes);
   const bool level0_pipeline_enabled = level0_pipeline_selected &&
     pgen_packed_hardcalls && pgen_prefetch_enabled;
+  step1_sample_weights =
+    in_filters.ind_in_analysis.matrix().cast<double>();
   Step1PgenPrefetchBuffer pgen_prefetch_buffer;
   std::future<Step1PgenPrefetchResult> pgen_prefetch_future;
   bool pgen_prefetch_pending = false;
   std::unique_ptr<Step1ComputeBackend> level0_pipeline_backend;
   std::future<Step1Level0PipelineResult> level0_pipeline_future;
   bool level0_pipeline_pending = false;
+  if(pgen_packed_hardcalls && pgen_block_bytes > 0 &&
+     pgen_block_bytes <= std::numeric_limits<size_t>::max()) {
+    const size_t packed_capacity = static_cast<size_t>(pgen_block_bytes);
+    Gblock.step1_pgen_packed_hardcalls.reserve(packed_capacity);
+    pgen_prefetch_buffer.packed_hardcalls.reserve(packed_capacity);
+    step1_compute_backend->register_packed_hardcall_buffer(
+      Gblock.step1_pgen_packed_hardcalls.data(), packed_capacity);
+    step1_compute_backend->register_packed_hardcall_buffer(
+      pgen_prefetch_buffer.packed_hardcalls.data(), packed_capacity);
+  }
+  const Eigen::Index level1_design_columns =
+    static_cast<Eigen::Index>(params.total_n_block) * params.n_ridge_l0;
+  const bool cache_level1_design = params.write_l0_pred &&
+    params.n_pheno == 1 && params.trait_mode == 0 &&
+    !params.use_loocv && !params.test_l0 && !params.select_l0 &&
+    !level0_pipeline_enabled &&
+    step1_compute_backend->initialize_level1_design_cache(
+      params.n_samples, level1_design_columns);
   if(level0_pipeline_enabled)
     level0_pipeline_backend = make_step1_compute_backend(
       "cuda", params.gpu_device);
@@ -1249,6 +1272,9 @@ void Data::level_0_calculations() {
         << " automatic_limit_mb=" <<
           (level0_pipeline_auto_limit_bytes / 1000000.0);
     sout << "\n";
+    if(params.write_l0_pred)
+      sout << " - Step 1 persistent Level 1 design : [" <<
+        (cache_level1_design ? "enabled" : "disabled") << "]\n";
   }
 
   // start level 0
@@ -1334,6 +1360,10 @@ void Data::level_0_calculations() {
             timings.packed_hardcall_upload_count;
           step1_profile.preprocess_packed_hardcall_upload_bytes +=
             timings.packed_hardcall_upload_bytes;
+          step1_profile.preprocess_registered_packed_uploads +=
+            timings.registered_packed_upload_count;
+          step1_profile.preprocess_registered_packed_upload_bytes +=
+            timings.registered_packed_upload_bytes;
           step1_profile.preprocess_packed_hardcall_expand_ms +=
             timings.packed_hardcall_expand_ms;
           step1_profile.preprocess_packed_hardcall_validation_ms +=
@@ -1540,8 +1570,6 @@ void Data::level_0_calculations() {
               ProfileClock::now();
             const ProfileClock::time_point data_setup_start =
               ProfileClock::now();
-            const VectorXd sample_weights =
-              in_filters.ind_in_analysis.matrix().cast<double>();
             result.data_setup_ms = elapsed_ms(data_setup_start);
             result.processed =
               level0_pipeline_backend->preprocess_packed_hardcalls(
@@ -1549,7 +1577,7 @@ void Data::level_0_calculations() {
                 pgen_prefetch_buffer.packed_hardcalls.size(),
                 pgen_prefetch_buffer.packed_stride_bytes,
                 next_bs, params.n_samples, pheno_data.new_cov,
-                sample_weights, params.n_analyzed - params.ncov,
+                step1_sample_weights, params.n_analyzed - params.ncov,
                 params.numtol, result.row_scales,
                 params.profile_step1 ? &result.preprocess : nullptr);
             result.preprocess_wall_ms = elapsed_ms(preprocess_start);
@@ -1581,7 +1609,7 @@ void Data::level_0_calculations() {
       if(params.use_loocv)
         ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, step1_compute_backend.get(), sout);
       else
-        ridge_level_0(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, masked_in_folds, step1_compute_backend.get(), sout);
+        ridge_level_0(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, masked_in_folds, step1_compute_backend.get(), cache_level1_design, sout);
       if(params.profile_step1) {
         const double ridge_total_ms = elapsed_ms(stage_start);
         const double eigensolve_ms = l0.profile_eigensolve_ms - eigensolve_before_ms;
@@ -1622,6 +1650,11 @@ void Data::level_0_calculations() {
       block++; in_filters.step1_snp_count += bs;
     }
   }
+
+  step1_compute_backend->release_packed_hardcall_buffers();
+  if(level0_pipeline_backend)
+    level0_pipeline_backend->release_packed_hardcall_buffers();
+  finish_l0_write(&l1_ests);
 
   // close streams
   if(params.write_l0_pred) {
@@ -1687,6 +1720,34 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
 
     l0->GGt.setZero(bs,bs);
     l0->GTY.setZero(bs,params.n_pheno);
+    if(Gblock.step1_pgen_packed_block && !params.test_l0) {
+      VectorXi fold_starts(params.cv_folds);
+      VectorXi fold_counts(params.cv_folds);
+      uint32_t fold_start = 0;
+      for(int fold = 0; fold < params.cv_folds; ++fold) {
+        fold_starts(fold) = fold_start;
+        fold_counts(fold) = params.cv_sizes(fold);
+        fold_start += params.cv_sizes(fold);
+      }
+      Step1ComputeTimings timings;
+      if(step1_compute_backend->cache_preprocessed_fold_systems(
+           fold_starts, fold_counts, pheno_data.phenotypes,
+           params.profile_step1 ? &timings : nullptr)) {
+        if(params.profile_step1) {
+          step1_profile.gty_ms += timings.crossproduct_ms;
+          step1_profile.gram_ms += timings.gram_ms;
+          step1_profile.backend_upload_ms += timings.upload_ms;
+          step1_profile.backend_download_ms += timings.download_ms;
+          step1_profile.backend_ridge_compute_ms += timings.ridge_ms;
+        }
+        sout << "done";
+        auto t3 = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+          t3 - t2);
+        sout << " (" << duration.count() << "ms) " << endl;
+        return;
+      }
+    }
     uint32_t cum_size_folds = 0;
 
     for( int i = 0; i < params.cv_folds; ++i ) {
@@ -1875,6 +1936,10 @@ void Data::print_step1_profile() {
         step1_profile.preprocess_packed_hardcall_blocks
       << " packed_hardcall_upload_bytes=" <<
         step1_profile.preprocess_packed_hardcall_upload_bytes
+      << " registered_packed_uploads=" <<
+        step1_profile.preprocess_registered_packed_uploads
+      << " registered_packed_upload_bytes=" <<
+        step1_profile.preprocess_registered_packed_upload_bytes
       << " packed_hardcall_expand_ms=" <<
         step1_profile.preprocess_packed_hardcall_expand_ms
       << " packed_hardcall_validation_ms=" <<
