@@ -53,6 +53,7 @@
 #include "cox_score.hpp"
 #include "Step1_Models.hpp"
 #include "Step1_Compute.hpp"
+#include "Step2_Compute.hpp"
 #include "Step2_Models.hpp"
 #include "Pheno.hpp"
 #include "MultiTrait_Tests.hpp"
@@ -272,7 +273,9 @@ void build_step1_prediction_groups(
 
 }
 
-Data::Data() : step1_compute_backend(make_cpu_step1_compute_backend()) { // @suppress("Class members should be properly initialized")
+Data::Data() :
+    step1_compute_backend(make_cpu_step1_compute_backend()),
+    step2_compute_backend(make_step2_compute_backend("cpu", 0)) { // @suppress("Class members should be properly initialized")
 }
 
 Data::~Data() {
@@ -289,6 +292,12 @@ void Data::run() {
     step1_compute_backend = make_step1_compute_backend(params.compute_backend, params.gpu_device);
     sout << " * Step 1 compute backend : [" << step1_compute_backend->name() << "] "
          << step1_compute_backend->description() << "\n";
+  } else {
+    step2_compute_backend = make_step2_compute_backend(
+      params.compute_backend, params.gpu_device);
+    sout << " * Step 2 compute backend : [" <<
+      step2_compute_backend->name() << "] " <<
+      step2_compute_backend->description() << "\n";
   }
 
   if(params.streamBGEN) check_bgen(files.bgen_file, params.file_type, params.zlib_compress, params.streamBGEN, params.BGENbits, params.nChrom);
@@ -404,19 +413,25 @@ void Data::print_step2_profile() {
   const char* trait = params.trait_mode == 0 ? "qt" :
     (params.trait_mode == 1 ? "bt" :
       (params.trait_mode == 2 ? "ct" : "t2e"));
+  const Eigen::Index phenotype_count = params.pheno_pass.count();
+  const uint64_t corrected_test_count = params.trait_mode == 3 ?
+    step2_profile.corrected_tests / 2 : step2_profile.corrected_tests;
+  const char* active_backend = step2_compute_backend->ready() ?
+    step2_compute_backend->name() : "cpu";
 
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
-  out << "\nSTEP2_PROFILE version=1 mode=" << mode
+  out << "\nSTEP2_PROFILE version=2 mode=" << mode
+      << " backend=" << active_backend
       << " file_type=" << params.file_type
       << " trait=" << trait
       << " chromosomes=" << step2_profile.chromosomes
       << " blocks=" << step2_profile.blocks
       << " variants=" << step2_profile.variants
       << " samples=" << params.n_samples
-      << " phenotypes=" << params.n_pheno
+      << " phenotypes=" << phenotype_count
       << " threads=" << params.threads
-      << " corrected_tests=" << step2_profile.corrected_tests
+      << " corrected_tests=" << corrected_test_count
       << " failed_tests=" << step2_profile.failed_tests << "\n";
 
   const auto print_stage = [&](const char* name, const double value) {
@@ -490,6 +505,25 @@ void Data::print_step2_profile() {
             thread_denominator)
         << " postdecode_percent=" <<
           (100 * postdecode_ms / thread_denominator) << "\n";
+  }
+
+  if(step2_compute_timings.scored_blocks > 0 ||
+     step2_compute_timings.prepared_chromosomes > 0) {
+    out << "STEP2_PROFILE scope=compute_backend"
+        << " name=" << active_backend
+        << " prepared_chromosomes="
+        << step2_compute_timings.prepared_chromosomes
+        << " scored_blocks=" << step2_compute_timings.scored_blocks
+        << " scored_variants=" << step2_compute_timings.scored_variants
+        << " packed_upload_bytes="
+        << step2_compute_timings.packed_upload_bytes
+        << " prepare_upload_ms="
+        << step2_compute_timings.prepare_upload_ms
+        << " host_pack_ms=" << step2_compute_timings.host_pack_ms
+        << " upload_ms=" << step2_compute_timings.upload_ms
+        << " kernel_ms=" << step2_compute_timings.kernel_ms
+        << " download_ms=" << step2_compute_timings.download_ms
+        << " wall_ms=" << step2_compute_timings.wall_ms << "\n";
   }
 
   if(step2_bgen_parse_profile.variants > 0) {
@@ -593,7 +627,8 @@ void Data::print_step2_profile() {
             thread_denominator) << "\n";
   }
 
-  out << "STEP2_PROFILE_FINAL version=1 mode=" << mode
+  out << "STEP2_PROFILE_FINAL version=2 mode=" << mode
+      << " backend=" << active_backend
       << " setup_ms=" << step2_profile.setup_ms
       << " prediction_read_ms=" << step2_profile.prediction_read_ms
       << " null_model_ms=" << step2_profile.null_model_ms
@@ -3678,6 +3713,7 @@ void Data::test_snps_fast() {
       else if(params.trait_mode == 2) compute_res_count(chrom);
       else if(params.trait_mode == 3) compute_res_cox(chrom);
       else compute_res();
+      prepare_step2_compute_backend();
       if(params.profile_step2)
         step2_profile.null_model_ms += elapsed_ms(profile_stage_start);
 
@@ -3775,11 +3811,39 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
   vector<uint64> indices(n_snps);
   std::iota(indices.begin(), indices.end(), start);
 
+  Gblock.step2_backend_scores_valid = false;
   if(params.profile_step2) profile_stage_start = ProfileClock::now();
   readChunk(indices, chrom, snp_data_blocks, insize, outsize, all_snps_info);
   if(params.profile_step2) {
     step2_profile.genotype_io_ms += elapsed_ms(profile_stage_start);
     profile_stage_start = ProfileClock::now();
+  }
+
+  bool packed_backend_block_eligible = step2_compute_backend->ready();
+  if(packed_backend_block_eligible && params.skip_dosage_comp) {
+    for(int variant = 0; variant < n_snps; ++variant) {
+      if(in_non_par(chrom, snpinfo[indices[variant]].physpos, &params)) {
+        packed_backend_block_eligible = false;
+        break;
+      }
+    }
+  }
+  if(packed_backend_block_eligible) {
+    vector<unsigned char> flipped(n_snps, 0);
+    vector<unsigned char> sparse(n_snps, 0);
+    for(int variant = 0; variant < n_snps; ++variant) {
+      flipped[variant] = all_snps_info[variant].flipped ? 1 : 0;
+      sparse[variant] =
+        all_snps_info[variant].n_zero >=
+          params.n_samples * params.prop_zero_thr ? 1 : 0;
+    }
+    Gblock.step2_backend_scores_valid =
+      step2_compute_backend->score_packed_block(
+        Gblock.step2_pgen_packed_hardcalls,
+        Gblock.step2_pgen_packed_means, flipped, sparse,
+        params.n_samples, Gblock.step2_backend_score_numerators,
+        Gblock.step2_backend_score_denominators,
+        params.profile_step2 ? &step2_compute_timings : nullptr);
   }
 
   // analyze using openmp
@@ -3792,6 +3856,62 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
   auto t2 = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
   sout << "done (" << duration.count() << "ms) "<< endl;
+}
+
+void Data::prepare_step2_compute_backend() {
+  step2_compute_backend->clear();
+  Gblock.step2_backend_scores_valid = false;
+
+  const bool packed_score_eligible =
+    (params.file_type == "pgen") &&
+    !params.dosage_mode &&
+    (params.test_type == 0) &&
+    !params.build_mask &&
+    !params.af_cc &&
+    params.split_by_pheno &&
+    !params.htp_out &&
+    !params.w_interaction &&
+    !params.snp_set &&
+    !params.trait_set &&
+    !params.multiphen &&
+    in_filters.ind_in_analysis.all();
+  if(!packed_score_eligible) return;
+
+  if(params.trait_mode == 0) {
+    const bool complete_masks =
+      (pheno_data.Neff == static_cast<double>(params.n_analyzed)).all();
+    step2_compute_backend->prepare_quantitative(res,
+      pheno_data.new_cov, pheno_data.YtX, pheno_data.masked_indivs,
+      complete_masks,
+      params.profile_step2 ? &step2_compute_timings : nullptr);
+    return;
+  }
+
+  if(params.trait_mode == 1) {
+    step2_compute_backend->prepare_binary(res,
+      m_ests.Gamma_sqrt_mask, m_ests.X_Gamma,
+      Gblock.step2_binary_XtY, params.pheno_pass,
+      params.profile_step2 ? &step2_compute_timings : nullptr);
+    return;
+  }
+
+  if(params.trait_mode != 3 || params.coxscore_exact) return;
+
+  vector<MatrixXd> weighted_designs(params.n_pheno);
+  vector<MatrixXd> projections(params.n_pheno);
+  VectorXd residual_variances = VectorXd::Ones(params.n_pheno);
+  for(int ph = 0; ph < params.n_pheno; ++ph) {
+    if(!params.pheno_pass(ph)) continue;
+    weighted_designs[ph] = m_ests.cox_MLE_NULL[ph].WX1;
+    projections[ph] = m_ests.cox_MLE_NULL[ph].X1_X1WX1inv;
+    residual_variances(ph) = m_ests.cox_MLE_NULL[ph].res_var;
+  }
+  step2_compute_backend->prepare_cox(
+    Gblock.step2_cox_score_residual, weighted_designs, projections,
+    Gblock.step2_cox_projection_score,
+    Gblock.step2_cox_projection_gram, residual_variances,
+    params.pheno_pass,
+    params.profile_step2 ? &step2_compute_timings : nullptr);
 }
 
 
@@ -4076,6 +4196,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   // sparse/dense per-variant implementation.
   const bool use_batched_dense_qt_score =
     batched_dense_qt_base_eligible &&
+    !Gblock.step2_backend_scores_valid &&
     (dense_qt_score_candidates * 2 >= bs);
   if(use_batched_dense_qt_score) {
     const ProfileClock::time_point batch_start = ProfileClock::now();
@@ -4121,9 +4242,25 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
           &preprocess_thread_ms[thread_num] : nullptr);
         reset_thread(&(Gblock.thread_data[thread_num]), params);
 
-        // check if g is sparse
-        if (!params.w_interaction)
-          check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
+        // The backend already has the complete score-test inputs.  In
+        // score-only workflows the host only needs the sparse classification
+        // for bookkeeping; constructing thousands of Eigen sparse vectors is
+        // otherwise dead work.  Correction tests still use the existing path
+        // because SPA/Firth may need the materialized genotype.
+        const bool backend_score_only =
+          Gblock.step2_backend_scores_valid &&
+          !params.firth && !params.use_SPA;
+        if (!params.w_interaction) {
+          if(backend_score_only) {
+            Gblock.thread_data[thread_num].is_sparse =
+              block_info->n_zero >=
+                params.n_samples * params.prop_zero_thr;
+          } else {
+            check_sparse_G(isnp, thread_num, &Gblock, params.n_samples,
+              in_filters.ind_in_analysis, block_info->n_zero,
+              params.prop_zero_thr);
+          }
+        }
         if(Gblock.thread_data[thread_num].is_sparse) {
           Gblock.thread_data[thread_num].qt_complete_masks =
             (params.trait_mode == 0) && qt_phenotypes_have_complete_masks;
@@ -4158,7 +4295,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         ScopedProfileTimer preprocess_timer(params.profile_step2 ?
           &preprocess_thread_ms[thread_num] : nullptr);
         // for QTs with non-sparse G: residualize and re-scale
-        if (!params.skip_cov_res && (params.trait_mode == 0) &&
+        if (!Gblock.step2_backend_scores_valid &&
+            !params.skip_cov_res && (params.trait_mode == 0) &&
             !Gblock.thread_data[thread_num].is_sparse &&
             !Gblock.thread_data[thread_num].qt_packed_direct) {
           if(use_unscaled_dense_qt) {
@@ -4719,7 +4857,8 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
       &Gblock.step2_pgen_packed_hardcalls,
       Gblock.step2_pgen_direct_qt_enabled,
       &Gblock.step2_pgen_packed_means,
-      &Gblock.step2_pgen_packed_unexpanded);
+      &Gblock.step2_pgen_packed_unexpanded,
+      step2_compute_backend && step2_compute_backend->ready());
   } else {
 
     snp_data_blocks.resize( n_snps );

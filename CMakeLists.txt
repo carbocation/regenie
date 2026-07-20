@@ -26,7 +26,7 @@ include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 include(CTest)
 
-option(REGENIE_WITH_CUDA "Build the experimental CUDA Step 1 compute backend" OFF)
+option(REGENIE_WITH_CUDA "Build the experimental CUDA compute backends" OFF)
 set(REGENIE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
   "CUDA architectures to compile for when REGENIE_WITH_CUDA=ON")
 set(REGENIE_LIBDEFLATE "AUTO" CACHE STRING
@@ -70,7 +70,7 @@ if(REGENIE_WITH_CUDA)
   endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
-  message(STATUS "Building experimental CUDA Step 1 backend for architectures: ${REGENIE_CUDA_ARCHITECTURES}")
+  message(STATUS "Building experimental CUDA compute backends for architectures: ${REGENIE_CUDA_ARCHITECTURES}")
 endif()
 
 # check Boost IOStreams
@@ -132,6 +132,7 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/SKAT.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/MultiTrait_Tests.cpp
   ${CMAKE_SOURCE_DIR}/src/MCC.cpp
@@ -143,9 +144,9 @@ add_executable(regenie
   )
 target_include_directories(regenie PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
-function(configure_step1_cuda target_name)
+function(configure_cuda_target target_name)
   if(REGENIE_WITH_CUDA)
-    target_sources(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
+    target_sources(${target_name} PRIVATE ${ARGN})
     target_compile_definitions(${target_name} PRIVATE WITH_CUDA)
     target_link_libraries(${target_name} PRIVATE CUDA::cublas CUDA::cusolver CUDA::cudart)
     set_target_properties(${target_name} PROPERTIES
@@ -155,7 +156,9 @@ function(configure_step1_cuda target_name)
   endif()
 endfunction()
 
-configure_step1_cuda(regenie)
+configure_cuda_target(regenie
+  ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu
+  ${CMAKE_SOURCE_DIR}/src/Step2_Compute_CUDA.cu)
 
 set(CMAKE_CXX_FLAGS "-O3 -Wall -pedantic -ffast-math -Wno-unused-local-typedefs -Wno-deprecated-declarations -Wno-long-long -Wno-c11-extensions -fPIC")
 add_definitions(-DVERSION_NUMBER="${RG_VERSION}")
@@ -354,7 +357,8 @@ if(BUILD_TESTING)
     target_link_libraries(step1_compute_test PRIVATE
       ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
   endif()
-  configure_step1_cuda(step1_compute_test)
+  configure_cuda_target(step1_compute_test
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
   add_test(NAME step1_compute_cpu
     COMMAND step1_compute_test --backend cpu)
   add_test(NAME step1_compute_auto

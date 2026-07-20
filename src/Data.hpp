@@ -27,6 +27,8 @@
 #ifndef DATA_H
 #define DATA_H
 
+#include "Step2_Compute.hpp"
+
 class Step1ComputeBackend;
 
 struct Step1GroupedPredictionProfile {
@@ -175,12 +177,15 @@ class Data {
     Step2BgenParseProfile step2_bgen_parse_profile;
     Step2VariantComputeProfile step2_variant_compute_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
+    std::unique_ptr<Step2ComputeBackend> step2_compute_backend;
+    Step2ComputeTimings step2_compute_timings;
 
     // function definitions
     void run();
     void run_step1();
     void run_step2();
     void print_step2_profile();
+    void prepare_step2_compute_backend();
 
     void file_read_initialization();
     void residualize_genotypes();

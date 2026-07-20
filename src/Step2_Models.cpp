@@ -643,7 +643,21 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
   }
 
   if( run_full_test ){
-    if(dt_thr->qt_packed_direct) {
+    if(gblock.step2_backend_scores_valid &&
+       isnp < gblock.step2_backend_score_numerators.cols() &&
+       gblock.step2_backend_score_numerators.rows() == params.n_pheno) {
+      num = gblock.step2_backend_score_numerators.col(isnp).array();
+      denum_arr =
+        gblock.step2_backend_score_denominators.col(isnp).array();
+      dt_thr->stats = num / denum_arr.sqrt();
+      if(params.htp_out) {
+        dt_thr->scores = num;
+        dt_thr->skat_var = denum_arr;
+      }
+      dt_thr->bhat = dt_thr->stats * pheno_data.scf_sv /
+        denum_arr.sqrt();
+
+    } else if(dt_thr->qt_packed_direct) {
       VectorXd XtG;
       double raw_squared_norm;
       accumulate_packed_qt(isnp, dt_thr->is_sparse, yres, pheno_data, gblock,
@@ -864,21 +878,30 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
 
     MapArXb mask (pheno_data.masked_indivs.col(i).data(), params.n_samples, 1);
     MapcMatXd XWsqrt (m_ests.X_Gamma[i].data(), params.n_samples, m_ests.X_Gamma[i].cols());
+    const bool use_backend_score =
+      gblock.step2_backend_scores_valid &&
+      isnp < gblock.step2_backend_score_numerators.cols() &&
+      i < gblock.step2_backend_score_numerators.rows();
 
-    // project out covariates from G
-    if(dt_thr->is_sparse) {
-      GWs = dt_thr->Gsparse.cwiseProduct(m_ests.Gamma_sqrt_mask.col(i));
-      XtWG = XWsqrt.transpose() * GWs;
+    if(use_backend_score) {
+      dt_thr->denum(i) =
+        gblock.step2_backend_score_denominators(i, isnp);
     } else {
-      GW = (Geno * m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
-      XtWG.noalias() = XWsqrt.transpose() * GW;
-    }
+      // project out covariates from G
+      if(dt_thr->is_sparse) {
+        GWs = dt_thr->Gsparse.cwiseProduct(m_ests.Gamma_sqrt_mask.col(i));
+        XtWG = XWsqrt.transpose() * GWs;
+      } else {
+        GW = (Geno * m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
+        XtWG.noalias() = XWsqrt.transpose() * GW;
+      }
 
-    // denominator
-    if(dt_thr->is_sparse) 
-      dt_thr->denum(i) = GWs.squaredNorm() - XtWG.squaredNorm();
-    else
-      dt_thr->denum(i) = GW.squaredNorm() - XtWG.squaredNorm();
+      // denominator
+      if(dt_thr->is_sparse)
+        dt_thr->denum(i) = GWs.squaredNorm() - XtWG.squaredNorm();
+      else
+        dt_thr->denum(i) = GW.squaredNorm() - XtWG.squaredNorm();
+    }
 
     double sqrt_denum = sqrt( dt_thr->denum(i) );
     if( sqrt_denum < params.numtol ){
@@ -889,7 +912,10 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
     }
 
     // score test stat for BT
-    if(dt_thr->is_sparse) 
+    if(use_backend_score)
+      dt_thr->stats(i) =
+        gblock.step2_backend_score_numerators(i, isnp) / sqrt_denum;
+    else if(dt_thr->is_sparse)
       dt_thr->stats(i) = GWs.dot(yres.col(i)) / sqrt_denum;
     else {
       double score = GW.dot(yres.col(i));
@@ -905,6 +931,17 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
 
     if(block_info->is_corrected(i) &&
        (fabs(dt_thr->stats(i)) > params.z_thr)) {
+      if(use_backend_score) {
+        if(dt_thr->is_sparse) {
+          GWs = dt_thr->Gsparse.cwiseProduct(
+            m_ests.Gamma_sqrt_mask.col(i));
+          XtWG = XWsqrt.transpose() * GWs;
+        } else {
+          GW = (Geno *
+            m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
+          XtWG.noalias() = XWsqrt.transpose() * GW;
+        }
+      }
       if(dt_thr->is_sparse) {
         dt_thr->Gres = -XWsqrt * XtWG;
         dt_thr->Gres += GWs;
@@ -1046,8 +1083,16 @@ void compute_score_cox(int const& isnp, int const& snp_index, int const& chrom, 
       m_ests.cox_MLE_NULL[i].X1_X1WX1inv;
     const MatrixXd& weighted_design = m_ests.cox_MLE_NULL[i].WX1;
     bool genotype_materialized = false;
+    const bool use_backend_score =
+      gblock.step2_backend_scores_valid &&
+      isnp < gblock.step2_backend_score_numerators.cols() &&
+      i < gblock.step2_backend_score_numerators.rows();
 
-    if(params.coxscore_exact ||
+    if(use_backend_score) {
+      T = gblock.step2_backend_score_numerators(i, isnp);
+      dt_thr->denum(i) =
+        gblock.step2_backend_score_denominators(i, isnp);
+    } else if(params.coxscore_exact ||
        (i >= static_cast<int>(gblock.step2_cox_projection_gram.size()))) {
       if(dt_thr->is_sparse) {
         projection_coeff = weighted_design.transpose() * dt_thr->Gsparse;
@@ -1105,6 +1150,14 @@ void compute_score_cox(int const& isnp, int const& snp_index, int const& chrom, 
 
     if(!genotype_materialized && block_info->is_corrected(i) &&
        (fabs(dt_thr->stats(i)) > params.z_thr)) {
+      if(use_backend_score) {
+        if(dt_thr->is_sparse)
+          projection_coeff =
+            weighted_design.transpose() * dt_thr->Gsparse;
+        else
+          projection_coeff.noalias() =
+            weighted_design.transpose() * Geno.matrix();
+      }
       if(dt_thr->is_sparse)
         dt_thr->Gres = dt_thr->Gsparse - projection * projection_coeff;
       else
