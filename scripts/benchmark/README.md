@@ -1,11 +1,11 @@
 # Benchmarking REGENIE
 
-This directory holds the scripts and result snapshots for repeatable REGENIE
-performance runs. `run_profiled.sh` wraps an ordinary REGENIE command, so no
-separate benchmark binary is needed. It works for production-scale Step 1 runs
-and shorter Step 2 throughput checks.
+Use this directory to run and compare REGENIE performance experiments.
+`run_profiled.sh` goes in front of an ordinary REGENIE command and collects the
+timing and hardware data needed to understand the result. No separate
+benchmark build is required.
 
-For each run, the wrapper saves:
+A run directory contains:
 
 - the exact shell-escaped command, revision, binary checksum, CPU topology,
   linked libraries, memory, disks, and GPU configuration;
@@ -71,6 +71,10 @@ can be used directly from CI or a batch scheduler.
 
 ## Recorded checkpoints
 
+- [`results/2026-07-20-step2.md`](results/2026-07-20-step2.md) covers realistic
+  multi-trait Step 2 work on an eight-core CPU, the retained CPU scoring
+  optimizations, and a packed-input CUDA feasibility study on T4 and A100.
+  The CUDA figures are kernel-level bounds, not end-to-end REGENIE timings.
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
@@ -80,3 +84,6 @@ can be used directly from CI or a batch scheduler.
   multi-phenotype Level 0 path, and Step 2 thread scaling.
 - `results/2026-07-19-production.tsv` contains the retained raw run-level
   measurements used by that report.
+- `results/2026-07-20-step2.tsv` and
+  `results/2026-07-20-step2-cuda.tsv` contain the measurements used by the
+  Step 2 report.
