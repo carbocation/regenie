@@ -1588,6 +1588,24 @@ void run_conformance(Step1ComputeBackend& candidate) {
         (resident_outcomes.array().colwise() *
           resident_weights.array()).matrix();
 
+    Eigen::VectorXd resident_ridge_parameters(2);
+    resident_ridge_parameters << 0.2, 1.4;
+    const Eigen::VectorXd resident_penalty_multipliers =
+      Eigen::VectorXd::LinSpaced(resident_design.cols(), 0.3, 1.8);
+    Eigen::MatrixXd expected_resident_solutions;
+    Eigen::MatrixXd resident_solutions;
+    oracle->diagonal_penalty_solve(expected_resident_gram,
+      expected_resident_crossproduct, resident_ridge_parameters,
+      resident_penalty_multipliers, expected_resident_solutions);
+    const bool resident_solve_supported =
+      candidate.solve_cached_weighted_design(
+        resident_weights, resident_outcomes, resident_ridge_parameters,
+        resident_penalty_multipliers, resident_solutions,
+        &resident_design_timings);
+    if(std::string(candidate.name()) == "cuda" && !resident_solve_supported)
+      throw std::runtime_error(
+        "CUDA backend did not support the resident weighted solve");
+
     Eigen::MatrixXd resident_score;
     candidate.compute_cached_design_crossproduct(
       resident_outcomes, resident_score, &resident_design_timings);
@@ -1600,16 +1618,20 @@ void run_conformance(Step1ComputeBackend& candidate) {
       resident_gram, expected_resident_gram);
     const double resident_crossproduct_error = relative_error(
       resident_crossproduct, expected_resident_crossproduct);
+    const double resident_solve_error = resident_solve_supported ?
+      relative_error(resident_solutions, expected_resident_solutions) : 0.0;
     const double resident_score_error = relative_error(
       resident_score, expected_resident_score);
     if(resident_prediction_error > 5e-12 ||
        resident_gram_error > 5e-12 ||
        resident_crossproduct_error > 5e-12 ||
+       resident_solve_error > 5e-12 ||
        resident_score_error > 5e-12 ||
        resident_design_timings.resident_design_upload_count != 3 ||
        resident_design_timings.resident_design_upload_bytes !=
          static_cast<uint64_t>(resident_design.size()) * sizeof(double) ||
-       resident_design_timings.resident_design_reuse_count != 3)
+       resident_design_timings.resident_design_reuse_count !=
+         static_cast<uint64_t>(3 + resident_solve_supported))
       throw std::runtime_error(
         "resident design operation conformance tolerance exceeded");
 
@@ -1648,6 +1670,8 @@ void run_conformance(Step1ComputeBackend& candidate) {
               << " gram_relative_error=" << resident_gram_error
               << " weighted_crossproduct_relative_error=" <<
                    resident_crossproduct_error
+              << " fused_solve_supported=" << resident_solve_supported
+              << " fused_solve_relative_error=" << resident_solve_error
               << " crossproduct_relative_error=" << resident_score_error
               << " upload_bytes=" <<
                    resident_design_timings.resident_design_upload_bytes

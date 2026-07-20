@@ -1244,88 +1244,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      const int design_count = checked_element_count(
-        rows, features, "cached weighted design matrix");
-      ensure_capacity(d_projected_, projected_capacity_, design_count,
-        "cudaMalloc(cached weighted design matrix)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, rows,
-        "cudaMalloc(cached design weights)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
-        "cudaMalloc(cached weighted Gram matrix)");
-      if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
-          "cudaMalloc(cached weighted outcomes)");
-        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, outcomes.size(),
-          "cudaMalloc(cached weighted outcome matrix)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
-          crossproduct.size(), "cudaMalloc(cached weighted crossproduct)");
-      }
-
-      const Eigen::MatrixXd packed_outcomes = outcome_count > 0 ?
-        contiguous_copy_if_needed(outcomes) : Eigen::MatrixXd();
-      const double* outcome_data = packed_outcomes.size() ?
-        packed_outcomes.data() : outcomes.data();
+      compute_cached_weighted_design_products_device(
+        weights, outcomes, timings);
       ComputeClock::time_point transfer_start;
-      if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
-        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
-        "copy cached design weights to CUDA device");
-      if(outcome_count > 0)
-        check_cuda(cudaMemcpy(d_phenotypes_, outcome_data,
-          static_cast<size_t>(outcomes.size()) * sizeof(double),
-          cudaMemcpyHostToDevice),
-          "copy cached weighted outcomes to CUDA device");
-      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
-
-      const int threads = 256;
-      scale_matrix_rows<<<
-        (design_count + threads - 1) / threads, threads>>>(
-        d_resident_genotypes_, d_ridge_parameters_, d_projected_, rows,
-        design_count);
-      check_cuda(cudaGetLastError(),
-        "scale cached weighted design rows kernel");
-      if(outcome_count > 0) {
-        const int outcome_elements = checked_element_count(
-          rows, outcome_count, "cached weighted outcomes");
-        scale_matrix_rows<<<
-          (outcome_elements + threads - 1) / threads, threads>>>(
-          d_phenotypes_, d_ridge_parameters_, d_scaled_rhs_, rows,
-          outcome_elements);
-        check_cuda(cudaGetLastError(),
-          "scale cached weighted outcomes kernel");
-      }
-
-      const double alpha = 1.0;
-      const double beta = 0.0;
-      if(outcome_count > 0) {
-        std::unique_ptr<CudaEventPair> crossproduct_events;
-        if(timings) {
-          crossproduct_events.reset(new CudaEventPair());
-          crossproduct_events->record_start();
-        }
-        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-          features, outcome_count, rows, &alpha,
-          d_resident_genotypes_, rows, d_scaled_rhs_, rows, &beta,
-          d_crossproduct_, features),
-          "cublasDgemm(cached weighted crossproduct)");
-        if(timings)
-          timings->crossproduct_ms +=
-            crossproduct_events->record_stop_and_elapsed_ms();
-      }
-
-      std::unique_ptr<CudaEventPair> gram_events;
-      if(timings) {
-        gram_events.reset(new CudaEventPair());
-        gram_events->record_start();
-      }
-      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-        features, features, rows, &alpha,
-        d_resident_genotypes_, rows, d_projected_, rows, &beta,
-        d_gram_, features),
-        "cublasDgemm(cached weighted Gram matrix)");
-      if(timings)
-        timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
-
       if(timings) transfer_start = ComputeClock::now();
       if(outcome_count > 0)
         check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_,
@@ -1338,8 +1259,57 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "copy cached weighted Gram matrix from CUDA device");
       if(timings) {
         timings->download_ms += elapsed_ms(transfer_start);
-        timings->resident_design_reuse_count++;
       }
+    }
+
+    bool solve_cached_weighted_design(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_valid_ || weights.size() != resident_design_rows_ ||
+         outcomes.rows() != resident_design_rows_ ||
+         penalty_multipliers.size() != resident_design_columns_)
+        throw std::invalid_argument(
+          "Step 1 cached weighted solve received incompatible dimensions");
+      if(!weights.allFinite() || (weights.array() < 0).any() ||
+         !outcomes.allFinite() || !ridge_parameters.allFinite() ||
+         (ridge_parameters.array() < 0).any() ||
+         !penalty_multipliers.allFinite() ||
+         (penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 cached weighted solve requires finite inputs and non-negative weights and penalties");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_rows_, "cached weighted solve row count");
+      const int features = checked_int(
+        resident_design_columns_, "cached weighted solve feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "cached weighted solve outcome count");
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "cached weighted solve parameter count");
+      const long long solution_column_count_long =
+        static_cast<long long>(outcome_count) * parameter_count;
+      if(solution_column_count_long > INT_MAX)
+        throw std::runtime_error(
+          "CUDA cached weighted solution column count exceeds integer limits");
+      solutions.resize(features,
+        static_cast<Eigen::Index>(solution_column_count_long));
+      if(features == 0 || outcome_count == 0 || parameter_count == 0) {
+        solutions.setZero();
+        return true;
+      }
+      if(rows == 0) return false;
+
+      compute_cached_weighted_design_products_device(
+        weights, outcomes, timings);
+      diagonal_penalty_solve_device(features, outcome_count,
+        ridge_parameters, penalty_multipliers, solutions, timings);
+      return true;
     }
 
     void compute_cached_design_crossproduct(
@@ -2456,14 +2426,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "cudaMalloc(diagonal-penalty Gram matrix)");
       ensure_capacity(d_crossproduct_, crossproduct_capacity_, right_hand_sides.size(),
         "cudaMalloc(diagonal-penalty right-hand sides)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
-        penalty_multipliers.size(), "cudaMalloc(diagonal-penalty multipliers)");
-      ensure_capacity(d_projected_, projected_capacity_, gram.size(),
-        "cudaMalloc(diagonal-penalty factorization matrix)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, right_hand_sides.size(),
-        "cudaMalloc(diagonal-penalty solve workspace)");
-      ensure_capacity(d_predictions_, predictions_capacity_, solutions.size(),
-        "cudaMalloc(diagonal-penalty solutions)");
 
       const Eigen::MatrixXd packed_gram = contiguous_copy_if_needed(gram);
       const Eigen::MatrixXd packed_rhs = contiguous_copy_if_needed(right_hand_sides);
@@ -2478,71 +2440,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaMemcpy(d_crossproduct_, rhs_data,
         right_hand_sides.size() * sizeof(double), cudaMemcpyHostToDevice),
         "copy diagonal-penalty right-hand sides to CUDA device");
-      check_cuda(cudaMemcpy(d_ridge_parameters_, penalty_multipliers.data(),
-        penalty_multipliers.size() * sizeof(double), cudaMemcpyHostToDevice),
-        "copy diagonal-penalty multipliers to CUDA device");
       if(timings) timings->upload_ms += elapsed_ms(transfer_start);
-
-      int workspace_size = 0;
-      check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
-        CUBLAS_FILL_MODE_LOWER, size, d_projected_, size, &workspace_size),
-        "cusolverDnDpotrf_bufferSize");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
-        "cudaMalloc(cuSOLVER Cholesky workspace)");
-
-      std::unique_ptr<CudaEventPair> solve_events;
-      if(timings) {
-        solve_events.reset(new CudaEventPair());
-        solve_events->record_start();
-      }
-      const int threads = 256;
-      for(int parameter = 0; parameter < parameter_count; ++parameter) {
-        check_cuda(cudaMemcpy(d_projected_, d_gram_, gram.size() * sizeof(double),
-          cudaMemcpyDeviceToDevice), "copy diagonal-penalty factorization matrix");
-        check_cuda(cudaMemcpy(d_scaled_rhs_, d_crossproduct_,
-          right_hand_sides.size() * sizeof(double), cudaMemcpyDeviceToDevice),
-          "copy diagonal-penalty solve right-hand sides");
-        add_diagonal_penalty<<<(size + threads - 1) / threads, threads>>>(
-          d_projected_, d_ridge_parameters_, ridge_parameters(parameter), size);
-        check_cuda(cudaGetLastError(), "add diagonal penalty kernel");
-
-        check_cusolver(cusolverDnDpotrf(solver_handle_, CUBLAS_FILL_MODE_LOWER,
-          size, d_projected_, size, d_solver_workspace_, workspace_size,
-          d_solver_info_), "cusolverDnDpotrf");
-        int solver_info = 0;
-        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
-          cudaMemcpyDeviceToHost), "copy Cholesky factorization status to host");
-        if(solver_info != 0) {
-          std::ostringstream message;
-          message << "cuSOLVER Cholesky factorization failed with info=" << solver_info;
-          throw std::runtime_error(message.str());
-        }
-
-        check_cusolver(cusolverDnDpotrs(solver_handle_, CUBLAS_FILL_MODE_LOWER,
-          size, right_hand_side_count, d_projected_, size, d_scaled_rhs_, size,
-          d_solver_info_), "cusolverDnDpotrs");
-        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
-          cudaMemcpyDeviceToHost), "copy Cholesky solve status to host");
-        if(solver_info != 0) {
-          std::ostringstream message;
-          message << "cuSOLVER Cholesky solve failed with info=" << solver_info;
-          throw std::runtime_error(message.str());
-        }
-
-        check_cuda(cudaMemcpy(
-          d_predictions_ + static_cast<Eigen::Index>(parameter) *
-            size * right_hand_side_count,
-          d_scaled_rhs_, right_hand_sides.size() * sizeof(double),
-          cudaMemcpyDeviceToDevice),
-          "store diagonal-penalty solutions on CUDA device");
-      }
-      if(timings) timings->ridge_ms += solve_events->record_stop_and_elapsed_ms();
-
-      if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(solutions.data(), d_predictions_,
-        solutions.size() * sizeof(double), cudaMemcpyDeviceToHost),
-        "copy diagonal-penalty solutions from CUDA device");
-      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      diagonal_penalty_solve_device(size, right_hand_side_count,
+        ridge_parameters, penalty_multipliers, solutions, timings);
     }
 
     void diagonal_penalty_predict(
@@ -4030,6 +3930,208 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    void compute_cached_weighted_design_products_device(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Step1ComputeTimings* timings) {
+
+      const int rows = checked_int(
+        resident_design_rows_, "cached weighted design row count");
+      const int features = checked_int(
+        resident_design_columns_, "cached weighted design feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "cached weighted design outcome count");
+      const int design_count = checked_element_count(
+        rows, features, "cached weighted design matrix");
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(features) * features;
+      const Eigen::Index crossproduct_elements =
+        static_cast<Eigen::Index>(features) * outcome_count;
+
+      ensure_capacity(d_projected_, projected_capacity_, design_count,
+        "cudaMalloc(cached weighted design matrix)");
+      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, rows,
+        "cudaMalloc(cached design weights)");
+      ensure_capacity(d_gram_, gram_capacity_, gram_elements,
+        "cudaMalloc(cached weighted Gram matrix)");
+      if(outcome_count > 0) {
+        ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
+          "cudaMalloc(cached weighted outcomes)");
+        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, outcomes.size(),
+          "cudaMalloc(cached weighted outcome matrix)");
+        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+          crossproduct_elements, "cudaMalloc(cached weighted crossproduct)");
+      }
+
+      const Eigen::MatrixXd packed_outcomes = outcome_count > 0 ?
+        contiguous_copy_if_needed(outcomes) : Eigen::MatrixXd();
+      const double* outcome_data = packed_outcomes.size() ?
+        packed_outcomes.data() : outcomes.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
+        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
+        "copy cached design weights to CUDA device");
+      if(outcome_count > 0)
+        check_cuda(cudaMemcpy(d_phenotypes_, outcome_data,
+          static_cast<size_t>(outcomes.size()) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "copy cached weighted outcomes to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      const int threads = 256;
+      scale_matrix_rows<<<
+        (design_count + threads - 1) / threads, threads>>>(
+        d_resident_genotypes_, d_ridge_parameters_, d_projected_, rows,
+        design_count);
+      check_cuda(cudaGetLastError(),
+        "scale cached weighted design rows kernel");
+      if(outcome_count > 0) {
+        const int outcome_elements = checked_element_count(
+          rows, outcome_count, "cached weighted outcomes");
+        scale_matrix_rows<<<
+          (outcome_elements + threads - 1) / threads, threads>>>(
+          d_phenotypes_, d_ridge_parameters_, d_scaled_rhs_, rows,
+          outcome_elements);
+        check_cuda(cudaGetLastError(),
+          "scale cached weighted outcomes kernel");
+      }
+
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      if(outcome_count > 0) {
+        std::unique_ptr<CudaEventPair> crossproduct_events;
+        if(timings) {
+          crossproduct_events.reset(new CudaEventPair());
+          crossproduct_events->record_start();
+        }
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+          features, outcome_count, rows, &alpha,
+          d_resident_genotypes_, rows, d_scaled_rhs_, rows, &beta,
+          d_crossproduct_, features),
+          "cublasDgemm(cached weighted crossproduct)");
+        if(timings)
+          timings->crossproduct_ms +=
+            crossproduct_events->record_stop_and_elapsed_ms();
+      }
+
+      std::unique_ptr<CudaEventPair> gram_events;
+      if(timings) {
+        gram_events.reset(new CudaEventPair());
+        gram_events->record_start();
+      }
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        features, features, rows, &alpha,
+        d_resident_genotypes_, rows, d_projected_, rows, &beta,
+        d_gram_, features),
+        "cublasDgemm(cached weighted Gram matrix)");
+      if(timings) {
+        timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
+        timings->resident_design_reuse_count++;
+      }
+    }
+
+    void diagonal_penalty_solve_device(
+      int size,
+      int right_hand_side_count,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) {
+
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "diagonal-penalty parameter count");
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(size) * size;
+      const Eigen::Index right_hand_side_elements =
+        static_cast<Eigen::Index>(size) * right_hand_side_count;
+
+      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+        penalty_multipliers.size(), "cudaMalloc(diagonal-penalty multipliers)");
+      ensure_capacity(d_projected_, projected_capacity_, gram_elements,
+        "cudaMalloc(diagonal-penalty factorization matrix)");
+      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+        right_hand_side_elements,
+        "cudaMalloc(diagonal-penalty solve workspace)");
+      ensure_capacity(d_predictions_, predictions_capacity_, solutions.size(),
+        "cudaMalloc(diagonal-penalty solutions)");
+
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, penalty_multipliers.data(),
+        penalty_multipliers.size() * sizeof(double), cudaMemcpyHostToDevice),
+        "copy diagonal-penalty multipliers to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      int workspace_size = 0;
+      check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, size, d_projected_, size, &workspace_size),
+        "cusolverDnDpotrf_bufferSize");
+      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_,
+        workspace_size, "cudaMalloc(cuSOLVER Cholesky workspace)");
+
+      std::unique_ptr<CudaEventPair> solve_events;
+      if(timings) {
+        solve_events.reset(new CudaEventPair());
+        solve_events->record_start();
+      }
+      const int threads = 256;
+      for(int parameter = 0; parameter < parameter_count; ++parameter) {
+        check_cuda(cudaMemcpy(d_projected_, d_gram_,
+          static_cast<size_t>(gram_elements) * sizeof(double),
+          cudaMemcpyDeviceToDevice),
+          "copy diagonal-penalty factorization matrix");
+        check_cuda(cudaMemcpy(d_scaled_rhs_, d_crossproduct_,
+          static_cast<size_t>(right_hand_side_elements) * sizeof(double),
+          cudaMemcpyDeviceToDevice),
+          "copy diagonal-penalty solve right-hand sides");
+        add_diagonal_penalty<<<(size + threads - 1) / threads, threads>>>(
+          d_projected_, d_ridge_parameters_, ridge_parameters(parameter), size);
+        check_cuda(cudaGetLastError(), "add diagonal penalty kernel");
+
+        check_cusolver(cusolverDnDpotrf(solver_handle_, CUBLAS_FILL_MODE_LOWER,
+          size, d_projected_, size, d_solver_workspace_, workspace_size,
+          d_solver_info_), "cusolverDnDpotrf");
+        int solver_info = 0;
+        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+          cudaMemcpyDeviceToHost),
+          "copy Cholesky factorization status to host");
+        if(solver_info != 0) {
+          std::ostringstream message;
+          message << "cuSOLVER Cholesky factorization failed with info="
+                  << solver_info;
+          throw std::runtime_error(message.str());
+        }
+
+        check_cusolver(cusolverDnDpotrs(solver_handle_, CUBLAS_FILL_MODE_LOWER,
+          size, right_hand_side_count, d_projected_, size, d_scaled_rhs_, size,
+          d_solver_info_), "cusolverDnDpotrs");
+        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+          cudaMemcpyDeviceToHost), "copy Cholesky solve status to host");
+        if(solver_info != 0) {
+          std::ostringstream message;
+          message << "cuSOLVER Cholesky solve failed with info=" << solver_info;
+          throw std::runtime_error(message.str());
+        }
+
+        check_cuda(cudaMemcpy(
+          d_predictions_ + static_cast<Eigen::Index>(parameter) *
+            right_hand_side_elements,
+          d_scaled_rhs_,
+          static_cast<size_t>(right_hand_side_elements) * sizeof(double),
+          cudaMemcpyDeviceToDevice),
+          "store diagonal-penalty solutions on CUDA device");
+      }
+      if(timings)
+        timings->ridge_ms += solve_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(solutions.data(), d_predictions_,
+        solutions.size() * sizeof(double), cudaMemcpyDeviceToHost),
+        "copy diagonal-penalty solutions from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+    }
+
     static void release_level0_cholesky_lane(
       CudaLevel0CholeskyLane& lane) {
       if(lane.stream) cudaStreamSynchronize(lane.stream);

@@ -1330,14 +1330,19 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             }
             if(l1->pheno_l1_not_converged(ph)) break;
 
-            compute_backend->compute_cached_weighted_design_products(
-              cached_weights, cached_working_outcome, XtWX, XtWZ,
-              profile_timings);
-            weighted_product_calls++;
             current_tau(0) = params->tau[ph](j);
-            compute_backend->diagonal_penalty_solve(
-              XtWX, XtWZ, current_tau, l1->ridge_param_mult.matrix(),
-              solver_coefficients, profile_timings);
+            if(!compute_backend->solve_cached_weighted_design(
+                 cached_weights, cached_working_outcome, current_tau,
+                 l1->ridge_param_mult.matrix(), solver_coefficients,
+                 profile_timings)) {
+              compute_backend->compute_cached_weighted_design_products(
+                cached_weights, cached_working_outcome, XtWX, XtWZ,
+                profile_timings);
+              compute_backend->diagonal_penalty_solve(
+                XtWX, XtWZ, current_tau, l1->ridge_param_mult.matrix(),
+                solver_coefficients, profile_timings);
+            }
+            weighted_product_calls++;
             solve_calls++;
             betanew = solver_coefficients.col(0).array();
 

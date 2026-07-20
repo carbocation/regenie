@@ -198,6 +198,14 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& crossproduct,
       Step1ComputeTimings* timings = nullptr);
 
+    virtual bool solve_cached_weighted_design(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void compute_cached_design_crossproduct(
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Eigen::MatrixXd& crossproduct,

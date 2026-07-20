@@ -182,19 +182,25 @@ void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
                 (-_diagHessian.array()).max(0.0), 0.0).matrix();
             const Eigen::MatrixXd working_response = z;
             Eigen::MatrixXd gram, crossproduct, solution;
-            if(_resident_design)
-                _compute_backend->compute_cached_weighted_design_products(
-                    weights, working_response, gram, crossproduct, _timings);
-            else
-                _compute_backend->compute_weighted_design_products(
-                    Xmat, weights, working_response, gram, crossproduct,
-                    _timings);
             Eigen::VectorXd ridge_parameter(1);
             ridge_parameter(0) = lambda;
             const Eigen::VectorXd penalty_multipliers = Eigen::VectorXd::Ones(p);
-            _compute_backend->diagonal_penalty_solve(
-                gram, crossproduct, ridge_parameter, penalty_multipliers,
-                solution, _timings);
+            const bool resident_solve = _resident_design &&
+                _compute_backend->solve_cached_weighted_design(
+                    weights, working_response, ridge_parameter,
+                    penalty_multipliers, solution, _timings);
+            if(!resident_solve) {
+                if(_resident_design)
+                    _compute_backend->compute_cached_weighted_design_products(
+                        weights, working_response, gram, crossproduct, _timings);
+                else
+                    _compute_backend->compute_weighted_design_products(
+                        Xmat, weights, working_response, gram, crossproduct,
+                        _timings);
+                _compute_backend->diagonal_penalty_solve(
+                    gram, crossproduct, ridge_parameter, penalty_multipliers,
+                    solution, _timings);
+            }
             beta = solution.col(0);
             eta = mask.select(
                 step1_linear_prediction(_compute_backend, Xmat, beta,
