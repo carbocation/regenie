@@ -1,29 +1,24 @@
-# Benchmarking REGENIE
+# REGENIE benchmarks
 
-Use this directory to run and compare REGENIE performance experiments.
-`run_profiled.sh` goes in front of an ordinary REGENIE command and collects the
-timing and hardware data needed to understand the result. No separate
-benchmark build is required.
+The reports in this directory answer two practical questions:
 
-A run directory contains:
+| Report | Workload shapes | Main conclusion |
+| --- | --- | --- |
+| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000, one quantitative trait; and N=50,000, M=700,000 multi-trait panels | A100 is the clear Stage 1 target; the retained large-sample Level 0 path is close to saturated |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Measured at N=50,000, M=700,000; compute-only projection at N=50,000, M=10,000,000 | Use Spot N2 fan-out for production Stage 2; CUDA is a local accelerator, not a placement argument |
 
-- the exact shell-escaped command, revision, binary checksum, CPU topology,
-  linked libraries, memory, disks, and GPU configuration;
-- external wall time, CPU time, peak RSS, page faults, context switches, and
-  filesystem operations from GNU `time`;
-- one-second `vmstat` and `iostat` traces when those tools are installed;
-- GPU utilization, memory-controller utilization, allocated memory, power,
-  power limit, clocks, and temperature at a configurable interval;
-- raw and timestamped console logs, plus every structured
-  `STEP1_PROFILE` or `STEP2_PROFILE` field in long-form TSV; and
-- interval-based host CPU utilization, I/O wait, and run-queue summaries from
-  `vmstat`, plus whole-run and phase-level GPU summaries.
+Each report states `N`, `M`, trait count, model, hardware, and whether a number
+is measured or projected. The TSV files hold the detailed run records and
+historical controls.
 
-Example:
+## Running a benchmark
+
+`run_profiled.sh` wraps an ordinary REGENIE command. No separate benchmark
+binary is required.
 
 ```bash
 scripts/benchmark/run_profiled.sh \
-  --label a100-n500k-m700k-p1 \
+  --label step1-n500k-m700k-p1 \
   --system-label a2-highgpu-1g \
   --output-root /path/to/results \
   --gpu-device 0 \
@@ -34,81 +29,72 @@ scripts/benchmark/run_profiled.sh \
     --pgen /path/to/real-ld-n500000-m700000 \
     --phenoFile /path/to/phenotypes.txt \
     --covarFile /path/to/covariates.txt \
-    --qt --bsize 1000 --threads 6 --lowmem \
+    --qt --bsize 1000 --threads 12 --lowmem \
     --lowmem-prefix /path/to/results/l0 \
     --compute-backend cuda --gpu-device 0 --step1-profile \
     --out /path/to/results/fit
 ```
 
-Use a stable `--system-label` that describes the hardware configuration, not
-the cloud instance name. This keeps result tables meaningful after the
-original machines have been deleted or renamed.
+Use a stable `--system-label` that describes the machine type and relevant
+configuration, never a transient cloud instance name.
 
-Build the binary the way users are expected to run it. For optimized x86
-measurements, set `MKLROOT` when configuring REGENIE and confirm that
-`binary_libraries.txt` links to oneMKL. A BLAS mismatch can dominate the CPU
-result.
+For optimized x86 measurements, configure with `MKLROOT` and verify that
+`binary_libraries.txt` links oneMKL. A BLAS mismatch can invalidate a CPU
+comparison.
 
-`prepare_multitrait_fixture.py` makes a deterministic multi-phenotype cohort
-from aligned phenotype and covariate files. By default it keeps 10,000 samples
-per population group, generates 32 correlated quantitative traits, and writes
-both a complete-case file and a version whose per-trait missingness increases
-from 0% to 10%. It also writes a PLINK keep file; use that file to make a
-physical PGEN subset so each benchmark reads the same number of samples. The
-helper requires NumPy.
+## What a run records
 
-`prepare_nongaussian_fixture.py` derives binary and time-to-event outcomes
-from the complete quantitative-trait table. Its defaults create eight binary
-traits spanning 1% to 50% prevalence and eight survival traits spanning 10% to
-80% observed events. Counts are exact and generation is deterministic, which
-makes it straightforward to reproduce the same phenotype files on different
-machines and verify them by checksum.
+Each invocation creates `LABEL-YYYYMMDDTHHMMSSZ/` containing:
 
-`prepare_step2_trait_matrix.py` is the wider Step 2 fixture used for the
-32-trait placement comparison. It takes matched complete and missing
-quantitative panels, cycles the same prevalence and event-rate targets across
-all traits, and carries each quantitative missingness mask into the derived
-binary and survival outcomes. It writes complete and missing panels for both
-models plus a compact trait summary. Generating the panels independently on
-the CPU and GPU benchmark machines produced identical SHA-256 checksums.
+- exact command, Git revision, binary checksum, and linked libraries;
+- CPU topology, memory, disks, and GPU configuration;
+- wall time, CPU time, peak RSS, page faults, context switches, and filesystem
+  operations from GNU `time`;
+- structured `STEP1_PROFILE` or `STEP2_PROFILE` fields;
+- host CPU, I/O, and run-queue telemetry when `vmstat`/`iostat` are available;
+- GPU utilization, memory-controller activity, memory allocation, power,
+  clocks, and temperature; and
+- raw console output plus compact `summary.tsv` and `profile_kv.tsv` files.
 
-Each invocation creates `LABEL-YYYYMMDDTHHMMSSZ/`. `summary.tsv` is the compact
-run summary, `profile_kv.tsv` preserves the structured REGENIE profile, and
-`gpu.csv` is the raw telemetry. The wrapper exits with REGENIE's status, so it
-can be used directly from CI or a batch scheduler.
+The wrapper exits with REGENIE's status and can be used from CI or a batch
+scheduler.
 
-## Recorded checkpoints
+## Fixture helpers
 
-- [`results/2026-07-20-step2.md`](results/2026-07-20-step2.md) covers realistic
-  multi-trait Step 2 work on an eight-core CPU and matched end-to-end CPU/CUDA
-  comparisons on T4 and A100. It includes quantitative traits with and without
-  missingness, binary traits, survival traits, approximate Firth correction,
-  full-fixture placement measurements, historical saturation diagnostics, GPU
-  telemetry, and the automatic backend policy. The cost-aware follow-up uses
-  the corrected single-process A100 path for 8- and 32-trait score-only
-  placements, the blockwise oneMKL CPU path, on-demand A100 versus Spot N2
-  break-even analysis, and a phase-based projection to the 10-million-variant
-  production range.
-- [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
-  the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
-  fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
-  power, quantitative, binary, and survival workloads, the retained Level 1
-  GPU residency changes, the retained small-block Level 0 pipeline, a
-  production-scale cold-cache A100 optimization, the generalized
-  multi-phenotype Level 0 path, and Step 2 thread scaling.
-- `results/2026-07-19-production.tsv` contains the retained raw run-level
-  measurements used by that report.
-- `results/2026-07-20-step2.tsv`,
-  `results/2026-07-20-step2-integrated.tsv`, and
-  `results/2026-07-20-step2-steady-state.tsv` contain the CPU, integrated
-  CPU/CUDA, and full-fixture measurements used by the Step 2 report.
-- `results/2026-07-20-step2-trait-matrix.tsv` contains the 8- and 32-trait
-  score-only timing, phase, memory, and GPU telemetry rows.
-  `results/2026-07-20-step2-cpu-block.tsv` records the current oneMKL CPU
-  measurements, correction-heavy runs, phase timings, and numerical checks.
-  The companion
-  `results/2026-07-20-step2-cost-projection.tsv` records the explicitly
-  compute-only 10-million-variant placement arithmetic, and
-  `results/2026-07-20-step2-prices.tsv` records the price snapshot.
-- `results/2026-07-20-step2-cuda.tsv` contains the earlier standalone-kernel
-  diagnostic measurements.
+`prepare_multitrait_fixture.py` creates the N=50,000 quantitative panel from
+aligned phenotype and covariate files. Its default output contains 32
+correlated traits, a complete file, a file with per-trait missingness rising
+from 0% to 10%, and a PLINK keep file for making the matching physical PGEN
+subset.
+
+`prepare_nongaussian_fixture.py` derives eight binary traits with prevalences
+from 1% to 50% and eight survival models with event fractions from 10% to 80%.
+
+`prepare_step2_trait_matrix.py` expands those targets to the 32-trait Stage 2
+panels and carries the quantitative missingness masks into the binary and
+survival outcomes. Generation is deterministic so fixtures can be verified by
+checksum across systems.
+
+## Raw result files
+
+Stage 1:
+
+- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — retained run-level measurements for
+  the Stage 1 report.
+
+Stage 2:
+
+- [`results/2026-07-20-step2-cpu-block.tsv`](results/2026-07-20-step2-cpu-block.tsv) — current oneMKL CPU measurements,
+  phase timings, correction-heavy runs, and validation.
+- [`results/2026-07-20-step2-trait-matrix.tsv`](results/2026-07-20-step2-trait-matrix.tsv) — measured A100/N2 score-only
+  matrix and GPU telemetry.
+- [`results/2026-07-20-step2-cost-projection.tsv`](results/2026-07-20-step2-cost-projection.tsv) — explicit N=50,000,
+  M=10,000,000 compute-only projection arithmetic.
+- [`results/2026-07-20-step2-prices.tsv`](results/2026-07-20-step2-prices.tsv) — cloud price snapshot and source URLs.
+- [`results/2026-07-20-step2.tsv`](results/2026-07-20-step2.tsv) and
+  [`results/2026-07-20-step2-integrated.tsv`](results/2026-07-20-step2-integrated.tsv) — earlier CPU and integrated CUDA
+  controls.
+- [`results/2026-07-20-step2-steady-state.tsv`](results/2026-07-20-step2-steady-state.tsv) — historical utilization and
+  concurrency diagnostics.
+- [`results/2026-07-20-step2-cuda.tsv`](results/2026-07-20-step2-cuda.tsv) — standalone kernel diagnostics; these
+  are not end-to-end runtime forecasts.
