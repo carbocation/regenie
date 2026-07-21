@@ -1,0 +1,7 @@
+model	missingness	samples	variants	phenotypes	upstream_v4_1_2_n2_wall_s	upstream_basis	current_n2_wall_s	current_cpu_speedup	current_a100_wall_s	projection_validation
+quantitative	none	500000	700000	32	6584.010000	direct_full_run	497.84	13.225153	238.65	direct
+quantitative	linear_0_to_10pct	500000	700000	32	10874.990172	chromosome_1_wall_x_711_over_58	1650.04	6.590743	744.02	full_quantitative_projection_error_1.5226pct
+binary	none	500000	700000	32	18981.861207	chromosome_1_wall_x_711_over_58	1056.65	17.964190	303.47	partial_369_block_rate_difference_0.2189pct
+binary	linear_0_to_10pct	500000	700000	32	23095.854310	chromosome_1_wall_x_711_over_58	1622.77	14.232365	339.55	full_quantitative_projection_error_1.5226pct
+survival	none	500000	700000	32	23687.700517	chromosome_1_wall_x_711_over_58	1477.28	16.034672	718.44	full_quantitative_projection_error_1.5226pct
+survival	linear_0_to_10pct	500000	700000	32	29983.728103	chromosome_1_wall_x_711_over_58	2236.61	13.405881	786.03	full_quantitative_projection_error_1.5226pct

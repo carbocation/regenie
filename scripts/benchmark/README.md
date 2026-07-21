@@ -5,7 +5,7 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000, one quantitative trait; and N=50,000, M=700,000 multi-trait panels | A100 is the clear Stage 1 target; the retained large-sample Level 0 path is close to saturated |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Direct N=500,000, M=700,000 anchors for 32 quantitative, binary, and survival traits; N=500,000, M=100,000,000 placement model | Use one co-located Spot N2 worker per chromosome; the single-process A100 is faster than one worker but loses on total wall time and cost |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Upstream/current N=500,000, M=700,000 comparisons for 32 quantitative, binary, and survival traits; N=500,000, M=100,000,000 placement model | Current CPU is 6.6-18.0x faster than upstream; use one co-located Spot N2 worker per chromosome |
 
 Each report states `N`, `M`, trait count, model, hardware, and whether a number
 is measured or projected. The TSV files hold the detailed run records and
@@ -85,6 +85,15 @@ Stage 1:
 
 Stage 2:
 
+- [`results/2026-07-21-step2-upstream.tsv`](results/2026-07-21-step2-upstream.tsv) — upstream v4.1.2 and matched
+  current measurements at N=500,000, including the full M=700,000 anchor and
+  chromosome-sized model/missingness comparisons.
+- [`results/2026-07-21-step2-upstream-comparison.tsv`](results/2026-07-21-step2-upstream-comparison.tsv) — direct and
+  validated steady-state upstream/current comparison at N=500,000 and
+  M=700,000.
+- [`results/2026-07-21-step2-upstream-production.tsv`](results/2026-07-21-step2-upstream-production.tsv) — upstream,
+  current CPU, and current A100 wall-time and cost projections at 100 million
+  variants.
 - [`results/2026-07-20-step2-cpu-block.tsv`](results/2026-07-20-step2-cpu-block.tsv) — current oneMKL CPU measurements,
   phase timings, correction-heavy runs, and validation.
 - [`results/2026-07-20-step2-trait-matrix.tsv`](results/2026-07-20-step2-trait-matrix.tsv) — measured A100/N2 score-only
