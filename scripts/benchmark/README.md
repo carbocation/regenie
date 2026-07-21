@@ -83,10 +83,11 @@ can be used directly from CI or a batch scheduler.
   multi-trait Step 2 work on an eight-core CPU and matched end-to-end CPU/CUDA
   comparisons on T4 and A100. It includes quantitative traits with and without
   missingness, binary traits, survival traits, approximate Firth correction,
-  full-fixture placement and fan-out measurements, GPU telemetry, and the
-  automatic backend policy. The cost-aware follow-up adds 8- and 32-trait
-  score-only placements, on-demand A100 versus Spot N2 break-even analysis,
-  and a phase-based projection to the 10-million-variant production range.
+  full-fixture placement measurements, historical saturation diagnostics, GPU
+  telemetry, and the automatic backend policy. The cost-aware follow-up uses
+  the corrected single-process A100 path for 8- and 32-trait score-only
+  placements, on-demand A100 versus Spot N2 break-even analysis, and a
+  phase-based projection to the 10-million-variant production range.
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
