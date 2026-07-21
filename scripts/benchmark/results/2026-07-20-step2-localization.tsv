@@ -1,0 +1,7 @@
+record_id	record_type	system	storage	bytes	variants	wall_s	throughput_gib_s	region_relation	durable_write	role	source
+same-region-pgen-copy	direct_measurement	n2-standard-16	pd-ssd	7495728463	NA	13.28	0.525673	same_region	sync_in_timed_interval	production_rate_anchor	local_benchmark
+real-ld-pgen-density	fixture_measurement	all	pgen	61507803381	700000	NA	NA	NA	NA	bytes_per_variant_anchor	local_fixture
+production-pgen-100m	linear_projection	all	pgen	8786829054429	100000000	NA	NA	NA	NA	production_input_size	real_ld_pgen_density
+a2-highgpu-1g-write-cap	documented_limit	a2-highgpu-1g	pd-balanced	NA	NA	NA	0.781250	NA	NA	optimistic_a100_localization_bound	https://cloud.google.com/compute/docs/disks/performance
+a2-highgpu-1g-local-ssd-capacity	documented_limit	a2-highgpu-1g	local-ssd	3221225472000	NA	NA	NA	NA	NA	insufficient_for_projected_input	https://cloud.google.com/compute/docs/accelerator-optimized-machines
+n2-standard-16-write-cap	documented_limit	n2-standard-16	pd-ssd	NA	NA	NA	1.171875	NA	NA	machine_limit_not_observed_rate	https://cloud.google.com/compute/docs/disks/performance

@@ -5,7 +5,7 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000, one quantitative trait; and N=50,000, M=700,000 multi-trait panels | A100 is the clear Stage 1 target; the retained large-sample Level 0 path is close to saturated |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Measured N=50,000 versus N=500,000 sample scaling; M=10,000,000 CPU fleet estimates; measured A100 comparison at N=50,000 | Use Spot N2 workers for production Stage 2; worker count is a wall-time choice, not a chromosome-count rule |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Direct N=500,000, M=700,000 anchors for 32 quantitative, binary, and survival traits; N=500,000, M=100,000,000 placement model | Use one co-located Spot N2 worker per chromosome; the single-process A100 is faster than one worker but loses on total wall time and cost |
 
 Each report states `N`, `M`, trait count, model, hardware, and whether a number
 is measured or projected. The TSV files hold the detailed run records and
@@ -89,10 +89,18 @@ Stage 2:
   phase timings, correction-heavy runs, and validation.
 - [`results/2026-07-20-step2-trait-matrix.tsv`](results/2026-07-20-step2-trait-matrix.tsv) — measured A100/N2 score-only
   matrix and GPU telemetry.
+- [`results/2026-07-20-step2-large-anchor.tsv`](results/2026-07-20-step2-large-anchor.tsv) — cold-input N=500,000,
+  M=700,000 measurements and A100 block-size controls; the `--bsize 1000`
+  rows feed the production model.
+- [`results/2026-07-20-step2-production-model.tsv`](results/2026-07-20-step2-production-model.tsv) — N=500,000,
+  M=100,000,000 wall-time and whole-placement cost estimates.
+- [`results/2026-07-20-step2-chromosome-allocation.tsv`](results/2026-07-20-step2-chromosome-allocation.tsv) — 100 million
+  variants allocated across chromosomes 1-22, X, and Y by GRCh38 length.
+- [`results/2026-07-20-step2-localization.tsv`](results/2026-07-20-step2-localization.tsv) — durable same-region
+  localization measurement and machine storage limits.
 - [`results/2026-07-20-step2-sample-scaling.tsv`](results/2026-07-20-step2-sample-scaling.tsv) — matched N=50,000 and
-  N=500,000 runs for 32 quantitative, binary, and survival traits.
-- [`results/2026-07-20-step2-cost-projection.tsv`](results/2026-07-20-step2-cost-projection.tsv) — M=10,000,000
-  worker-count scenarios with aggregate fleet cost stated explicitly.
+  N=500,000 runs at M=16,000. These isolate sample-size effects and are not
+  used for production placement estimates.
 - [`results/2026-07-20-step2-prices.tsv`](results/2026-07-20-step2-prices.tsv) — cloud price snapshot and source URLs.
 - [`results/2026-07-20-step2.tsv`](results/2026-07-20-step2.tsv) and
   [`results/2026-07-20-step2-integrated.tsv`](results/2026-07-20-step2-integrated.tsv) — earlier CPU and integrated CUDA
