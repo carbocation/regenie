@@ -86,8 +86,9 @@ can be used directly from CI or a batch scheduler.
   full-fixture placement measurements, historical saturation diagnostics, GPU
   telemetry, and the automatic backend policy. The cost-aware follow-up uses
   the corrected single-process A100 path for 8- and 32-trait score-only
-  placements, on-demand A100 versus Spot N2 break-even analysis, and a
-  phase-based projection to the 10-million-variant production range.
+  placements, the blockwise oneMKL CPU path, on-demand A100 versus Spot N2
+  break-even analysis, and a phase-based projection to the 10-million-variant
+  production range.
 - [`results/2026-07-19-production.md`](results/2026-07-19-production.md) records
   the current A100, T4, and eight-core N2 benchmark on a shared real-LD-derived
   fixture, including v4.1.2 Step 1 and Step 2 CPU anchors, GPU utilization and
@@ -102,7 +103,10 @@ can be used directly from CI or a batch scheduler.
   `results/2026-07-20-step2-steady-state.tsv` contain the CPU, integrated
   CPU/CUDA, and full-fixture measurements used by the Step 2 report.
 - `results/2026-07-20-step2-trait-matrix.tsv` contains the 8- and 32-trait
-  score-only timing, phase, memory, and GPU telemetry rows. The companion
+  score-only timing, phase, memory, and GPU telemetry rows.
+  `results/2026-07-20-step2-cpu-block.tsv` records the current oneMKL CPU
+  measurements, correction-heavy runs, phase timings, and numerical checks.
+  The companion
   `results/2026-07-20-step2-cost-projection.tsv` records the explicitly
   compute-only 10-million-variant placement arithmetic, and
   `results/2026-07-20-step2-prices.tsv` records the price snapshot.
