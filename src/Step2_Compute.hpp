@@ -55,6 +55,7 @@ class Step2ComputeBackend {
   virtual const char* name() const = 0;
   virtual std::string description() const = 0;
   virtual bool ready() const = 0;
+  virtual bool uses_packed_hardcalls() const = 0;
   virtual bool provides_observed_trait_counts() const = 0;
   virtual void clear() = 0;
 
@@ -101,6 +102,13 @@ class Step2ComputeBackend {
     Eigen::MatrixXd& denominators,
     Eigen::MatrixXd& observed_allele_sums,
     Eigen::MatrixXd& observed_nonmissing_counts,
+    Step2ComputeTimings* timings = nullptr) = 0;
+
+  virtual bool score_dense_block(
+    const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
+    const std::vector<unsigned char>& sparse,
+    Eigen::MatrixXd& numerators,
+    Eigen::MatrixXd& denominators,
     Step2ComputeTimings* timings = nullptr) = 0;
 };
 

@@ -364,6 +364,24 @@ if(BUILD_TESTING)
   add_test(NAME step1_compute_auto
     COMMAND step1_compute_test --backend auto)
 
+  add_executable(step2_compute_test
+    ${CMAKE_SOURCE_DIR}/test/test_step2_compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp)
+  target_include_directories(step2_compute_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(step2_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(step2_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  configure_cuda_target(step2_compute_test
+    ${CMAKE_SOURCE_DIR}/src/Step2_Compute_CUDA.cu)
+  add_test(NAME step2_compute_cpu COMMAND step2_compute_test)
+
   add_executable(cox_firth_test
     ${CMAKE_SOURCE_DIR}/test/test_cox_firth.cpp
     ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
@@ -471,6 +489,7 @@ if(BUILD_TESTING)
   # as the application, so a static OpenBLAS build must also expose its
   # Fortran runtime dependencies to these targets.
   target_link_libraries(step1_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
+  target_link_libraries(step2_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
   target_link_libraries(cox_firth_test PRIVATE ${GFORTRAN_LIBRARIES})
 endif()
 

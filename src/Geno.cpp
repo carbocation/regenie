@@ -3166,8 +3166,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     const bool use_fast_hardcall_path =
       use_fast_hardcall_base && !non_par;
     const bool use_packed_hardcall_path =
-      use_fast_hardcall_path && all_samples_in_analysis &&
-      (!has_trait_missingness || packed_backend_with_trait_missingness);
+      use_fast_hardcall_path && all_samples_in_analysis;
     if(profile && use_fast_hardcall_path)
       fast_path_variants[thread_num]++;
     if(profile && use_packed_hardcall_path)

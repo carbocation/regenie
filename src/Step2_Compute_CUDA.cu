@@ -404,6 +404,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
   }
 
   bool ready() const override { return mode_ != ScoreMode::none; }
+  bool uses_packed_hardcalls() const override { return true; }
   bool provides_observed_trait_counts() const override {
     return ready() && trait_counts_required_;
   }
@@ -829,6 +830,14 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     return numerators.allFinite() && denominators.allFinite();
+  }
+
+  bool score_dense_block(
+      const Eigen::Ref<const Eigen::MatrixXd>&,
+      const std::vector<unsigned char>&,
+      Eigen::MatrixXd&, Eigen::MatrixXd&,
+      Step2ComputeTimings*) override {
+    return false;
   }
 
  private:

@@ -3880,7 +3880,9 @@ void Data::test_snps_fast() {
     }
 
     bool use_step2_pipeline =
-      step2_compute_backend->ready() && params.file_type == "pgen" &&
+      step2_compute_backend->ready() &&
+      step2_compute_backend->uses_packed_hardcalls() &&
+      params.file_type == "pgen" &&
       !params.firth && !params.use_SPA;
     if(use_step2_pipeline && params.skip_dosage_comp) {
       const int chromosome_start = snp_tally.snp_count;
@@ -4141,16 +4143,16 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
     profile_stage_start = ProfileClock::now();
   }
 
-  bool packed_backend_block_eligible = step2_compute_backend->ready();
-  if(packed_backend_block_eligible && params.skip_dosage_comp) {
+  bool backend_block_eligible = step2_compute_backend->ready();
+  if(backend_block_eligible && params.skip_dosage_comp) {
     for(int variant = 0; variant < n_snps; ++variant) {
       if(in_non_par(chrom, snpinfo[indices[variant]].physpos, &params)) {
-        packed_backend_block_eligible = false;
+        backend_block_eligible = false;
         break;
       }
     }
   }
-  if(packed_backend_block_eligible) {
+  if(backend_block_eligible) {
     vector<unsigned char> flipped(n_snps, 0);
     vector<unsigned char> sparse(n_snps, 0);
     for(int variant = 0; variant < n_snps; ++variant) {
@@ -4159,15 +4161,26 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
         all_snps_info[variant].n_zero >=
           params.n_samples * params.prop_zero_thr ? 1 : 0;
     }
-    Gblock.step2_backend_scores_valid =
-      step2_compute_backend->score_packed_block(
-        Gblock.step2_pgen_packed_hardcalls,
-        Gblock.step2_pgen_packed_means, flipped, sparse,
-        params.n_samples, Gblock.step2_backend_score_numerators,
-        Gblock.step2_backend_score_denominators,
-        Gblock.step2_backend_observed_allele_sums,
-        Gblock.step2_backend_observed_nonmissing_counts,
-        params.profile_step2 ? &step2_compute_timings : nullptr);
+    if(step2_compute_backend->uses_packed_hardcalls()) {
+      Gblock.step2_backend_scores_valid =
+        step2_compute_backend->score_packed_block(
+          Gblock.step2_pgen_packed_hardcalls,
+          Gblock.step2_pgen_packed_means, flipped, sparse,
+          params.n_samples, Gblock.step2_backend_score_numerators,
+          Gblock.step2_backend_score_denominators,
+          Gblock.step2_backend_observed_allele_sums,
+          Gblock.step2_backend_observed_nonmissing_counts,
+          params.profile_step2 ? &step2_compute_timings : nullptr);
+    } else {
+      Gblock.step2_backend_scores_valid =
+        step2_compute_backend->score_dense_block(
+          Gblock.Gmat.leftCols(n_snps), sparse,
+          Gblock.step2_backend_score_numerators,
+          Gblock.step2_backend_score_denominators,
+          params.profile_step2 ? &step2_compute_timings : nullptr);
+      Gblock.step2_backend_observed_allele_sums.resize(0, 0);
+      Gblock.step2_backend_observed_nonmissing_counts.resize(0, 0);
+    }
     Gblock.step2_backend_trait_counts_valid =
       Gblock.step2_backend_scores_valid &&
       Gblock.step2_backend_observed_allele_sums.rows() == params.n_pheno &&
@@ -5214,6 +5227,7 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
   else if(params.file_type == "pgen") {
     bool backend_score_only_unexpanded =
       step2_compute_backend && step2_compute_backend->ready() &&
+      step2_compute_backend->uses_packed_hardcalls() &&
       !params.firth && !params.use_SPA &&
       (!in_filters.has_missing.any() ||
        step2_compute_backend->provides_observed_trait_counts());
@@ -5234,7 +5248,8 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
         backend_score_only_unexpanded,
       &Gblock.step2_pgen_packed_means,
       &Gblock.step2_pgen_packed_unexpanded,
-      step2_compute_backend && step2_compute_backend->ready());
+      step2_compute_backend && step2_compute_backend->ready() &&
+        step2_compute_backend->uses_packed_hardcalls());
   } else {
 
     snp_data_blocks.resize( n_snps );
