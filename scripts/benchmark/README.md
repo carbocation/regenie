@@ -5,7 +5,7 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000, one quantitative trait; and N=50,000, M=700,000 multi-trait panels | A100 is the clear Stage 1 target; the retained large-sample Level 0 path is close to saturated |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Measured at N=50,000, M=700,000; compute-only projection at N=50,000, M=10,000,000 | Use Spot N2 fan-out for production Stage 2; CUDA is a local accelerator, not a placement argument |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Measured N=50,000 versus N=500,000 sample scaling; M=10,000,000 CPU fleet estimates; measured A100 comparison at N=50,000 | Use Spot N2 workers for production Stage 2; worker count is a wall-time choice, not a chromosome-count rule |
 
 Each report states `N`, `M`, trait count, model, hardware, and whether a number
 is measured or projected. The TSV files hold the detailed run records and
@@ -61,11 +61,12 @@ scheduler.
 
 ## Fixture helpers
 
-`prepare_multitrait_fixture.py` creates the N=50,000 quantitative panel from
-aligned phenotype and covariate files. Its default output contains 32
-correlated traits, a complete file, a file with per-trait missingness rising
-from 0% to 10%, and a PLINK keep file for making the matching physical PGEN
-subset.
+`prepare_multitrait_fixture.py` creates a quantitative panel from aligned
+phenotype and covariate files. By default it selects equal-sized group strata;
+`--all-samples` retains the full source cohort and its original group
+proportions. Its output contains 32 correlated traits, a complete file, a file
+with per-trait missingness rising from 0% to 10%, and a PLINK keep file for
+making a matching physical PGEN subset.
 
 `prepare_nongaussian_fixture.py` derives eight binary traits with prevalences
 from 1% to 50% and eight survival models with event fractions from 10% to 80%.
@@ -88,8 +89,10 @@ Stage 2:
   phase timings, correction-heavy runs, and validation.
 - [`results/2026-07-20-step2-trait-matrix.tsv`](results/2026-07-20-step2-trait-matrix.tsv) — measured A100/N2 score-only
   matrix and GPU telemetry.
-- [`results/2026-07-20-step2-cost-projection.tsv`](results/2026-07-20-step2-cost-projection.tsv) — explicit N=50,000,
-  M=10,000,000 compute-only projection arithmetic.
+- [`results/2026-07-20-step2-sample-scaling.tsv`](results/2026-07-20-step2-sample-scaling.tsv) — matched N=50,000 and
+  N=500,000 runs for 32 quantitative, binary, and survival traits.
+- [`results/2026-07-20-step2-cost-projection.tsv`](results/2026-07-20-step2-cost-projection.tsv) — M=10,000,000
+  worker-count scenarios with aggregate fleet cost stated explicitly.
 - [`results/2026-07-20-step2-prices.tsv`](results/2026-07-20-step2-prices.tsv) — cloud price snapshot and source URLs.
 - [`results/2026-07-20-step2.tsv`](results/2026-07-20-step2.tsv) and
   [`results/2026-07-20-step2-integrated.tsv`](results/2026-07-20-step2-integrated.tsv) — earlier CPU and integrated CUDA

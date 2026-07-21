@@ -34,6 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-trait", default="PHENO")
     parser.add_argument("--group-column", default="SUPERPOP")
     parser.add_argument("--samples-per-group", type=int, default=10_000)
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help=(
+            "Use every source sample in input order instead of drawing equal-sized "
+            "group strata."
+        ),
+    )
     parser.add_argument("--traits", type=int, default=32)
     parser.add_argument("--trait-correlation", type=float, default=0.4)
     parser.add_argument("--max-missing-rate", type=float, default=0.1)
@@ -102,6 +110,9 @@ def select_samples(args: argparse.Namespace, rng: np.random.Generator) -> list[S
             )
             seen[group] += 1
             reservoir = reservoirs[group]
+            if args.all_samples:
+                reservoir.append(sample)
+                continue
             if len(reservoir) < args.samples_per_group:
                 reservoir.append(sample)
             else:
@@ -111,9 +122,15 @@ def select_samples(args: argparse.Namespace, rng: np.random.Generator) -> list[S
 
     if not reservoirs:
         raise SystemExit("No samples were read")
-    undersized = {
-        group: count for group, count in seen.items() if count < args.samples_per_group
-    }
+    undersized = (
+        {}
+        if args.all_samples
+        else {
+            group: count
+            for group, count in seen.items()
+            if count < args.samples_per_group
+        }
+    )
     if undersized:
         details = ", ".join(
             f"{group}={count}" for group, count in sorted(undersized.items())
