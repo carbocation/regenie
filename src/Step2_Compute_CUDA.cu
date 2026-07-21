@@ -683,6 +683,10 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       Eigen::MatrixXd& observed_allele_sums,
       Eigen::MatrixXd& observed_nonmissing_counts,
       Step2ComputeTimings* timings) override {
+    // Block scoring may run on the Step 2 pipeline worker thread. CUDA's
+    // selected device is thread-local, so select it explicitly here rather
+    // than relying on the thread that prepared the chromosome.
+    check_cuda(cudaSetDevice(device_), "select CUDA device for Step 2 score");
     if(!ready() || samples != samples_ || packed_hardcalls.empty())
       return false;
     const int variants = static_cast<int>(packed_hardcalls.size());

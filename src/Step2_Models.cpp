@@ -50,7 +50,11 @@ using boost::math::normal;
 using boost::math::chi_squared;
 
 
-void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, struct in_files& files, struct filter const& filters, struct phenodt const& pheno_data, struct param& params, mstream& sout) {
+MatrixXd read_loco_predictions_for_chromosome(int const& chrom,
+    const Ref<const MatrixXd>& ltco_prs, struct in_files const& files,
+    struct filter const& filters, struct phenodt const& pheno_data,
+    struct param const& params, const Ref<const ArrayXb>& phenotypes_to_read,
+    mstream& sout) {
 
   string line, filename, tmp_pheno;
   std::vector< string > id_strings, tmp_str_vec ;
@@ -58,19 +62,13 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
   uint32_t indiv_index;
   Files blupf;
 
-  // skip reading if specified by user or if PRS is given (same for all chromosomes)
-  if( params.use_prs || params.skip_blups ) return;
-
-  m_ests.blups = MatrixXd::Zero(params.n_samples, params.n_pheno);
-
-  if(!silent) sout << "   -reading loco predictions for the chromosome..." << flush;
-  auto t1 = std::chrono::high_resolution_clock::now();
+  MatrixXd blups = MatrixXd::Zero(params.n_samples, params.n_pheno);
 
   // read blup file for each phenotype
   for(int ph = 0; ph < params.n_pheno; ph++) {
-    if( !params.pheno_pass(ph) ) continue;
+    if(!phenotypes_to_read(ph)) continue;
 
-    filename = files.blup_files[ files.pheno_names[ph] ];
+    filename = files.blup_files.at(files.pheno_names[ph]);
     ArrayXb read_indiv = ArrayXb::Constant(params.n_samples, false);
     blupf.openForRead(filename, sout);
 
@@ -100,7 +98,7 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
 
       // ignore sample if it is not in genotype data
       if (!in_map(id_strings[filecol], params.FID_IID_to_ind)) continue;
-      indiv_index = params.FID_IID_to_ind[id_strings[filecol]];
+      indiv_index = params.FID_IID_to_ind.at(id_strings[filecol]);
 
       // ignore sample if it is not included in analysis
       if(!filters.ind_in_analysis(indiv_index)) continue;
@@ -121,9 +119,9 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
         throw "individual has missing predictions (FID_IID=" + id_strings[filecol] + ";chr=" + to_string( chrom ) + ";phenotype=" + files.pheno_names[ph] + 
           "). Either ignore these individuals using option '--remove', or skip reading predictions with option '--ignore-pred'.\n" + params.err_help ;
       else if(params.w_ltco && (chrom != params.ltco_chr)) // use ltco
-        m_ests.blups(indiv_index, ph) = in_blup - m_ests.ltco_prs(indiv_index, ph);
+        blups(indiv_index, ph) = in_blup - ltco_prs(indiv_index, ph);
       else // loco
-        m_ests.blups(indiv_index, ph) = in_blup;
+        blups(indiv_index, ph) = in_blup;
     }
 
     // force all non-masked samples to have loco predictions
@@ -132,15 +130,32 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
       throw "all samples included in the analysis (for phenotype " +
         files.pheno_names[ph] + ") must have LOCO predictions in file : " + filename;
 
-    //cerr << m_ests.blups.col(ph).head(5)<<endl;
+    //cerr << blups.col(ph).head(5)<<endl;
 
     blupf.closeFile();
   }
 
+  return blups;
+}
+
+void blup_read_chr(bool const& silent, int const& chrom,
+    struct ests& m_ests, struct in_files& files,
+    struct filter const& filters, struct phenodt const& pheno_data,
+    struct param& params, mstream& sout) {
+
+  // skip reading if specified by user or if PRS is given (same for all chromosomes)
+  if(params.use_prs || params.skip_blups) return;
+
+  if(!silent)
+    sout << "   -reading loco predictions for the chromosome..." << flush;
+  const auto t1 = std::chrono::high_resolution_clock::now();
+  m_ests.blups = read_loco_predictions_for_chromosome(chrom,
+    m_ests.ltco_prs, files, filters, pheno_data, params,
+    params.pheno_pass, sout);
   if(silent) return;
 
   sout << "done";
-  auto t2 = std::chrono::high_resolution_clock::now();
+  const auto t2 = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
   sout << " (" << duration.count() << "ms) "<< endl;
 

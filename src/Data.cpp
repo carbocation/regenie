@@ -85,6 +85,36 @@ double elapsed_ms(const ProfileClock::time_point& start) {
   return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
 }
 
+struct Step2PipelineBlock {
+  int chrom = 0;
+  int block_number = 0;
+  int variant_count = 0;
+  ProfileClock::time_point wall_start;
+  std::vector<uint64> indices;
+  std::vector<variant_block> variants;
+  std::vector<std::vector<uchar>> encoded_variants;
+  std::vector<uint32_t> input_sizes;
+  std::vector<uint32_t> output_sizes;
+  std::vector<std::vector<unsigned char>> packed_hardcalls;
+  std::vector<double> missing_means;
+  std::vector<unsigned char> flipped;
+  std::vector<unsigned char> sparse;
+};
+
+struct Step2PipelineScoreResult {
+  bool valid = false;
+  Eigen::MatrixXd numerators;
+  Eigen::MatrixXd denominators;
+  Eigen::MatrixXd observed_allele_sums;
+  Eigen::MatrixXd observed_nonmissing_counts;
+  Step2ComputeTimings timings;
+};
+
+struct Step2LocoPrefetchResult {
+  Eigen::MatrixXd predictions;
+  double service_ms = 0;
+};
+
 class ScopedProfileTimer {
   public:
     explicit ScopedProfileTimer(double* elapsed_ms)
@@ -3680,8 +3710,65 @@ void Data::test_snps_fast() {
     step2_profile.setup_ms += elapsed_ms(profile_stage_start);
   }
 
+  const auto write_block_results = [&](const vector<variant_block>& variants) {
+    ProfileClock::time_point output_start;
+    if(params.profile_step2) output_start = ProfileClock::now();
+    for(auto const& snp_data : variants) {
+      if(snp_data.ignored) {
+        snp_tally.n_ignored_snps++;
+        continue;
+      }
 
-  for(auto const& chrom : files.chr_read) {
+      snp_tally.n_ignored_tests += snp_data.ignored_trait.count();
+      if(params.firth || params.use_SPA) {
+        n_corrected +=
+          (!snp_data.ignored_trait && snp_data.is_corrected).count();
+        snp_tally.n_failed_tests +=
+          (!snp_data.ignored_trait && snp_data.test_fail).count();
+        if(params.w_interaction) {
+          n_corrected += (2 + params.ncov_interaction) *
+            snp_data.is_corrected_inter.count();
+          snp_tally.n_failed_tests += (2 + params.ncov_interaction) *
+            (snp_data.is_corrected_inter &&
+             snp_data.test_fail_inter).count();
+        }
+      }
+
+      for(int phenotype = 0; phenotype < params.n_pheno; ++phenotype) {
+        if(!params.pheno_pass(phenotype) ||
+           snp_data.ignored_trait(phenotype)) {
+          if(!params.split_by_pheno)
+            ofile << snp_data.sum_stats[phenotype];
+          continue;
+        }
+        if(params.split_by_pheno)
+          (*ofile_split[phenotype]) << snp_data.sum_stats[phenotype];
+        else
+          ofile << snp_data.sum_stats[phenotype];
+      }
+    }
+    if(params.profile_step2)
+      step2_profile.output_ms += elapsed_ms(output_start);
+  };
+  bool step2_pipeline_notice_printed = false;
+  const bool step2_null_is_chromosome_invariant =
+    !params.getCorMat &&
+    (params.skip_blups || params.use_prs) &&
+    !params.firth && !params.use_SPA && !params.w_interaction &&
+    (params.trait_mode == 0 || params.trait_mode == 1 ||
+     params.trait_mode == 3);
+  bool step2_invariant_null_ready = false;
+  bool step2_invariant_null_notice_printed = false;
+  std::future<Step2LocoPrefetchResult> step2_loco_prefetch_future;
+  bool step2_loco_prefetch_pending = false;
+  int step2_loco_prefetch_chromosome = 0;
+  bool step2_loco_prefetch_notice_printed = false;
+
+
+  for(size_t chromosome_index = 0;
+      chromosome_index < files.chr_read.size(); ++chromosome_index) {
+
+    const int chrom = files.chr_read[chromosome_index];
 
     if( !in_map(chrom, chr_map) ) continue;
 
@@ -3700,29 +3787,300 @@ void Data::test_snps_fast() {
     if(params.profile_step2) step2_profile.chromosomes++;
 
     if(!params.getCorMat){
-      // read polygenic effect predictions from step 1
-      if(params.profile_step2) profile_stage_start = ProfileClock::now();
-      blup_read_chr(false, chrom, m_ests, files, in_filters, pheno_data, params, sout);
-      if(params.profile_step2) {
-        step2_profile.prediction_read_ms += elapsed_ms(profile_stage_start);
-        profile_stage_start = ProfileClock::now();
-      }
+      const bool reuse_invariant_null =
+        step2_null_is_chromosome_invariant &&
+        step2_invariant_null_ready;
 
-      // compute phenotype residual (adjusting for BLUP [and covariates for non-QTs])
-      if(params.trait_mode == 1) compute_res_bin(chrom);
-      else if(params.trait_mode == 2) compute_res_count(chrom);
-      else if(params.trait_mode == 3) compute_res_cox(chrom);
-      else compute_res();
-      prepare_step2_compute_backend();
-      if(params.profile_step2)
-        step2_profile.null_model_ms += elapsed_ms(profile_stage_start);
+      // read polygenic effect predictions from step 1
+      if(!reuse_invariant_null) {
+        if(params.profile_step2) profile_stage_start = ProfileClock::now();
+        if(step2_loco_prefetch_pending &&
+           step2_loco_prefetch_chromosome == chrom) {
+          sout << "   -using prefetched loco predictions for the chromosome..." <<
+            flush;
+          const ProfileClock::time_point wait_start = ProfileClock::now();
+          Step2LocoPrefetchResult prefetched =
+            step2_loco_prefetch_future.get();
+          const double wait_ms = elapsed_ms(wait_start);
+          step2_loco_prefetch_pending = false;
+          m_ests.blups.swap(prefetched.predictions);
+          sout << "done (" << static_cast<long long>(
+            prefetched.service_ms) << "ms service; " <<
+            static_cast<long long>(wait_ms) << "ms wait)" << endl;
+        } else {
+          blup_read_chr(false, chrom, m_ests, files, in_filters,
+            pheno_data, params, sout);
+        }
+        if(params.profile_step2) {
+          step2_profile.prediction_read_ms +=
+            elapsed_ms(profile_stage_start);
+          profile_stage_start = ProfileClock::now();
+        }
+
+        const bool can_prefetch_loco =
+          !params.skip_blups && !params.use_prs &&
+          (params.trait_mode == 0 || params.trait_mode == 1) &&
+          !params.firth && !params.use_SPA && !params.w_interaction &&
+          params.file_type == "pgen" && params.start_block <= 1 &&
+          step2_compute_backend &&
+          std::string(step2_compute_backend->name()) == "cuda";
+        if(can_prefetch_loco && !step2_loco_prefetch_pending) {
+          int next_chromosome = 0;
+          for(size_t next_index = chromosome_index + 1;
+              next_index < files.chr_read.size(); ++next_index) {
+            const int candidate = files.chr_read[next_index];
+            const std::map<int, std::vector<int>>::const_iterator entry =
+              chr_map.find(candidate);
+            if(entry == chr_map.end() || entry->second[1] == 0) continue;
+            next_chromosome = candidate;
+            break;
+          }
+          if(next_chromosome != 0) {
+            if(!step2_loco_prefetch_notice_printed) {
+              sout << " * Step 2 LOCO prediction prefetch : [enabled]\n";
+              step2_loco_prefetch_notice_printed = true;
+            }
+            step2_loco_prefetch_chromosome = next_chromosome;
+            const ArrayXb phenotypes_to_read = params.pheno_pass;
+            step2_loco_prefetch_future = std::async(std::launch::async,
+              [this, next_chromosome, phenotypes_to_read]() {
+                Step2LocoPrefetchResult result;
+                const ProfileClock::time_point service_start =
+                  ProfileClock::now();
+                result.predictions =
+                  read_loco_predictions_for_chromosome(next_chromosome,
+                    m_ests.ltco_prs, files, in_filters, pheno_data,
+                    params, phenotypes_to_read, sout);
+                result.service_ms = elapsed_ms(service_start);
+                return result;
+              });
+            step2_loco_prefetch_pending = true;
+          }
+        }
+
+        // compute phenotype residual (adjusting for BLUP [and covariates for non-QTs])
+        if(params.trait_mode == 1) compute_res_bin(chrom);
+        else if(params.trait_mode == 2) compute_res_count(chrom);
+        else if(params.trait_mode == 3) compute_res_cox(chrom);
+        else compute_res();
+        prepare_step2_compute_backend();
+        if(params.profile_step2)
+          step2_profile.null_model_ms += elapsed_ms(profile_stage_start);
+
+        step2_invariant_null_ready =
+          step2_null_is_chromosome_invariant &&
+          step2_compute_backend->ready();
+      } else if(!step2_invariant_null_notice_printed) {
+        sout << " * Step 2 chromosome-invariant null model : [reused]\n";
+        step2_invariant_null_notice_printed = true;
+      }
 
       // print y/x/logreg offset used for level 1 
       if(params.debug) write_inputs();
     }
 
-    // analyze by blocks of SNPs
-    for(int bb = 0; bb < chrom_nb ; bb++) {
+    bool use_step2_pipeline =
+      step2_compute_backend->ready() && params.file_type == "pgen" &&
+      !params.firth && !params.use_SPA;
+    if(use_step2_pipeline && params.skip_dosage_comp) {
+      const int chromosome_start = snp_tally.snp_count;
+      for(int variant = 0; variant < chrom_nsnps; ++variant) {
+        const int index = chromosome_start + variant;
+        if(in_non_par(chrom, snpinfo[index].physpos, &params)) {
+          use_step2_pipeline = false;
+          break;
+        }
+      }
+    }
+
+    if(use_step2_pipeline) {
+      if(!step2_pipeline_notice_printed) {
+        sout << " * Step 2 CUDA two-block pipeline : [enabled]\n";
+        step2_pipeline_notice_printed = true;
+      }
+
+      const auto read_pipeline_block = [&](const int variant_count,
+                                            const int first_variant,
+                                            const int block_number) {
+        std::shared_ptr<Step2PipelineBlock> work(
+          new Step2PipelineBlock());
+        work->chrom = chrom;
+        work->block_number = block_number;
+        work->variant_count = variant_count;
+        work->wall_start = ProfileClock::now();
+        work->indices.resize(variant_count);
+        std::iota(work->indices.begin(), work->indices.end(), first_variant);
+        work->variants.resize(variant_count);
+        allocate_mat(Gblock.Gmat, params.n_samples, variant_count);
+
+        Gblock.step2_backend_scores_valid = false;
+        Gblock.step2_backend_trait_counts_valid = false;
+        const ProfileClock::time_point read_start = ProfileClock::now();
+        readChunk(work->indices, chrom, work->encoded_variants,
+          work->input_sizes, work->output_sizes, work->variants);
+        if(params.profile_step2)
+          step2_profile.genotype_io_ms += elapsed_ms(read_start);
+
+        work->packed_hardcalls.swap(
+          Gblock.step2_pgen_packed_hardcalls);
+        work->missing_means.swap(Gblock.step2_pgen_packed_means);
+        Gblock.step2_pgen_packed_unexpanded.clear();
+        work->flipped.resize(variant_count, 0);
+        work->sparse.resize(variant_count, 0);
+        for(int variant = 0; variant < variant_count; ++variant) {
+          work->flipped[variant] =
+            work->variants[variant].flipped ? 1 : 0;
+          work->sparse[variant] =
+            work->variants[variant].n_zero >=
+              params.n_samples * params.prop_zero_thr ? 1 : 0;
+        }
+        return work;
+      };
+
+      const auto submit_pipeline_score =
+        [&](const std::shared_ptr<Step2PipelineBlock>& work) {
+          Step2ComputeBackend* backend = step2_compute_backend.get();
+          const Eigen::Index samples = params.n_samples;
+          const bool profile = params.profile_step2;
+          return std::async(std::launch::async,
+            [backend, work, samples, profile]() {
+              Step2PipelineScoreResult result;
+              result.valid = backend->score_packed_block(
+                work->packed_hardcalls, work->missing_means,
+                work->flipped, work->sparse, samples,
+                result.numerators, result.denominators,
+                result.observed_allele_sums,
+                result.observed_nonmissing_counts,
+                profile ? &result.timings : nullptr);
+              return result;
+            });
+        };
+
+      const auto accumulate_pipeline_timings =
+        [&](const Step2ComputeTimings& timings) {
+          step2_compute_timings.scored_blocks += timings.scored_blocks;
+          step2_compute_timings.scored_variants += timings.scored_variants;
+          step2_compute_timings.packed_upload_bytes +=
+            timings.packed_upload_bytes;
+          step2_compute_timings.host_pack_ms += timings.host_pack_ms;
+          step2_compute_timings.upload_ms += timings.upload_ms;
+          step2_compute_timings.kernel_ms += timings.kernel_ms;
+          step2_compute_timings.download_ms += timings.download_ms;
+          step2_compute_timings.wall_ms += timings.wall_ms;
+        };
+
+      const auto finish_pipeline_block =
+        [&](const std::shared_ptr<Step2PipelineBlock>& work,
+            Step2PipelineScoreResult& score,
+            const ProfileClock::time_point& compute_start) {
+          sout << " block [" << work->block_number << "/" <<
+            params.total_n_block << "] : " << flush;
+          if(params.profile_step2)
+            accumulate_pipeline_timings(score.timings);
+          Gblock.step2_backend_scores_valid = score.valid;
+          Gblock.step2_backend_score_numerators.swap(score.numerators);
+          Gblock.step2_backend_score_denominators.swap(score.denominators);
+          Gblock.step2_backend_observed_allele_sums.swap(
+            score.observed_allele_sums);
+          Gblock.step2_backend_observed_nonmissing_counts.swap(
+            score.observed_nonmissing_counts);
+          Gblock.step2_backend_trait_counts_valid =
+            score.valid &&
+            Gblock.step2_backend_observed_allele_sums.rows() ==
+              params.n_pheno &&
+            Gblock.step2_backend_observed_allele_sums.cols() ==
+              work->variant_count &&
+            Gblock.step2_backend_observed_nonmissing_counts.rows() ==
+              params.n_pheno &&
+            Gblock.step2_backend_observed_nonmissing_counts.cols() ==
+              work->variant_count;
+          if(!score.valid)
+            throw "Step 2 pipelined packed scoring failed";
+
+          if(Gblock.step2_backend_trait_counts_valid) {
+            for(int variant = 0; variant < work->variant_count; ++variant) {
+              variant_block& variant_info = work->variants[variant];
+              const snp& marker = snpinfo[work->indices[variant]];
+              const double mac_threshold = marker.apply_diff_MAC_filter ?
+                params.forced_MAC : params.min_MAC;
+              for(int phenotype = 0; phenotype < params.n_pheno;
+                  ++phenotype) {
+                const int nonmissing = static_cast<int>(
+                  Gblock.step2_backend_observed_nonmissing_counts(
+                    phenotype, variant));
+                const double allele_sum =
+                  Gblock.step2_backend_observed_allele_sums(
+                    phenotype, variant);
+                variant_info.ns(phenotype) = nonmissing;
+                variant_info.af(phenotype) = nonmissing > 0 ?
+                  allele_sum / (2.0 * nonmissing) : 0;
+                variant_info.mac(phenotype) = std::min(
+                  allele_sum, 2.0 * nonmissing - allele_sum);
+                variant_info.ignored_trait(phenotype) =
+                  marker.MAC_fail_if_checked &&
+                  variant_info.mac(phenotype) < mac_threshold;
+              }
+            }
+          }
+
+          compute_tests_mt(work->chrom, work->indices,
+            work->encoded_variants, work->input_sizes,
+            work->output_sizes, work->variants);
+          if(params.profile_step2)
+            step2_profile.variant_compute_ms += elapsed_ms(compute_start);
+          write_block_results(work->variants);
+          sout << "done (" << static_cast<long long>(
+            elapsed_ms(work->wall_start)) << "ms) " << endl;
+        };
+
+      std::shared_ptr<Step2PipelineBlock> pending_work;
+      std::future<Step2PipelineScoreResult> pending_score;
+      bool pipeline_pending = false;
+      for(int bb = 0; bb < chrom_nb; ++bb) {
+        get_block_size(params.block_size, chrom_nsnps, bb, bs);
+
+        if(!block_init_pass && (params.start_block > (block + 1))) {
+          snp_tally.snp_count += bs;
+          block++;
+          continue;
+        } else if(!block_init_pass) {
+          block_init_pass = true;
+        }
+
+        if(params.profile_step2) {
+          step2_profile.blocks++;
+          step2_profile.variants += bs;
+        }
+        std::shared_ptr<Step2PipelineBlock> current_work =
+          read_pipeline_block(bs, snp_tally.snp_count, block + 1);
+        snp_tally.snp_count += bs;
+        block++;
+
+        if(!pipeline_pending) {
+          pending_work = current_work;
+          pending_score = submit_pipeline_score(pending_work);
+          pipeline_pending = true;
+          continue;
+        }
+
+        const ProfileClock::time_point compute_start = ProfileClock::now();
+        Step2PipelineScoreResult completed_score = pending_score.get();
+        std::future<Step2PipelineScoreResult> current_score =
+          submit_pipeline_score(current_work);
+        finish_pipeline_block(pending_work, completed_score, compute_start);
+        pending_work = current_work;
+        pending_score = std::move(current_score);
+      }
+
+      if(pipeline_pending) {
+        const ProfileClock::time_point compute_start = ProfileClock::now();
+        Step2PipelineScoreResult completed_score = pending_score.get();
+        finish_pipeline_block(pending_work, completed_score, compute_start);
+      }
+
+    } else {
+      // analyze by blocks of SNPs
+      for(int bb = 0; bb < chrom_nb ; bb++) {
 
       get_block_size(params.block_size, chrom_nsnps, bb, bs);
 
@@ -3744,49 +4102,12 @@ void Data::test_snps_fast() {
         step2_profile.variants += bs;
       }
       analyze_block(chrom, bs, &snp_tally, block_info);
+      write_block_results(block_info);
 
-      // print the results
-      if(params.profile_step2) profile_stage_start = ProfileClock::now();
-      for (auto const& snp_data : block_info){
-
-        if( snp_data.ignored ) {
-          snp_tally.n_ignored_snps++;
-          continue;
-        }
-
-        snp_tally.n_ignored_tests += snp_data.ignored_trait.count();
-        if(params.firth || params.use_SPA) {
-          n_corrected += (!snp_data.ignored_trait && snp_data.is_corrected).count();
-          snp_tally.n_failed_tests += (!snp_data.ignored_trait && snp_data.test_fail).count();
-          if(params.w_interaction) {
-            n_corrected += (2 + params.ncov_interaction) * snp_data.is_corrected_inter.count(); // main, inter & joint
-            snp_tally.n_failed_tests += (2 + params.ncov_interaction) * (snp_data.is_corrected_inter && snp_data.test_fail_inter).count(); // main, inter & joint
-          }
-        }
-
-        for(int j = 0; j < params.n_pheno; ++j) {
-
-          if( !params.pheno_pass(j) || snp_data.ignored_trait(j) ) {
-            if(!params.split_by_pheno) // if using single file, print NAs for snp/trait sum stats
-              ofile << snp_data.sum_stats[j];
-
-            continue;
-          }
-
-          if(params.split_by_pheno)
-            (*ofile_split[j]) << snp_data.sum_stats[j]; // add test info
-          else
-            ofile << snp_data.sum_stats[j]; // add test info
-        }
-
+        snp_tally.snp_count += bs;
+        block++;
       }
-      if(params.profile_step2)
-        step2_profile.output_ms += elapsed_ms(profile_stage_start);
-
-      snp_tally.snp_count += bs;
-      block++;
     }
-
   }
 
   if(params.profile_step2) profile_stage_start = ProfileClock::now();

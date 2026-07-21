@@ -50,6 +50,10 @@ struct spa_data {
 };
 
 void blup_read_chr(bool const&,int const&,struct ests&,struct in_files&,struct filter const&,struct phenodt const&,struct param&,mstream&);
+Eigen::MatrixXd read_loco_predictions_for_chromosome(int const&,
+  const Eigen::Ref<const Eigen::MatrixXd>&, struct in_files const&,
+  struct filter const&, struct phenodt const&, struct param const&,
+  const Eigen::Ref<const ArrayXb>&, mstream&);
 
 // score tests
 /* // for all snps/traits
