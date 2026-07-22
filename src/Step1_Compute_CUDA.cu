@@ -1482,6 +1482,126 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
     }
 
+    bool grouped_predict_cached_design_partitions(
+      const Eigen::Ref<const Eigen::MatrixXd>& coefficients,
+      const Eigen::Ref<const Eigen::VectorXi>& row_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+      const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+      Eigen::MatrixXd& predictions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_valid_) return false;
+      if(coefficients.rows() != resident_design_columns_ ||
+         coefficients.cols() != row_offsets.size() ||
+         row_offsets.size() != row_counts.size() ||
+         group_offsets.size() != group_sizes.size())
+        throw std::invalid_argument(
+          "Step 1 cached grouped prediction received incompatible dimensions");
+      if(!coefficients.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached grouped prediction requires finite coefficients");
+      for(Eigen::Index partition = 0;
+          partition < row_offsets.size(); ++partition)
+        if(row_offsets(partition) < 0 || row_counts(partition) < 0 ||
+           row_offsets(partition) >
+             resident_design_rows_ - row_counts(partition))
+          throw std::invalid_argument(
+            "Step 1 cached grouped prediction received an invalid row partition");
+      for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
+        if(group_offsets(group) < 0 || group_sizes(group) < 0 ||
+           group_offsets(group) >
+             resident_design_columns_ - group_sizes(group))
+          throw std::invalid_argument(
+            "Step 1 cached grouped prediction received an invalid feature group");
+
+      predictions.resize(resident_design_rows_, group_offsets.size());
+      predictions.setZero();
+      if(resident_design_rows_ == 0 || group_offsets.size() == 0)
+        return true;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int group_count = checked_int(
+        group_offsets.size(), "cached grouped prediction group count");
+      const int design_rows = checked_int(
+        resident_design_rows_, "cached grouped prediction design rows");
+      const int design_columns = checked_int(
+        resident_design_columns_,
+        "cached grouped prediction design columns");
+      Eigen::Index maximum_rows = 0;
+      for(Eigen::Index partition = 0;
+          partition < row_counts.size(); ++partition)
+        maximum_rows = std::max<Eigen::Index>(
+          maximum_rows, row_counts(partition));
+      ensure_capacity(d_inverse_, inverse_capacity_, design_columns,
+        "cudaMalloc(cached grouped prediction coefficients)");
+      ensure_capacity(d_predictions_, predictions_capacity_,
+        maximum_rows * group_count,
+        "cudaMalloc(cached grouped predictions)");
+
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      for(Eigen::Index partition = 0;
+          partition < row_offsets.size(); ++partition) {
+        const Eigen::Index start_index = row_offsets(partition);
+        const Eigen::Index count_index = row_counts(partition);
+        const int start = checked_int(
+          start_index, "cached grouped prediction row offset");
+        const int count = checked_int(
+          count_index, "cached grouped prediction row count");
+        if(count == 0) continue;
+
+        ComputeClock::time_point transfer_start;
+        if(timings) transfer_start = ComputeClock::now();
+        if(design_columns > 0)
+          check_cuda(cudaMemcpy(d_inverse_, coefficients.col(partition).data(),
+            static_cast<size_t>(design_columns) * sizeof(double),
+            cudaMemcpyHostToDevice),
+            "copy cached grouped prediction coefficients to CUDA device");
+        if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+        std::unique_ptr<CudaEventPair> prediction_events;
+        if(timings) {
+          prediction_events.reset(new CudaEventPair());
+          prediction_events->record_start();
+        }
+        for(int group = 0; group < group_count; ++group) {
+          const int group_size = group_sizes(group);
+          double* group_predictions = d_predictions_ + group * count;
+          if(group_size > 0)
+            check_cublas(cublasDgemv(handle_, CUBLAS_OP_N,
+              count, group_size, &alpha,
+              resident_design_data() + start +
+                static_cast<Eigen::Index>(group_offsets(group)) *
+                  design_rows,
+              design_rows, d_inverse_ + group_offsets(group), 1,
+              &beta, group_predictions, 1),
+              "cublasDgemv(cached grouped prediction partition)");
+          else
+            check_cuda(cudaMemset(group_predictions, 0,
+              static_cast<size_t>(count) * sizeof(double)),
+              "clear empty cached grouped prediction partition");
+        }
+        if(timings)
+          timings->ridge_ms +=
+            prediction_events->record_stop_and_elapsed_ms();
+
+        if(timings) transfer_start = ComputeClock::now();
+        for(int group = 0; group < group_count; ++group)
+          check_cuda(cudaMemcpy(
+            predictions.col(group).segment(start_index, count_index).data(),
+            d_predictions_ + group * count,
+            static_cast<size_t>(count) * sizeof(double),
+            cudaMemcpyDeviceToHost),
+            "copy cached grouped prediction partition from CUDA device");
+        if(timings) {
+          timings->download_ms += elapsed_ms(transfer_start);
+          timings->resident_design_reuse_count++;
+        }
+      }
+      return true;
+    }
+
     void compute_cached_weighted_design_products(
       const Eigen::Ref<const Eigen::VectorXd>& weights,
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
@@ -3481,13 +3601,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           gram_events.reset(new CudaEventPair());
           gram_events->record_start();
         }
-        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-          features, features, count, &alpha,
-          d_genotypes_, count, d_projected_, count, &beta,
-          d_gram_, features), "cublasDgemm(weighted Gram chunk)");
+        compute_weighted_gram_lower_tiles(
+          d_genotypes_, d_projected_, count, features, beta);
         if(timings)
           timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
       }
+
+      const dim3 mirror_threads(16, 16);
+      const dim3 mirror_blocks(
+        (features + mirror_threads.x - 1) / mirror_threads.x,
+        (features + mirror_threads.y - 1) / mirror_threads.y);
+      mirror_lower_triangle<<<mirror_blocks, mirror_threads>>>(
+        d_gram_, features);
+      check_cuda(cudaGetLastError(), "mirror weighted Gram matrix kernel");
 
       ComputeClock::time_point transfer_start;
       if(timings) transfer_start = ComputeClock::now();
@@ -5045,6 +5171,28 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    void compute_weighted_gram_lower_tiles(
+      const double* design, const double* weighted_design,
+      int rows, int features, double beta) {
+
+      // Retain the optimized GEMM path while skipping off-diagonal work in
+      // the upper triangle. The completed lower triangle is mirrored later.
+      const int tile_size = 256;
+      const double alpha = 1.0;
+      for(int column = 0; column < features; column += tile_size) {
+        const int columns = std::min(tile_size, features - column);
+        for(int row = column; row < features; row += tile_size) {
+          const int rows_in_tile = std::min(tile_size, features - row);
+          check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+            rows_in_tile, columns, rows, &alpha,
+            design + static_cast<size_t>(row) * rows, rows,
+            weighted_design + static_cast<size_t>(column) * rows, rows,
+            &beta, d_gram_ + row + static_cast<size_t>(column) * features,
+            features), "cublasDgemm(weighted lower Gram tile)");
+        }
+      }
+    }
+
     void compute_cached_weighted_design_products_device(
       const Eigen::Ref<const Eigen::VectorXd>& weights,
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
@@ -5135,11 +5283,16 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         gram_events.reset(new CudaEventPair());
         gram_events->record_start();
       }
-      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-        features, features, rows, &alpha,
-        resident_design_data(), rows, d_projected_, rows, &beta,
-        d_gram_, features),
-        "cublasDgemm(cached weighted Gram matrix)");
+      compute_weighted_gram_lower_tiles(
+        resident_design_data(), d_projected_, rows, features, beta);
+      const dim3 mirror_threads(16, 16);
+      const dim3 mirror_blocks(
+        (features + mirror_threads.x - 1) / mirror_threads.x,
+        (features + mirror_threads.y - 1) / mirror_threads.y);
+      mirror_lower_triangle<<<mirror_blocks, mirror_threads>>>(
+        d_gram_, features);
+      check_cuda(cudaGetLastError(),
+        "mirror cached weighted Gram matrix kernel");
       if(timings) {
         timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
         timings->resident_design_reuse_count++;

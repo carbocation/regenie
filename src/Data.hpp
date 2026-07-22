@@ -103,6 +103,10 @@ struct Step1Profile {
   uint64_t prediction_output_rows = 0;
   uint64_t prediction_output_values = 0;
   uint64_t prediction_output_threads = 0;
+  double prediction_output_read_l0_ms = 0;
+  double prediction_output_read_cache_ms = 0;
+  double prediction_output_check_l0_ms = 0;
+  double prediction_output_model_ms = 0;
   double prediction_output_format_ms = 0;
   double prediction_output_write_ms = 0;
   Step1GroupedPredictionProfile grouped_prediction;
@@ -223,6 +227,7 @@ class Data {
       const Eigen::Ref<const Eigen::VectorXi>&,
       const Eigen::Ref<const Eigen::VectorXi>&,
       Eigen::MatrixXd&);
+    bool read_level1_prediction_cache(int const&);
     void print_snp_betas(const Eigen::Ref<const Eigen::VectorXd>&);
     void write_predictions(int const&);
     std::string write_ID_header(std::vector<uint32_t>&);

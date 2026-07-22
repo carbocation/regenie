@@ -1907,6 +1907,50 @@ void run_conformance(Step1ComputeBackend& candidate) {
     const Eigen::VectorXd expected_resident_predictions =
       resident_design * resident_coefficients;
 
+    Eigen::VectorXi resident_group_offsets(3);
+    resident_group_offsets << 0, 2, 5;
+    Eigen::VectorXi resident_group_sizes(3);
+    resident_group_sizes << 2, 3, 1;
+    Eigen::VectorXi resident_partition_offsets(3);
+    resident_partition_offsets << 0, 7, 18;
+    Eigen::VectorXi resident_partition_sizes(3);
+    resident_partition_sizes << 7, 11, 5;
+    const Eigen::MatrixXd resident_group_coefficients =
+      deterministic_matrix(6, 3, 0.43);
+    Eigen::MatrixXd resident_group_predictions;
+    const bool resident_group_supported =
+      candidate.grouped_predict_cached_design_partitions(
+        resident_group_coefficients, resident_partition_offsets,
+        resident_partition_sizes, resident_group_offsets,
+        resident_group_sizes, resident_group_predictions,
+        &resident_design_timings);
+    if(std::string(candidate.name()) == "cuda" &&
+       !resident_group_supported)
+      throw std::runtime_error(
+        "CUDA backend did not support cached grouped prediction");
+    Eigen::MatrixXd expected_resident_group_predictions(23, 3);
+    for(Eigen::Index partition = 0;
+        partition < resident_partition_offsets.size(); ++partition)
+      for(Eigen::Index group = 0;
+          group < resident_group_offsets.size(); ++group)
+        expected_resident_group_predictions.col(group).segment(
+          resident_partition_offsets(partition),
+          resident_partition_sizes(partition)).noalias() =
+            resident_design.middleRows(
+              resident_partition_offsets(partition),
+              resident_partition_sizes(partition)).middleCols(
+                resident_group_offsets(group),
+                resident_group_sizes(group)) *
+            resident_group_coefficients.col(partition).segment(
+              resident_group_offsets(group), resident_group_sizes(group));
+    const double resident_group_prediction_error =
+      resident_group_supported ? relative_error(
+        resident_group_predictions,
+        expected_resident_group_predictions) : 0.0;
+    if(resident_group_prediction_error > 5e-12)
+      throw std::runtime_error(
+        "cached grouped prediction conformance tolerance exceeded");
+
     Eigen::VectorXd resident_weights(23);
     for(Eigen::Index row = 0; row < resident_weights.size(); ++row)
       resident_weights(row) =
@@ -2038,7 +2082,9 @@ void run_conformance(Step1ComputeBackend& candidate) {
        resident_design_timings.resident_design_upload_bytes !=
          static_cast<uint64_t>(resident_design.size()) * sizeof(double) ||
        resident_design_timings.resident_design_reuse_count !=
-         static_cast<uint64_t>(3 + resident_solve_supported) ||
+         static_cast<uint64_t>(
+           3 + resident_solve_supported +
+             (resident_group_supported ? 3 : 0)) ||
        (resident_fold_supported &&
          resident_fold_timings.resident_design_reuse_count != 3))
       throw std::runtime_error(
@@ -2082,6 +2128,8 @@ void run_conformance(Step1ComputeBackend& candidate) {
               << " fused_solve_supported=" << resident_solve_supported
               << " fused_solve_relative_error=" << resident_solve_error
               << " crossproduct_relative_error=" << resident_score_error
+              << " grouped_prediction_relative_error=" <<
+                   resident_group_prediction_error
               << " fold_prediction_relative_error=" <<
                    resident_fold_prediction_error
               << " fold_coefficient_relative_error=" <<

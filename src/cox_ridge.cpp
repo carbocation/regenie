@@ -69,10 +69,11 @@ cox_ridge::cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& X
     _object.resize(_niter + 1);
     _deviance.resize(_niter + 1);
 
-    eta = mask.select(
-        step1_linear_prediction(_compute_backend, Xmat, beta,
-            _resident_design, _timings) + offset_val,
-        0).matrix();
+    Eigen::VectorXd eta_unmasked = offset_val;
+    if(!beta.isZero(0))
+        eta_unmasked += step1_linear_prediction(
+            _compute_backend, Xmat, beta, _resident_design, _timings);
+    eta = mask.select(eta_unmasked, 0).matrix();
     eta_order = survivalData.permute_mtx * eta;
     
     if (null_deviance == -999) {
@@ -95,10 +96,11 @@ void cox_ridge::reset(const survival_data& survivalData, const Eigen::MatrixXd& 
     lambda = lambda_val;
 
     // Calculate eta, eta_order, or other necessary calculations
-    eta = mask.select(
-        step1_linear_prediction(_compute_backend, Xmat, beta,
-            _resident_design, _timings) + offset_val,
-        0).matrix();
+    Eigen::VectorXd eta_unmasked = offset_val;
+    if(!beta.isZero(0))
+        eta_unmasked += step1_linear_prediction(
+            _compute_backend, Xmat, beta, _resident_design, _timings);
+    eta = mask.select(eta_unmasked, 0).matrix();
     eta_order = survivalData.permute_mtx * eta;
 
     _deviance.resize(_niter + 1);

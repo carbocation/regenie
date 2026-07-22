@@ -79,6 +79,7 @@ struct ridgel1 {
   MatrixXb l0_colkeep;
   Eigen::MatrixXd l0_pv_block;
   Eigen::ArrayXi chrom_block, chrom_map_ndiff;
+  Eigen::VectorXi prediction_group_offsets, prediction_group_sizes;
   Eigen::ArrayXd ridge_param_mult;
   Eigen::MatrixXd beta_snp_step1; // MxR
   std::vector<Eigen::MatrixXd> top_snp_pgs;
@@ -96,7 +97,8 @@ double get_poisson_dev(const Eigen::Ref<const Eigen::ArrayXd>& Y, const Eigen::R
 
 void fit_null_cox(bool const&, const int&, struct param*, struct phenodt*, struct ests*, struct in_files*, mstream&, bool const& save_betas = false);
 double getCoxLambdaMax(const Eigen::MatrixXd&, const Eigen::VectorXd&,
-  Step1ComputeBackend* compute_backend = nullptr);
+  Step1ComputeBackend* compute_backend = nullptr,
+  bool resident_design = false);
 
 void ridge_level_0(const int&,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,std::vector<MatrixXb>&,Step1ComputeBackend*,bool,mstream&);
 void ridge_level_0_loocv(const int,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,Step1ComputeBackend*,mstream&);
@@ -134,6 +136,7 @@ void apply_iter_cond(int const&,int const&,int const&,struct ridgel0&,struct rid
 void read_l0(int const&,int const&,struct in_files*,struct param*,struct ridgel1*,mstream&);
 void read_l0_chunk(int const&,int const&,int const&,int const&,const std::string&,struct param*,struct ridgel1*,mstream&);
 void check_l0(int const&,int const&,struct param*,struct ridgel1*,struct phenodt const*,mstream&,bool const& silent_mode = false);
+std::string level1_prediction_cache_path(const struct in_files*, int);
 
 
 uint64 getSize(std::string const& fname);

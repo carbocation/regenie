@@ -1540,7 +1540,8 @@ void print_usage_info(struct param const* params, struct in_files* files, mstrea
     // Step 1
     // 4P + max( B + PRT, PRT) + #chrs [P:#traits;R=#ridge l0;T=#predictions from l0]
     int t_eff = ( params->write_l0_pred ? 1 : params->total_n_block );
-    int p_eff = ( params->write_l0_pred ? 1 : params->n_pheno );
+    int p_eff = ( params->write_l0_pred ?
+      std::min(2, params->n_pheno) : params->n_pheno );
     int b_eff = params->total_n_block;
 
     total_ram = 4 * params->n_pheno + params->nChrom + params->ncov;

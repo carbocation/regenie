@@ -31,6 +31,10 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef WITH_MKL
+#include <mkl_cblas.h>
+#endif
+
 #ifdef WITH_CUDA
 std::unique_ptr<Step1ComputeBackend> make_cuda_step1_compute_backend(int device);
 bool cuda_step1_compute_backend_available(int device, std::string& reason);
@@ -352,6 +356,24 @@ void Step1ComputeBackend::predict_cached_design(
   (void)predictions;
   (void)timings;
   throw std::runtime_error("Step 1 backend has no cached design matrix");
+}
+
+bool Step1ComputeBackend::grouped_predict_cached_design_partitions(
+  const Eigen::Ref<const Eigen::MatrixXd>& coefficients,
+  const Eigen::Ref<const Eigen::VectorXi>& row_offsets,
+  const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+  const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+  const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+  Eigen::MatrixXd& predictions,
+  Step1ComputeTimings* timings) {
+  (void)coefficients;
+  (void)row_offsets;
+  (void)row_counts;
+  (void)group_offsets;
+  (void)group_sizes;
+  (void)predictions;
+  (void)timings;
+  return false;
 }
 
 void Step1ComputeBackend::compute_cached_weighted_design_products(
@@ -708,7 +730,18 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
       crossproduct.noalias() = design.transpose() * outcomes;
       if(timings) timings->crossproduct_ms += elapsed_ms(start);
       if(timings) start = ComputeClock::now();
-      gram.noalias() = design.transpose() * design;
+      gram.setZero();
+#ifdef WITH_MKL
+      cblas_dsyrk(
+        CblasColMajor, CblasLower, CblasTrans,
+        static_cast<MKL_INT>(design.cols()),
+        static_cast<MKL_INT>(design.rows()),
+        1.0, design.data(), static_cast<MKL_INT>(design.rows()),
+        0.0, gram.data(), static_cast<MKL_INT>(gram.rows()));
+#else
+      gram.selfadjointView<Eigen::Lower>().rankUpdate(design.transpose());
+#endif
+      gram.triangularView<Eigen::Upper>() = gram.transpose();
       if(timings) timings->gram_ms += elapsed_ms(start);
     }
 
@@ -741,7 +774,19 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
         (outcomes.array().colwise() * weights.array()).matrix();
       if(timings) timings->crossproduct_ms += elapsed_ms(start);
       if(timings) start = ComputeClock::now();
+#ifdef WITH_MKL
+      gram.setZero();
+      cblas_dgemmt(
+        CblasColMajor, CblasLower, CblasTrans, CblasNoTrans,
+        static_cast<MKL_INT>(design.cols()),
+        static_cast<MKL_INT>(design.rows()),
+        1.0, design.data(), static_cast<MKL_INT>(design.rows()),
+        weighted_design.data(), static_cast<MKL_INT>(weighted_design.rows()),
+        0.0, gram.data(), static_cast<MKL_INT>(gram.rows()));
+      gram.triangularView<Eigen::Upper>() = gram.transpose();
+#else
       gram.noalias() = design.transpose() * weighted_design;
+#endif
       if(timings) timings->gram_ms += elapsed_ms(start);
     }
 

@@ -240,6 +240,15 @@ class Step1ComputeBackend {
       Eigen::VectorXd& predictions,
       Step1ComputeTimings* timings = nullptr);
 
+    virtual bool grouped_predict_cached_design_partitions(
+      const Eigen::Ref<const Eigen::MatrixXd>& coefficients,
+      const Eigen::Ref<const Eigen::VectorXi>& row_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+      const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+      Eigen::MatrixXd& predictions,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void compute_cached_weighted_design_products(
       const Eigen::Ref<const Eigen::VectorXd>& weights,
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,

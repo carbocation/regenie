@@ -360,6 +360,8 @@ void Data::run_step1(){
   set_blocks();
   // some initializations
   setmem();
+  for(int ph = 0; ph < params.n_pheno; ++ph)
+    remove(level1_prediction_cache_path(&files, ph).c_str());
   if(params.profile_step1) {
     step1_profile.initialization_ms = elapsed_ms(profile_run_start);
     profile_stage_start = ProfileClock::now();
@@ -2075,10 +2077,19 @@ void Data::print_step1_final_profile() {
         << " rows=" << step1_profile.prediction_output_rows
         << " values=" << step1_profile.prediction_output_values
         << " threads=" << step1_profile.prediction_output_threads
+        << " read_l0_ms=" << step1_profile.prediction_output_read_l0_ms
+        << " read_cache_ms=" <<
+          step1_profile.prediction_output_read_cache_ms
+        << " check_l0_ms=" << step1_profile.prediction_output_check_l0_ms
+        << " model_ms=" << step1_profile.prediction_output_model_ms
         << " format_ms=" << step1_profile.prediction_output_format_ms
         << " write_ms=" << step1_profile.prediction_output_write_ms
         << " other_ms=" << std::max(0.0,
           step1_profile.output_ms -
+          step1_profile.prediction_output_read_l0_ms -
+          step1_profile.prediction_output_read_cache_ms -
+          step1_profile.prediction_output_check_l0_ms -
+          step1_profile.prediction_output_model_ms -
           step1_profile.prediction_output_format_ms -
           step1_profile.prediction_output_write_ms)
         << "\n";
@@ -2140,6 +2151,11 @@ void Data::prep_l1_models(){
 
   // for chr map
   l1_ests.chrom_map_ndiff = ArrayXi::Zero(params.nChrom);
+  vector<int> prediction_group_chromosomes;
+  build_step1_prediction_groups(files.chr_read, chr_map,
+    params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+    l1_ests.prediction_group_offsets, l1_ests.prediction_group_sizes,
+    prediction_group_chromosomes);
 
 }
 
@@ -2550,16 +2566,77 @@ void Data::step1_grouped_predict(
   profile.host_materialization_ms += timings.host_materialization_ms;
 }
 
+bool Data::read_level1_prediction_cache(int const& ph) {
+  const string path = level1_prediction_cache_path(&files, ph);
+  const uint64_t expected_bytes =
+    static_cast<uint64_t>(params.n_samples) * total_chrs_loco *
+      sizeof(double);
+  if(getSize(path) == 0) return false;
+  if(getSize(path) != expected_bytes)
+    throw std::runtime_error(
+      "temporary Level 1 prediction cache has an invalid size");
+
+  const auto read_start = ProfileClock::now();
+  predictions[0].resize(params.n_samples, total_chrs_loco);
+  ifstream input(path.c_str(), ios::in | ios::binary);
+  if(!input)
+    throw std::runtime_error(
+      "cannot open temporary Level 1 prediction cache");
+  input.read(reinterpret_cast<char*>(predictions[0].data()),
+    static_cast<std::streamsize>(expected_bytes));
+  input.close();
+  if(!input)
+    throw std::runtime_error(
+      "cannot read temporary Level 1 prediction cache");
+  if(remove(path.c_str()) != 0)
+    throw std::runtime_error(
+      "cannot remove temporary Level 1 prediction cache");
+  if(params.profile_step1)
+    step1_profile.prediction_output_read_cache_ms +=
+      elapsed_ms(read_start);
+  return true;
+}
+
 void Data::make_predictions(int const& ph, int const& val) {
 
   sout << "  * making predictions..." << flush;
   auto t1 = std::chrono::high_resolution_clock::now();
   int ph_eff = params.write_l0_pred ? 0 : ph;
 
+  if(read_level1_prediction_cache(ph)) {
+    if(params.test_l0) {
+      VectorXi group_offsets, group_sizes;
+      vector<int> group_chromosomes;
+      build_step1_prediction_groups(files.chr_read, chr_map,
+        params.n_ridge_l0, l1_ests.chrom_map_ndiff,
+        group_offsets, group_sizes, group_chromosomes);
+      for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
+        predictions[0].col(group) +=
+          l1_ests.top_snp_pgs[group_chromosomes[group]].col(ph);
+    }
+    write_predictions(ph);
+    sout << "done";
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1);
+    sout << " (" << duration.count() << "ms) " << endl << endl;
+    return;
+  }
+
   // read in level 0 predictions from file
-  if(params.write_l0_pred)
+  if(params.write_l0_pred) {
+    const auto read_l0_start = ProfileClock::now();
     read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
+    if(params.profile_step1)
+      step1_profile.prediction_output_read_l0_ms +=
+        elapsed_ms(read_l0_start);
+  }
+  const auto check_l0_start = ProfileClock::now();
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  if(params.profile_step1)
+    step1_profile.prediction_output_check_l0_ms +=
+      elapsed_ms(check_l0_start);
+  const auto model_start = ProfileClock::now();
 
   int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
   MatrixXd X1, X2, beta_l1, beta_avg;
@@ -2620,6 +2697,8 @@ void Data::make_predictions(int const& ph, int const& val) {
     for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
       predictions[0].col(group) +=
         l1_ests.top_snp_pgs[group_chromosomes[group]].col(ph);
+  if(params.profile_step1)
+    step1_profile.prediction_output_model_ms += elapsed_ms(model_start);
 
   write_predictions(ph);
 
@@ -2722,10 +2801,30 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
   auto t1 = std::chrono::high_resolution_clock::now();
   int ph_eff = params.write_l0_pred ? 0 : ph;
 
+  if(read_level1_prediction_cache(ph)) {
+    write_predictions(ph);
+    sout << "done";
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1);
+    sout << " (" << duration.count() << "ms) " << endl << endl;
+    return;
+  }
+
   // read in level 0 predictions from file
-  if(params.write_l0_pred)
+  if(params.write_l0_pred) {
+    const auto read_l0_start = ProfileClock::now();
     read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
+    if(params.profile_step1)
+      step1_profile.prediction_output_read_l0_ms +=
+        elapsed_ms(read_l0_start);
+  }
+  const auto check_l0_start = ProfileClock::now();
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  if(params.profile_step1)
+    step1_profile.prediction_output_check_l0_ms +=
+      elapsed_ms(check_l0_start);
+  const auto model_start = ProfileClock::now();
 
   int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
   ArrayXd etavec, pivec, wvec, zvec, score;
@@ -2810,6 +2909,8 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
       group_offsets.size()) = grouped_predictions;
     cum_size_folds += params.cv_sizes(i);
   }
+  if(params.profile_step1)
+    step1_profile.prediction_output_model_ms += elapsed_ms(model_start);
 
   write_predictions(ph);
 
@@ -3085,10 +3186,30 @@ void Data::make_predictions_cox(int const& ph, int const& val) {
   auto t1 = std::chrono::high_resolution_clock::now();
   int ph_eff = params.write_l0_pred ? 0 : ph;
 
+  if(read_level1_prediction_cache(ph)) {
+    write_predictions(ph);
+    sout << "done";
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t2 - t1);
+    sout << " (" << duration.count() << "ms) " << endl << endl;
+    return;
+  }
+
   // read in level 0 predictions from file
-  if(params.write_l0_pred)
+  if(params.write_l0_pred) {
+    const auto read_l0_start = ProfileClock::now();
     read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
+    if(params.profile_step1)
+      step1_profile.prediction_output_read_l0_ms +=
+        elapsed_ms(read_l0_start);
+  }
+  const auto check_l0_start = ProfileClock::now();
   check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  if(params.profile_step1)
+    step1_profile.prediction_output_check_l0_ms +=
+      elapsed_ms(check_l0_start);
+  const auto model_start = ProfileClock::now();
 
   // compute predictor for each chromosome group
   VectorXi group_offsets, group_sizes;
@@ -3108,6 +3229,8 @@ void Data::make_predictions_cox(int const& ph, int const& val) {
       group_offsets.size()) = grouped_predictions;
     cum_size_folds += params.cv_sizes(i);
   }
+  if(params.profile_step1)
+    step1_profile.prediction_output_model_ms += elapsed_ms(model_start);
 
   write_predictions(ph);
 
