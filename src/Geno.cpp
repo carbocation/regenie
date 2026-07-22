@@ -3081,6 +3081,36 @@ void parseSnpfromBed(const int& isnp, const int &chrom, const vector<uchar>& bed
 }
 
 
+namespace {
+
+// The common Step 2 PGEN path has already expanded a hardcall vector and all
+// samples are in the analysis. Traverse each phenotype's compact missing-
+// sample list instead of rescanning every sample and consulting a second
+// sample-to-phenotype indirection for every variant.
+void update_autosomal_trait_counts_by_phenotype(
+    const Eigen::Ref<const Eigen::ArrayXd>& genotypes,
+    variant_block* snp_data,
+    const std::vector<std::vector<int>>& missing_samples_by_phenotype) {
+  for(size_t phenotype = 0;
+      phenotype < missing_samples_by_phenotype.size(); ++phenotype) {
+    double missing_allele_sum = 0;
+    int missing_nonmissing = 0;
+    const std::vector<int>& samples =
+      missing_samples_by_phenotype[phenotype];
+    for(size_t index = 0; index < samples.size(); ++index) {
+      const double genotype = genotypes(samples[index]);
+      if(genotype == -3) continue;
+      missing_allele_sum += genotype;
+      ++missing_nonmissing;
+    }
+    snp_data->af(phenotype) -= missing_allele_sum;
+    snp_data->mac(phenotype) -= missing_allele_sum;
+    snp_data->ns(phenotype) -= missing_nonmissing;
+  }
+}
+
+}  // namespace
+
 // step 2
 void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile, vector<vector<unsigned char>>* retained_packed_hardcalls, bool retain_unexpanded_packed, vector<double>* retained_packed_means, vector<unsigned char>* retained_packed_unexpanded, bool retain_all_packed_hardcalls){
 
@@ -3218,12 +3248,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       // nonmissing counts with the score matrices. Avoid expanding and
       // revisiting the dense genotype solely for this bookkeeping.
       if(has_trait_missingness && !retain_unexpanded_packed) {
-        for(int index = 0; index < Geno.size(); ++index) {
-          const double genotype = Geno(index);
-          if(genotype != -3 && filters->has_missing(index))
-            update_trait_counts(index, genotype, genotype, 0, 0,
-              snp_data, filters->missing_pheno_indices[index]);
-        }
+        update_autosomal_trait_counts_by_phenotype(Geno, snp_data,
+          filters->missing_sample_indices_by_pheno);
       }
       const bool sparse_candidate =
         snp_data->n_zero >=

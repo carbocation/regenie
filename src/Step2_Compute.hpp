@@ -46,6 +46,10 @@ struct Step2ComputeTimings {
   double kernel_ms = 0;
   double download_ms = 0;
   double wall_ms = 0;
+  double linear_crossproduct_ms = 0;
+  double square_materialization_ms = 0;
+  double square_crossproduct_ms = 0;
+  double finalize_ms = 0;
 };
 
 class Step2ComputeBackend {

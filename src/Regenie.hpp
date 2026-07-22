@@ -498,6 +498,7 @@ struct filter {
   std::map <std::string, uint32_t> snpID_to_ind;
   ArrayXb ind_ignore, has_missing, ind_in_analysis;
   std::vector<std::vector<int>> missing_pheno_indices;
+  std::vector<std::vector<int>> missing_sample_indices_by_pheno;
   uint32_t step1_snp_count = 0;
   std::map <std::string, std::vector<int>> setID_to_ind;//chr,index,is_kept
   std::map <std::string, uint64> condition_snp_names;

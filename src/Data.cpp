@@ -555,7 +555,14 @@ void Data::print_step2_profile() {
         << " upload_ms=" << step2_compute_timings.upload_ms
         << " kernel_ms=" << step2_compute_timings.kernel_ms
         << " download_ms=" << step2_compute_timings.download_ms
-        << " wall_ms=" << step2_compute_timings.wall_ms << "\n";
+        << " wall_ms=" << step2_compute_timings.wall_ms
+        << " linear_crossproduct_ms=" <<
+          step2_compute_timings.linear_crossproduct_ms
+        << " square_materialization_ms=" <<
+          step2_compute_timings.square_materialization_ms
+        << " square_crossproduct_ms=" <<
+          step2_compute_timings.square_crossproduct_ms
+        << " finalize_ms=" << step2_compute_timings.finalize_ms << "\n";
   }
 
   if(step2_bgen_parse_profile.variants > 0) {
@@ -4092,6 +4099,13 @@ void Data::test_snps_fast() {
           step2_compute_timings.kernel_ms += timings.kernel_ms;
           step2_compute_timings.download_ms += timings.download_ms;
           step2_compute_timings.wall_ms += timings.wall_ms;
+          step2_compute_timings.linear_crossproduct_ms +=
+            timings.linear_crossproduct_ms;
+          step2_compute_timings.square_materialization_ms +=
+            timings.square_materialization_ms;
+          step2_compute_timings.square_crossproduct_ms +=
+            timings.square_crossproduct_ms;
+          step2_compute_timings.finalize_ms += timings.finalize_ms;
         };
 
       const auto finish_pipeline_block =

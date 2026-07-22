@@ -316,18 +316,37 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
     const std::chrono::steady_clock::time_point start =
       std::chrono::steady_clock::now();
     const Eigen::Index variants = genotypes.cols();
+    std::chrono::steady_clock::time_point phase_start =
+      std::chrono::steady_clock::now();
     linear_crossproducts_.noalias() =
       linear_terms_.transpose() * genotypes;
+    const double linear_crossproduct_ms = elapsed_ms(phase_start);
+    phase_start = std::chrono::steady_clock::now();
+    double square_materialization_ms = 0;
+    double square_crossproduct_ms = 0;
     if(square_terms_.cols() > 0) {
       squared_genotypes_.resize(genotypes.rows(), variants);
-      squared_genotypes_ = genotypes.array().square().matrix();
+      // Eigen's coefficient-wise assignment is single-threaded here. Each
+      // production block is several GiB, so partition independent variant
+      // columns across the existing OpenMP team before the second GEMM.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+      for(Eigen::Index variant = 0; variant < variants; ++variant)
+        squared_genotypes_.col(variant) =
+          genotypes.col(variant).array().square().matrix();
+      square_materialization_ms = elapsed_ms(phase_start);
+      phase_start = std::chrono::steady_clock::now();
       square_crossproducts_.noalias() =
         square_terms_.transpose() * squared_genotypes_;
+      square_crossproduct_ms = elapsed_ms(phase_start);
     } else {
       raw_squared_norms_ = genotypes.colwise().squaredNorm();
+      square_materialization_ms = elapsed_ms(phase_start);
       square_crossproducts_.resize(0, 0);
     }
 
+    phase_start = std::chrono::steady_clock::now();
     numerators.resize(phenotypes_, variants);
     denominators.resize(phenotypes_, variants);
     if(mode_ == CpuScoreMode::quantitative_complete)
@@ -339,6 +358,7 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       finish_binary(variants, sparse, numerators, denominators);
     else
       finish_cox(variants, numerators, denominators);
+    const double finalize_ms = elapsed_ms(phase_start);
 
     const double wall_ms = elapsed_ms(start);
     if(timings) {
@@ -346,6 +366,10 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       timings->scored_variants += variants;
       timings->kernel_ms += wall_ms;
       timings->wall_ms += wall_ms;
+      timings->linear_crossproduct_ms += linear_crossproduct_ms;
+      timings->square_materialization_ms += square_materialization_ms;
+      timings->square_crossproduct_ms += square_crossproduct_ms;
+      timings->finalize_ms += finalize_ms;
     }
     return numerators.allFinite() && denominators.allFinite();
   }
@@ -353,6 +377,9 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
  private:
   void finish_quantitative_complete(Eigen::Index variants,
       Eigen::MatrixXd& numerators, Eigen::MatrixXd& denominators) const {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for(Eigen::Index variant = 0; variant < variants; ++variant) {
       double denominator = raw_squared_norms_(variant);
       for(Eigen::Index covariate = 0; covariate < covariates_;
@@ -377,6 +404,9 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
   void finish_quantitative_missing(Eigen::Index variants,
       const std::vector<unsigned char>& sparse,
       Eigen::MatrixXd& numerators, Eigen::MatrixXd& denominators) const {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for(Eigen::Index variant = 0; variant < variants; ++variant) {
       for(Eigen::Index phenotype = 0; phenotype < phenotypes_;
           ++phenotype) {
@@ -413,6 +443,9 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       const std::vector<unsigned char>& sparse,
       Eigen::MatrixXd& numerators, Eigen::MatrixXd& denominators) const {
     const Eigen::Index terms_per_phenotype = covariates_ + 1;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for(Eigen::Index phenotype = 0; phenotype < phenotypes_;
         ++phenotype) {
       if(!active_[phenotype]) {
@@ -441,6 +474,9 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
   void finish_cox(Eigen::Index variants, Eigen::MatrixXd& numerators,
       Eigen::MatrixXd& denominators) const {
     const Eigen::Index terms_per_phenotype = 1 + 2 * covariates_;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for(Eigen::Index phenotype = 0; phenotype < phenotypes_;
         ++phenotype) {
       if(!active_[phenotype]) {
