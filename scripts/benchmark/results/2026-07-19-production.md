@@ -18,27 +18,24 @@ upstream Level 0 and four measured phenotype fits support a 6.1-6.5 hour full
 runtime projection, making the current A100 pipeline 32.7-34.7x faster. The
 matched P=8 survival evidence supports a 230.19-239.78 minute upstream
 projection, making the current A100 pipeline 19.16-19.96x faster. On the same
-eight-core N2, the matched P=8 quantitative evidence supports a
-156.75-163.17 minute upstream projection, making the current CPU
-implementation 1.46-1.52x faster.
+eight-core N2, CPU-only improvements are more modest because Level 0 remains
+the dominant cost; that software-only comparison is reported separately
+below.
 
 | Model | N | M | P | Fork placement and full runtime | Upstream v4.1.2 comparator | Upstream basis | Speedup over upstream |
 | --- | ---: | ---: | ---: | --- | ---: | --- | ---: |
 | Quantitative, 0-10% input missingness | 500,000 | 700,000 | 32 | `b5f86e9` A100: 21.2 min estimated | 243.08 min | Matched P=32 quantitative full run | 11.45x |
 | Binary, 0-10% input missingness | 500,000 | 700,000 | 8 | `b5f86e9` A100: 11.21 min estimated | 366.56-388.74 min projected | Measured Level 0 and first four phenotype fits; remaining fits extrapolated | 32.70-34.68x |
 | Survival, 0-10% input missingness | 500,000 | 700,000 | 8 | `b5f86e9` A100: 12.01 min estimated | 230.19-239.78 min projected | Measured Level 0 and first four phenotype fits; remaining fits bounded by the complete-outcome survival trend and TIME4 cost | 19.16-19.96x |
-| Quantitative, 0-10% input missingness | 500,000 | 700,000 | 8 | `b5f86e9` N2: 107.08 min estimated | 156.75-163.17 min projected | 152 measured upstream Level 0 blocks; exact first-eight Level 1 and output timings reused from the matched P=32 run | 1.46-1.52x |
 
 The fork runtimes in this table are estimated full runs: measured `b5f86e9`
 Level 1 and output times are combined with matched measured Level 0 times. The
 upstream P=32 quantitative comparator is a matched full run. The P=8 binary
 range is a projection from the partially completed matched run, as described
-below. The P=8 quantitative CPU range combines a bounded matched Level 0 run
-with exact per-trait timings from the completed P=32 run, whose first eight
-phenotype columns are identical. The survival row is a range from a matched
-run, as described below. Direct N=50,000 binary and survival comparisons are
-also shown later in this report. Cross-model scaling is not used as a
-substitute.
+below. The survival row is a range from a matched run, as described below.
+N=50,000 binary and survival measurements and the P=8 quantitative CPU-only
+comparison are secondary checks shown alongside the N=500,000 evidence later
+in this report. Cross-model scaling is not used as a substitute.
 
 ## Workloads
 
@@ -181,18 +178,24 @@ the upstream quantitative P=32 run.
 Mean Level 1 GPU utilization is 65.8% at 274 W. All eight current-branch LOCO
 files, including missing values, passed exact-output regression checks.
 
-## Current-branch checks across N and CPU hardware
+## Binary and survival at N=500,000 and N=50,000
 
-Revision `b5f86e9` was also tested at N=50,000, M=700,000 without changing its
-defaults. These rows characterize `b5f86e9`; they do not use an intermediate
-fork revision as a performance baseline.
+The N=50,000 measurements are secondary anchors, so they are shown with the
+N=500,000 production evidence rather than as a stand-alone conclusion. All
+current rows use revision `b5f86e9` on the A100; upstream v4.1.2 uses the
+eight-core N2 because it has no CUDA backend. The missingness patterns differ
+between sample sizes, so these rows compare current with upstream at each N;
+they are not an N-scaling experiment.
 
-Both matched upstream runs are measured directly.
+| Model | Missingness | N | M | P | Upstream v4.1.2 N2 full runtime | Current A100 full runtime | Current speedup vs upstream |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Binary | 0-10% | 500,000 | 700,000 | 8 | 366.56-388.74 min projected | 11.21 min estimated | 32.70-34.68x |
+| Binary | none | 50,000 | 700,000 | 8 | 43.20 min measured | 1.03 min measured | 41.80x |
+| Survival | 0-10% | 500,000 | 700,000 | 8 | 230.19-239.78 min projected | 12.01 min estimated | 19.16-19.96x |
+| Survival | none | 50,000 | 700,000 | 8 | 32.31 min measured | 0.96 min measured | 33.53x |
 
-| Model | N | M | P | Upstream v4.1.2 full run | `b5f86e9` full run | Current speedup vs upstream | Current Level 0 | Current Level 1 | Current output |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Binary, complete | 50,000 | 700,000 | 8 | 2,591.97 s measured | 62.00 s | 41.80x | 22.72 s | 35.03 s | 2.68 s |
-| Survival, complete | 50,000 | 700,000 | 8 | 1,938.50 s measured | 57.81 s | 33.53x | 26.67 s | 26.85 s | 2.71 s |
+The N=500,000 projection methods are described in the binary and survival
+sections above. Both N=50,000 pairs are directly measured.
 
 The upstream binary run directly matches N, M, P, prevalences, complete
 outcomes, and oneMKL host library; the systems differ because upstream has no
@@ -206,6 +209,13 @@ and 5.54 seconds in prediction output. A paired check of the first LOCO file
 covered 1.15 million predictions with a maximum absolute difference of
 `1.065e-4`, mean absolute difference of `1.41e-5`, RMS difference of
 `1.82e-5`, and no difference above `1e-3`.
+
+## Quantitative P=8 CPU-only comparison at N=500,000
+
+This is a same-hardware software comparison on the eight-core N2, not an A100
+placement result. No matched A100 P=8 quantitative run is reported here. The
+full-run CPU speedup is modest because Level 0 dominates elapsed time and is
+only 1.32-1.38x faster than upstream.
 
 The eight-core N2 comparison uses N=500,000, M=700,000, and P=8 quantitative
 traits:
@@ -223,10 +233,9 @@ completed P=32 run; those are exactly the eight columns used here. The Level 0
 run was stopped after 152 complete blocks covering 151,347 variants. Its lower
 projection models the fixture's 689 full and 22 chromosome-end blocks
 separately and retains the observed fixed overhead. The upper projection
-scales the observed partial process wall by the 711 total blocks. This bounded
-run replaces the former P=1 floor with a matched P=8 range.
+scales the observed partial process wall by the 711 total blocks.
 
-The committed Level 1 includes 131.84 seconds for Gram construction and
+The current Level 1 includes 131.84 seconds for Gram construction and
 produces eight LOCO files that pass exact-output regression checks.
 
 CPU Level 0 remains the larger problem. It took 6,195.76 seconds in the matched
@@ -260,8 +269,8 @@ The final revision is `b5f86e9`. Its A100 CUDA+oneMKL build passes the CPU,
 CUDA-auto, Step 2 CPU, and Cox test targets. Its N2 oneMKL build passes the CPU,
 auto-backend, and Cox targets.
 
-The new measurements are in
-[`2026-07-22-step1-level1.tsv`](2026-07-22-step1-level1.tsv). Earlier Stage 1
+Detailed current measurements are in
+[`2026-07-22-step1-level1.tsv`](2026-07-22-step1-level1.tsv). Historical Stage 1
 runs, including the upstream, T4, single-trait, and first multi-trait anchors,
 remain in [`2026-07-19-production.tsv`](2026-07-19-production.tsv). Direct and
 projected upstream comparisons are collected in

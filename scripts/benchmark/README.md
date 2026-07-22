@@ -4,8 +4,8 @@ The reports in this directory answer two practical questions:
 
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
-| [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) versus the best branch pipeline at N=500,000 and M=700,000, plus direct N=50,000 binary/survival anchors | The A100 placement is 11.45x faster for P=32 quantitative, 32.70-34.68x for P=8 binary, and 19.16-19.96x for P=8 survival |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `c7e6c53` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | The former P=8 quantitative gap is closed: current processes 1,400.7 variants/s, 5.54x upstream; CPU chromosome fan-out remains the recommended production placement |
+| [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) versus the best branch pipeline at N=500,000 and M=700,000; direct N=50,000 binary/survival checks are shown alongside the N=500,000 results | The A100 placement is 11.45x faster for P=32 quantitative, 32.70-34.68x for P=8 binary, and 19.16-19.96x for P=8 survival |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `c7e6c53` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=8 quantitative, current processes 1,400.7 variants/s, 5.54x upstream; CPU chromosome fan-out remains the recommended production placement |
 
 Each report states `N`, trait count, model, hardware, and whether a number is
 measured or projected. Stage 1 reports use `M` for the number of markers used
@@ -90,7 +90,8 @@ Stage 1:
   not presented as report comparators.
 - [`results/2026-07-22-step1-upstream.tsv`](results/2026-07-22-step1-upstream.tsv) — direct upstream v4.1.2
   comparisons and measured-trait projections for slow multi-trait runs,
-  including direct N=50,000 binary and survival anchors.
+  including direct N=50,000 binary and survival checks paired in the report
+  with the N=500,000 production results.
 
 Stage 2:
 
@@ -106,6 +107,9 @@ Stage 2:
   current CPU and upstream measurements at N=50,000 and N=500,000, P=32,
   and 57,821 Stage 2 variants tested, including complete and variable-missingness
   quantitative, binary, and survival panels.
+- [`results/2026-07-22-step2-binary-missingness.tsv`](results/2026-07-22-step2-binary-missingness.tsv) — matched cold-input
+  current CPU measurements for complete and variable-missingness binary traits
+  at N=500,000, P=32, and 57,821 Stage 2 variants tested.
 - [`results/2026-07-22-step2-production-current.tsv`](results/2026-07-22-step2-production-current.tsv) — current CPU,
   upstream, and best measured CUDA production projection for 100 million
   Stage 2 variants tested.
