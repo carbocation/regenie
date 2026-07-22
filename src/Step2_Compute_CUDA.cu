@@ -574,6 +574,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       const std::vector<Eigen::VectorXd>& score_residuals,
       const std::vector<Eigen::MatrixXd>& weighted_designs,
       const std::vector<Eigen::MatrixXd>& projections,
+      const Eigen::Ref<const Eigen::MatrixXd>& common_projection_design,
+      const std::vector<Eigen::MatrixXd>& projection_transforms,
       const std::vector<Eigen::VectorXd>& projection_scores,
       const std::vector<Eigen::MatrixXd>& projection_grams,
       const Eigen::Ref<const Eigen::VectorXd>& residual_variances,
@@ -582,6 +584,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
         active_phenotypes,
       Step2ComputeTimings* timings) override {
+    (void)common_projection_design;
+    (void)projection_transforms;
     clear();
     attempted_ = true;
     const int phenotype_count = static_cast<int>(score_residuals.size());
@@ -835,6 +839,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
   bool score_dense_block(
       const Eigen::Ref<const Eigen::MatrixXd>&,
       const std::vector<unsigned char>&,
+      const Eigen::RowVectorXd*,
       Eigen::MatrixXd&, Eigen::MatrixXd&,
       Step2ComputeTimings*) override {
     return false;

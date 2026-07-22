@@ -87,6 +87,8 @@ class Step2ComputeBackend {
     const std::vector<Eigen::VectorXd>& score_residuals,
     const std::vector<Eigen::MatrixXd>& weighted_designs,
     const std::vector<Eigen::MatrixXd>& projections,
+    const Eigen::Ref<const Eigen::MatrixXd>& common_projection_design,
+    const std::vector<Eigen::MatrixXd>& projection_transforms,
     const std::vector<Eigen::VectorXd>& projection_scores,
     const std::vector<Eigen::MatrixXd>& projection_grams,
     const Eigen::Ref<const Eigen::VectorXd>& residual_variances,
@@ -111,6 +113,7 @@ class Step2ComputeBackend {
   virtual bool score_dense_block(
     const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
     const std::vector<unsigned char>& sparse,
+    const Eigen::RowVectorXd* raw_squared_norms,
     Eigen::MatrixXd& numerators,
     Eigen::MatrixXd& denominators,
     Step2ComputeTimings* timings = nullptr) = 0;

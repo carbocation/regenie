@@ -66,6 +66,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
     square_terms_.resize(0, 0);
     small_.resize(0, 0);
     grams_.clear();
+    projection_transforms_.clear();
+    cox_factored_projection_ = false;
     variances_.resize(0);
     active_.clear();
   }
@@ -215,6 +217,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
       const std::vector<Eigen::VectorXd>& score_residuals,
       const std::vector<Eigen::MatrixXd>& weighted_designs,
       const std::vector<Eigen::MatrixXd>& projections,
+      const Eigen::Ref<const Eigen::MatrixXd>& common_projection_design,
+      const std::vector<Eigen::MatrixXd>& projection_transforms,
       const std::vector<Eigen::VectorXd>& projection_scores,
       const std::vector<Eigen::MatrixXd>& projection_grams,
       const Eigen::Ref<const Eigen::VectorXd>& residual_variances,
@@ -228,6 +232,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
     if(phenotype_count < 4 ||
        weighted_designs.size() != score_residuals.size() ||
        projections.size() != score_residuals.size() ||
+       (!projection_transforms.empty() &&
+        projection_transforms.size() != score_residuals.size()) ||
        projection_scores.size() != score_residuals.size() ||
        projection_grams.size() != score_residuals.size() ||
        residual_variances.size() != phenotype_count ||
@@ -253,11 +259,24 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
     samples_ = sample_count;
     phenotypes_ = phenotype_count;
     covariates_ = covariate_count;
-    const Eigen::Index terms_per_phenotype = 1 + 2 * covariates_;
+    cox_factored_projection_ = common_projection_design.size() > 0 ||
+      !projection_transforms.empty();
+    if(cox_factored_projection_ &&
+       (common_projection_design.rows() != samples_ ||
+        common_projection_design.cols() != covariates_ ||
+        projection_transforms.size() !=
+          static_cast<size_t>(phenotypes_)))
+      return false;
+    const Eigen::Index terms_per_phenotype = 1 + covariates_ +
+      (cox_factored_projection_ ? 0 : covariates_);
     linear_terms_ = Eigen::MatrixXd::Zero(samples_,
-      phenotypes_ * terms_per_phenotype);
+      phenotypes_ * terms_per_phenotype +
+      (cox_factored_projection_ ? covariates_ : 0));
+    if(cox_factored_projection_)
+      linear_terms_.rightCols(covariates_) = common_projection_design;
     small_ = Eigen::MatrixXd::Zero(phenotypes_, covariates_);
     grams_.resize(phenotypes_);
+    projection_transforms_.resize(phenotypes_);
     variances_ = residual_variances;
     active_.resize(phenotypes_, 0);
     for(Eigen::Index phenotype = 0; phenotype < phenotypes_;
@@ -272,14 +291,21 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
          projections[phenotype].cols() != covariates_ ||
          projection_scores[phenotype].size() != covariates_ ||
          projection_grams[phenotype].rows() != covariates_ ||
-         projection_grams[phenotype].cols() != covariates_)
+         projection_grams[phenotype].cols() != covariates_ ||
+         (cox_factored_projection_ &&
+          (projection_transforms[phenotype].rows() != covariates_ ||
+           projection_transforms[phenotype].cols() != covariates_)))
         return false;
       const Eigen::Index base = phenotype * terms_per_phenotype;
       linear_terms_.col(base) = score_residuals[phenotype];
       linear_terms_.middleCols(base + 1, covariates_) =
         weighted_designs[phenotype];
-      linear_terms_.middleCols(base + 1 + covariates_, covariates_) =
-        projections[phenotype];
+      if(cox_factored_projection_)
+        projection_transforms_[phenotype] =
+          projection_transforms[phenotype];
+      else
+        linear_terms_.middleCols(base + 1 + covariates_, covariates_) =
+          projections[phenotype];
       small_.row(phenotype) = projection_scores[phenotype].transpose();
       grams_[phenotype] = projection_grams[phenotype];
     }
@@ -305,6 +331,7 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
   bool score_dense_block(
       const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
       const std::vector<unsigned char>& sparse,
+      const Eigen::RowVectorXd* supplied_raw_squared_norms,
       Eigen::MatrixXd& numerators,
       Eigen::MatrixXd& denominators,
       Step2ComputeTimings* timings) override {
@@ -341,7 +368,15 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
         square_terms_.transpose() * squared_genotypes_;
       square_crossproduct_ms = elapsed_ms(phase_start);
     } else {
-      raw_squared_norms_ = genotypes.colwise().squaredNorm();
+      const bool use_supplied_raw_squared_norms =
+        mode_ == CpuScoreMode::cox && supplied_raw_squared_norms &&
+        supplied_raw_squared_norms->size() == variants &&
+        supplied_raw_squared_norms->allFinite() &&
+        (supplied_raw_squared_norms->array() >= 0).all();
+      if(use_supplied_raw_squared_norms)
+        raw_squared_norms_ = *supplied_raw_squared_norms;
+      else
+        raw_squared_norms_ = genotypes.colwise().squaredNorm();
       square_materialization_ms = elapsed_ms(phase_start);
       square_crossproducts_.resize(0, 0);
     }
@@ -473,7 +508,10 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
 
   void finish_cox(Eigen::Index variants, Eigen::MatrixXd& numerators,
       Eigen::MatrixXd& denominators) const {
-    const Eigen::Index terms_per_phenotype = 1 + 2 * covariates_;
+    const Eigen::Index terms_per_phenotype = 1 + covariates_ +
+      (cox_factored_projection_ ? 0 : covariates_);
+    const Eigen::Index common_base =
+      phenotypes_ * terms_per_phenotype;
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
@@ -492,8 +530,16 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
             ++covariate) {
           const double coefficient =
             linear_crossproducts_(base + 1 + covariate, variant);
-          const double raw_cross = linear_crossproducts_(
-            base + 1 + covariates_ + covariate, variant);
+          double raw_cross = 0;
+          if(cox_factored_projection_) {
+            for(Eigen::Index column = 0; column < covariates_; ++column)
+              raw_cross += projection_transforms_[phenotype](
+                column, covariate) * linear_crossproducts_(
+                  common_base + column, variant);
+          } else {
+            raw_cross = linear_crossproducts_(
+              base + 1 + covariates_ + covariate, variant);
+          }
           numerator -= coefficient * small_(phenotype, covariate);
           denominator -= 2 * coefficient * raw_cross;
         }
@@ -520,8 +566,10 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
   Eigen::MatrixXd square_terms_;
   Eigen::MatrixXd small_;
   std::vector<Eigen::MatrixXd> grams_;
+  std::vector<Eigen::MatrixXd> projection_transforms_;
   Eigen::VectorXd variances_;
   std::vector<unsigned char> active_;
+  bool cox_factored_projection_ = false;
   Eigen::MatrixXd linear_crossproducts_;
   Eigen::MatrixXd squared_genotypes_;
   Eigen::MatrixXd square_crossproducts_;

@@ -26,6 +26,7 @@
 
 #include <limits.h> /* for PATH_MAX */
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <future>
@@ -4309,9 +4310,20 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
           Gblock.step2_backend_observed_nonmissing_counts,
           params.profile_step2 ? &step2_compute_timings : nullptr);
     } else {
+      Eigen::RowVectorXd hardcall_squared_norms(n_snps);
+      bool hardcall_squared_norms_valid = params.trait_mode == 3;
+      for(int variant = 0;
+          hardcall_squared_norms_valid && variant < n_snps; ++variant) {
+        const double squared_norm =
+          all_snps_info[variant].hardcall_squared_norm;
+        hardcall_squared_norms_valid =
+          std::isfinite(squared_norm) && squared_norm >= 0;
+        hardcall_squared_norms(variant) = squared_norm;
+      }
       Gblock.step2_backend_scores_valid =
         step2_compute_backend->score_dense_block(
           Gblock.Gmat.leftCols(n_snps), sparse,
+          hardcall_squared_norms_valid ? &hardcall_squared_norms : nullptr,
           Gblock.step2_backend_score_numerators,
           Gblock.step2_backend_score_denominators,
           params.profile_step2 ? &step2_compute_timings : nullptr);
@@ -4411,15 +4423,28 @@ void Data::prepare_step2_compute_backend() {
 
   vector<MatrixXd> weighted_designs(params.n_pheno);
   vector<MatrixXd> projections(params.n_pheno);
+  vector<MatrixXd> projection_transforms;
+  MatrixXd common_projection_design;
+  if(!params.blup_cov) {
+    common_projection_design.resize(params.n_samples,
+      pheno_data.new_cov.cols() + 1);
+    common_projection_design.col(0).setOnes();
+    common_projection_design.rightCols(pheno_data.new_cov.cols()) =
+      pheno_data.new_cov;
+    projection_transforms.resize(params.n_pheno);
+  }
   VectorXd residual_variances = VectorXd::Ones(params.n_pheno);
   for(int ph = 0; ph < params.n_pheno; ++ph) {
     if(!params.pheno_pass(ph)) continue;
     weighted_designs[ph] = m_ests.cox_MLE_NULL[ph].WX1;
     projections[ph] = m_ests.cox_MLE_NULL[ph].X1_X1WX1inv;
+    if(!params.blup_cov)
+      projection_transforms[ph] = m_ests.cox_MLE_NULL[ph].X1tWX1inv;
     residual_variances(ph) = m_ests.cox_MLE_NULL[ph].res_var;
   }
   step2_compute_backend->prepare_cox(
     Gblock.step2_cox_score_residual, weighted_designs, projections,
+    common_projection_design, projection_transforms,
     Gblock.step2_cox_projection_score,
     Gblock.step2_cox_projection_gram, residual_variances,
     pheno_data.masked_indivs, params.pheno_pass,

@@ -68,7 +68,7 @@ void check_quantitative(Step2ComputeBackend& backend) {
     throw std::runtime_error("complete quantitative preparation failed");
 
   Eigen::MatrixXd numerators, denominators;
-  if(!backend.score_dense_block(genotypes, dense, numerators,
+  if(!backend.score_dense_block(genotypes, dense, nullptr, numerators,
        denominators, &timings))
     throw std::runtime_error("complete quantitative scoring failed");
   const Eigen::MatrixXd design_cross = design.transpose() * genotypes;
@@ -95,7 +95,7 @@ void check_quantitative(Step2ComputeBackend& backend) {
   if(!backend.prepare_quantitative(residuals, design, products,
        observed, false, nullptr))
     throw std::runtime_error("missing quantitative preparation failed");
-  if(!backend.score_dense_block(genotypes, dense, numerators,
+  if(!backend.score_dense_block(genotypes, dense, nullptr, numerators,
        denominators, nullptr))
     throw std::runtime_error("missing quantitative scoring failed");
   Eigen::MatrixXd expected_missing_numerators(phenotypes, variants);
@@ -158,7 +158,7 @@ void check_binary(Step2ComputeBackend& backend) {
 
   const std::vector<unsigned char> dense(variants, 0);
   Eigen::MatrixXd numerators, denominators;
-  if(!backend.score_dense_block(genotypes, dense, numerators,
+  if(!backend.score_dense_block(genotypes, dense, nullptr, numerators,
        denominators, nullptr))
     throw std::runtime_error("binary scoring failed");
   Eigen::MatrixXd expected_numerators(phenotypes, variants);
@@ -190,42 +190,60 @@ void check_cox(Step2ComputeBackend& backend) {
   std::vector<Eigen::VectorXd> score_residuals(phenotypes);
   std::vector<Eigen::MatrixXd> weighted_designs(phenotypes);
   std::vector<Eigen::MatrixXd> projections(phenotypes);
+  std::vector<Eigen::MatrixXd> projection_transforms(phenotypes);
   std::vector<Eigen::VectorXd> projection_scores(phenotypes);
   std::vector<Eigen::MatrixXd> projection_grams(phenotypes);
   Eigen::VectorXd variances(phenotypes);
+  Eigen::MatrixXd common_projection_design =
+    deterministic_matrix(samples, covariates, -0.71);
+  Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> observed =
+    Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic>::Constant(
+      samples, phenotypes, true);
+  Eigen::Array<bool, Eigen::Dynamic, 1> active =
+    Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(phenotypes, true);
+  active(phenotypes - 1) = false;
   for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype) {
     score_residuals[phenotype] =
       deterministic_matrix(samples, 1, 0.11 * phenotype);
+    for(Eigen::Index sample = 0; sample < samples; ++sample) {
+      observed(sample, phenotype) =
+        ((sample + 3 * phenotype) % 11) != 0;
+      if(!observed(sample, phenotype)) score_residuals[phenotype](sample) = 0;
+    }
+    const Eigen::VectorXd weights =
+      deterministic_matrix(samples, 1, 0.19 * phenotype).array().abs() + 0.5;
     weighted_designs[phenotype] =
-      deterministic_matrix(samples, covariates, 0.19 * phenotype);
-    projections[phenotype] =
-      deterministic_matrix(samples, covariates, -0.23 * phenotype);
-    projection_scores[phenotype] =
-      deterministic_matrix(covariates, 1, 0.31 * phenotype);
-    const Eigen::MatrixXd gram_source =
-      deterministic_matrix(covariates, covariates, 0.43 * phenotype);
+      common_projection_design.array().colwise() * weights.array();
+    projection_transforms[phenotype] =
+      (common_projection_design.transpose() * weighted_designs[phenotype])
+        .colPivHouseholderQr().inverse();
+    projections[phenotype] = common_projection_design *
+      projection_transforms[phenotype];
+    projection_scores[phenotype] = projections[phenotype].transpose() *
+      score_residuals[phenotype];
     projection_grams[phenotype] =
-      gram_source.transpose() * gram_source;
+      projections[phenotype].transpose() * projections[phenotype];
     variances(phenotype) = 0.8 + 0.1 * phenotype;
   }
-  const auto observed =
-    Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic>::Constant(
-      samples, phenotypes, true);
-  const auto active =
-    Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(phenotypes, true);
   if(!backend.prepare_cox(score_residuals, weighted_designs,
-       projections, projection_scores, projection_grams, variances,
+       projections, common_projection_design, projection_transforms,
+       projection_scores, projection_grams, variances,
        observed, active, nullptr))
     throw std::runtime_error("Cox preparation failed");
 
   const std::vector<unsigned char> dense(variants, 0);
   Eigen::MatrixXd numerators, denominators;
-  if(!backend.score_dense_block(genotypes, dense, numerators,
+  if(!backend.score_dense_block(genotypes, dense, nullptr, numerators,
        denominators, nullptr))
     throw std::runtime_error("Cox scoring failed");
   Eigen::MatrixXd expected_numerators(phenotypes, variants);
   Eigen::MatrixXd expected_denominators(phenotypes, variants);
   for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype) {
+    if(!active(phenotype)) {
+      expected_numerators.row(phenotype).setZero();
+      expected_denominators.row(phenotype).setOnes();
+      continue;
+    }
     const Eigen::MatrixXd coefficients =
       weighted_designs[phenotype].transpose() * genotypes;
     const Eigen::MatrixXd raw_cross =
@@ -243,6 +261,49 @@ void check_cox(Step2ComputeBackend& backend) {
   }
   require_close(numerators, expected_numerators, "Cox numerator");
   require_close(denominators, expected_denominators, "Cox denominator");
+
+  const Eigen::MatrixXd factored_numerators = numerators;
+  const Eigen::MatrixXd factored_denominators = denominators;
+  Eigen::RowVectorXd supplied_squared_norms =
+    genotypes.colwise().squaredNorm();
+  if(!backend.score_dense_block(genotypes, dense,
+       &supplied_squared_norms, numerators, denominators, nullptr))
+    throw std::runtime_error("Cox supplied-norm scoring failed");
+  require_close(numerators, factored_numerators,
+    "Cox supplied-norm numerator");
+  require_close(denominators, factored_denominators,
+    "Cox supplied-norm denominator");
+
+  supplied_squared_norms(0) = -1;
+  if(!backend.score_dense_block(genotypes, dense,
+       &supplied_squared_norms, numerators, denominators, nullptr))
+    throw std::runtime_error("Cox invalid-norm fallback failed");
+  require_close(numerators, factored_numerators,
+    "Cox invalid-norm fallback numerator");
+  require_close(denominators, factored_denominators,
+    "Cox invalid-norm fallback denominator");
+
+  const Eigen::MatrixXd empty_design;
+  const std::vector<Eigen::MatrixXd> empty_transforms;
+  if(!backend.prepare_cox(score_residuals, weighted_designs,
+       projections, empty_design, empty_transforms, projection_scores,
+       projection_grams, variances, observed, active, nullptr) ||
+     !backend.score_dense_block(genotypes, dense, nullptr, numerators,
+       denominators, nullptr))
+    throw std::runtime_error("legacy Cox scoring failed");
+  require_close(numerators, factored_numerators,
+    "factored versus legacy Cox numerator");
+  require_close(denominators, factored_denominators,
+    "factored versus legacy Cox denominator");
+
+  std::vector<Eigen::MatrixXd> malformed_transforms =
+    projection_transforms;
+  malformed_transforms.pop_back();
+  if(backend.prepare_cox(score_residuals, weighted_designs,
+       projections, common_projection_design, malformed_transforms,
+       projection_scores, projection_grams, variances, observed, active,
+       nullptr) || backend.ready())
+    throw std::runtime_error("malformed factored Cox preparation accepted");
 }
 
 }  // namespace

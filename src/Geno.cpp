@@ -3204,6 +3204,8 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     bool requires_mean_imputation = true;
     const unsigned char* packed_data = nullptr;
     bool unexpanded_packed = false;
+    PackedHardcallDecodeStats packed_stats;
+    bool packed_stats_valid = false;
     if( params->dosage_mode ) eij2 = 0;
 
     // read genotype data
@@ -3228,7 +3230,6 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
     }
 
     if(use_packed_hardcall_path) {
-      PackedHardcallDecodeStats packed_stats;
       {
         ScopedThreadWorkTimer packed_expand_timer(
           profile ? &packed_expand_thread_ms[thread_num] : nullptr);
@@ -3239,6 +3240,7 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
           packed_stats = expand_packed_hardcalls(
             packed_data, Geno.size(), Geno.data());
       }
+      packed_stats_valid = true;
       total = static_cast<double>(packed_stats.allele_sum);
       snp_data->ns1 = packed_stats.nonmissing;
       snp_data->n_zero = filters->ind_in_analysis.size() -
@@ -3423,6 +3425,27 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       }
     } else {
       flip_geno(total, Geno, snp_data, params);
+    }
+
+    // The packed decoder has already counted every hardcall. For the standard
+    // diploid additive encoding, derive the norm of the final mean-imputed
+    // vector from those integer counts instead of scanning N doubles again.
+    // All other encodings retain the dense fallback.
+    if(packed_stats_valid && packed_stats.nonmissing > 0 &&
+       !unexpanded_packed &&
+       params->test_type == 0 && !params->build_mask) {
+      const double observed = static_cast<double>(packed_stats.nonmissing);
+      const double missing = static_cast<double>(packed_stats.missing);
+      const double allele_sum = static_cast<double>(packed_stats.allele_sum);
+      const double nonzero = observed - static_cast<double>(packed_stats.zeros);
+      const double observed_squared_norm = 3.0 * allele_sum - 2.0 * nonzero;
+      const double imputation_mean = snp_data->flipped ? 2.0 -
+        allele_sum / observed : allele_sum / observed;
+      const double flipped_observed_squared_norm = snp_data->flipped ?
+        4.0 * observed - 4.0 * allele_sum + observed_squared_norm :
+        observed_squared_norm;
+      snp_data->hardcall_squared_norm = flipped_observed_squared_norm +
+        missing * imputation_mean * imputation_mean;
     }
 
     // apply dominant/recessive encoding & recompute mean
@@ -3657,6 +3680,7 @@ void prep_snp_stats(variant_block* snp_data, struct param const* params){
   snp_data->skip_int = false;
   snp_data->fitHLM = false;
   snp_data->flipped = false;
+  snp_data->hardcall_squared_norm = -1;
   snp_data->ns1 = 0, snp_data->n_rr = 0, snp_data->n_aa = 0;
   if (params->skip_dosage_comp) {
     snp_data->ns1_adj = 0;

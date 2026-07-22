@@ -222,6 +222,10 @@ struct variant_block {
   bool ignored, flipped;
   int n_rr, n_aa, n_zero = -1;
   double scale_fac, mac1, af1, info1, ns1, ns1_adj;
+  // Exact squared norm after minor-allele flipping and mean imputation when
+  // the source is an unmodified standard diploid additive PGEN hardcall
+  // vector. A negative value means that the dense vector must be inspected.
+  double hardcall_squared_norm = -1;
   Eigen::ArrayXi ns, ns_case, ns_control, nmales, ns_case_adj;
   Eigen::ArrayXd af, af_case, af_control, mac, info, cf_burden;
   Eigen::MatrixXi genocounts;
