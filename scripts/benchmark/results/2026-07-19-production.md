@@ -89,13 +89,13 @@ Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
 6.44x faster. The comparator is the measured 136.79-minute upstream P=1
 runtime used as a floor; upstream P=32 was not run.
 
-| Component | `c312f41` | `b5f86e9` | Ratio |
-| --- | ---: | ---: | ---: |
-| Level 0 | 608.17 s measured | 608.17 s reused; not rerun | -- |
-| Level 1 | 1,049.96 s | 623.70 s | 1.68x faster |
-| Prediction output | 1,039.60 s | 41.61 s | 25.0x faster |
-| Level 1 plus output | 2,089.56 s | 665.31 s | 3.14x faster |
-| Full run | about 2,697.7 s | about 1,273.5 s | 2.12x faster |
+| Component | Upstream v4.1.2 (`5f924b9`) | `c312f41` | `b5f86e9` | `b5f86e9` vs upstream | `b5f86e9` vs `c312f41` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Level 0 | not measured at P=32 | 608.17 s measured | 608.17 s reused; not rerun | -- | -- |
+| Level 1 | not measured at P=32 | 1,049.96 s | 623.70 s | -- | 1.68x faster |
+| Prediction output | not measured at P=32 | 1,039.60 s | 41.61 s | -- | 25.0x faster |
+| Level 1 plus output | not measured at P=32 | 2,089.56 s | 665.31 s | -- | 3.14x faster |
+| Full run | at least 8,207.13 s; measured P=1 floor | about 2,697.7 s | about 1,273.5 s | at least 6.44x faster | 2.12x faster |
 
 In the `b5f86e9` Level 1 run, the retained Level 0 reads represented by the
 profile total 619.96 seconds. Prefetch overlaps 117.28 seconds of that work,
@@ -112,13 +112,13 @@ Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
 quantitative runtime used as a conservative Level 0 floor; upstream P=8
 binary was not run.
 
-| Component | `c312f41` | `b5f86e9` | Ratio |
-| --- | ---: | ---: | ---: |
-| Level 0 | 356.80 s measured | 356.80 s reused; not rerun | -- |
-| Level 1 | 442.26 s | 300.40 s | 1.47x faster |
-| Weighted Gram construction | 346.75 s | 209.23 s | 1.66x faster |
-| Prediction output | 11.11 s | 9.49 s | 1.17x faster |
-| Full run | 815.96 s | about 672.48 s | 1.21x faster |
+| Component | Upstream v4.1.2 (`5f924b9`) | `c312f41` | `b5f86e9` | `b5f86e9` vs upstream | `b5f86e9` vs `c312f41` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Level 0 | not measured for P=8 binary | 356.80 s measured | 356.80 s reused; not rerun | -- | -- |
+| Level 1 | not measured for P=8 binary | 442.26 s | 300.40 s | -- | 1.47x faster |
+| Weighted Gram construction | not instrumented in upstream | 346.75 s | 209.23 s | -- | 1.66x faster |
+| Prediction output | not measured for P=8 binary | 11.11 s | 9.49 s | -- | 1.17x faster |
+| Full run | at least 8,207.13 s; measured P=1 quantitative floor | 815.96 s | about 672.48 s | at least 12.20x faster | 1.21x faster |
 
 Both revisions perform 508 IRLS iterations and select the same models. Of roughly
 90.5 million nonmissing printed prediction values, 526 differ in their decimal
@@ -137,15 +137,15 @@ Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
 quantitative runtime used as a conservative Level 0 floor; upstream P=8
 survival was not run.
 
-| Component | `c312f41` | `b5f86e9` | Ratio |
-| --- | ---: | ---: | ---: |
-| Level 0 | 461.25 s measured | 461.25 s reused; not rerun | -- |
-| Level 1 | 475.54 s | 243.12 s | 1.96x faster |
-| Weighted Gram construction | 229.18 s | 138.17 s | 1.66x faster |
-| Lambda selection | 105.88 s | 0.50 s | 214x faster |
-| Validation | 53.24 s | 11.61 s | 4.58x faster |
-| Prediction output | 9.69 s | 9.77 s | unchanged |
-| Full run | 953.23 s | about 720.88 s | 1.32x faster |
+| Component | Upstream v4.1.2 (`5f924b9`) | `c312f41` | `b5f86e9` | `b5f86e9` vs upstream | `b5f86e9` vs `c312f41` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Level 0 | not measured for P=8 survival | 461.25 s measured | 461.25 s reused; not rerun | -- | -- |
+| Level 1 | not measured for P=8 survival | 475.54 s | 243.12 s | -- | 1.96x faster |
+| Weighted Gram construction | not instrumented in upstream | 229.18 s | 138.17 s | -- | 1.66x faster |
+| Lambda selection | not instrumented in upstream | 105.88 s | 0.50 s | -- | 214x faster |
+| Validation | not instrumented in upstream | 53.24 s | 11.61 s | -- | 4.58x faster |
+| Prediction output | not measured for P=8 survival | 9.69 s | 9.77 s | -- | unchanged |
+| Full run | at least 8,207.13 s; measured P=1 quantitative floor | 953.23 s | about 720.88 s | at least 11.38x faster | 1.32x faster |
 
 Mean Level 1 GPU utilization rises from 55.7% at 230 W to 65.8% at 274 W, but
 the important result is that elapsed time falls by 49%. All eight `b5f86e9`
@@ -162,29 +162,27 @@ No upstream estimate is reported because the available upstream Stage 1 run
 has N=500,000, P=1, and a quantitative model. Scaling across both N and model
 would be speculative.
 
-| Model | N | M | P | `b5f86e9` full run | Level 0 | Level 1 | Output |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Binary, complete | 50,000 | 700,000 | 8 | 62.00 s | 22.72 s | 35.03 s | 2.68 s |
-| Survival, complete | 50,000 | 700,000 | 8 | 57.81 s | 26.67 s | 26.85 s | 2.71 s |
+| Model | N | M | P | Upstream v4.1.2 full run | `b5f86e9` full run | Level 0 | Level 1 | Output |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| Binary, complete | 50,000 | 700,000 | 8 | not available; upstream data are N=500,000, P=1 quantitative | 62.00 s | 22.72 s | 35.03 s | 2.68 s |
+| Survival, complete | 50,000 | 700,000 | 8 | not available; upstream data are N=500,000, P=1 quantitative | 57.81 s | 26.67 s | 26.85 s | 2.71 s |
 
 These complete end-to-end runs show that the implementation works at a tenfold
 smaller N and for two iterative models. They are not used to claim a speedup
 over upstream.
 
-On the eight-core N2, a matched `b5f86e9` diagnostic build using the original
-full-matrix CPU Gram calculation took 289.04 seconds for Level 1 at N=500,000,
-M=700,000, and P=8 quantitative traits. The committed symmetric oneMKL path in
-`b5f86e9` takes 227.25 seconds, including 131.84 seconds for Gram construction,
-and produces eight byte-identical LOCO files. This isolates the CPU Gram
-change; it is neither an upstream comparison nor a comparison with
-`c312f41`. A second diagnostic build routed the symmetric operation through
-Eigen and took 231.27 seconds, so its small difference from explicit oneMKL
-should be treated as run noise.
+The eight-core N2 comparison uses N=500,000, M=700,000, and P=8 quantitative
+traits:
 
-For production context, the estimated 107.08-minute `b5f86e9` N2 full run is
-at least 1.28x faster than upstream v4.1.2. That again uses the measured
-136.79-minute upstream P=1 quantitative run as a floor because upstream P=8
-was not run.
+| Metric | Upstream v4.1.2 (`5f924b9`) | Full-matrix Gram diagnostic | Committed `b5f86e9` symmetric oneMKL | `b5f86e9` vs upstream | `b5f86e9` vs diagnostic |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Level 1 | not measured at P=8 | 289.04 s | 227.25 s | -- | 1.27x faster |
+| Full run | at least 8,207.13 s; measured P=1 floor | 6,492.80 s measured | 6,424.80 s estimated | at least 1.28x faster | 1.01x faster |
+
+The committed Level 1 includes 131.84 seconds for Gram construction and
+produces eight byte-identical LOCO files. A second diagnostic build routed the
+symmetric operation through Eigen and took 231.27 seconds for Level 1, so its
+small difference from explicit oneMKL should be treated as run noise.
 
 CPU Level 0 remains the larger problem. It took 6,195.76 seconds in the matched
 N2 run; residualization accounted for 3,563.67 seconds and Gram construction
