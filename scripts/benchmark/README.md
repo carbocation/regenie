@@ -5,7 +5,7 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) direct P=1 comparison and conservative upstream floors for P=8/P=32 at N=500,000, M=700,000; separate engineering diagnostics | The retained A100 P=1 pipeline is 74.38x faster than upstream; `b5f86e9` multi-trait A100 workloads are at least 6.44-12.20x faster than the measured upstream floor |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Batched CPU revision `8953759` versus upstream v4.1.2 (`5f924b9`) at N=500,000, M=700,000, P=32; production projection at M=100,000,000 | Versus upstream `5f924b9`, `8953759` is 6.6-18.0x faster on the same N2; the recommended placement is one co-located Spot N2 worker per chromosome |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `38c5f82`, batched CPU `8953759`, and upstream v4.1.2 (`5f924b9`) at N=500,000 and P=32; production projection at M=100,000,000 | The current M=700,000 quantitative missingness run takes 14m56s: 12.14x faster than upstream and 1.84x faster than `8953759`; CPU chromosome fan-out remains the recommended placement |
 
 Each report states `N`, `M`, trait count, model, hardware, and whether a number
 is measured or projected. The TSV files hold the detailed run records and
@@ -93,6 +93,10 @@ Stage 1:
 
 Stage 2:
 
+- [`results/2026-07-22-step2-optimization.tsv`](results/2026-07-22-step2-optimization.tsv) — current CPU
+  `38c5f82`, batched CPU `8953759`, and upstream v4.1.2 (`5f924b9`) at
+  N=500,000 and P=32. It contains matched chromosome 1 quantitative, binary,
+  and survival runs plus the full M=700,000 quantitative validation.
 - [`results/2026-07-21-step2-upstream.tsv`](results/2026-07-21-step2-upstream.tsv) — upstream v4.1.2 (`5f924b9`)
   measurements at N=500,000, including the full M=700,000 quantitative anchor
   and chromosome-sized model/missingness runs.

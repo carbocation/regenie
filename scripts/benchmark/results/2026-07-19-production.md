@@ -102,6 +102,17 @@ profile total 619.96 seconds. Prefetch overlaps 117.28 seconds of that work,
 but the foreground still waits 502.68 seconds. More GPU arithmetic would not
 materially improve this workload until the input path changes.
 
+The storage path is already close to its hardware allowance. These 32 Level 0
+files contain 455.04 GB of double-precision predictions. The A100 system uses
+a 2 TB balanced Persistent Disk, whose documented size-based allowance is
+about 700 MiB/s; the measured reader rate is approximately 700 MiB/s. Reading
+larger staged chunks increased the four-trait Level 1 wall time from 89.47 to
+107.43 seconds, and increasing kernel readahead produced a similar regression,
+so neither change was retained. Lossless zstd reduced a representative 1 GiB
+slice by only 4.2%. A material improvement now requires faster scratch storage
+such as Local SSD, or a redesign that avoids writing 455 GB between levels;
+changing the reader again is not a high-confidence optimization.
+
 All 32 `b5f86e9` LOCO files are byte-for-byte identical to the matched
 `c312f41` files.
 
