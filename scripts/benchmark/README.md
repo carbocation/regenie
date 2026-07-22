@@ -4,7 +4,7 @@ The reports in this directory answer two practical questions:
 
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
-| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000, one quantitative trait; and N=50,000, M=700,000 multi-trait panels | A100 is the clear Stage 1 target; the retained large-sample Level 0 path is close to saturated |
+| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000 with 32 quantitative traits or eight binary/survival models; N=50,000 generalization checks; matched eight-core CPU run | A100 Level 1 is 1.47-1.96x faster for binary and survival models, while quantitative Level 1 is now limited mainly by reading retained Level 0 data |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Upstream/current N=500,000, M=700,000 comparisons for 32 quantitative, binary, and survival traits; N=500,000, M=100,000,000 placement model | Current CPU is 6.6-18.0x faster than upstream; use one co-located Spot N2 worker per chromosome |
 
 Each report states `N`, `M`, trait count, model, hardware, and whether a number
@@ -81,7 +81,10 @@ checksum across systems.
 Stage 1:
 
 - [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — retained run-level measurements for
-  the Stage 1 report.
+  the earlier Stage 1 work.
+- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — matched multi-trait Level 1 controls and
+  current measurements at N=500,000, plus smaller-sample and CPU
+  generalization checks.
 
 Stage 2:
 
