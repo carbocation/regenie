@@ -5,7 +5,7 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) versus the best branch pipeline at N=500,000 and M=700,000, plus direct N=50,000 binary/survival anchors | The A100 placement is 11.45x faster for P=32 quantitative, 32.70-34.68x for P=8 binary, and 19.16-19.96x for P=8 survival |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `d189bfd` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | P=32 speedups are 11.35-22.29x at N=500,000, and direct sample-scaling runs show that 10x N produces 12.95-17.44x upstream wall time; CPU chromosome fan-out remains the recommended placement |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `c7e6c53` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | The former P=8 quantitative gap is closed: current processes 1,400.7 variants/s, 5.54x upstream; CPU chromosome fan-out remains the recommended production placement |
 
 Each report states `N`, trait count, model, hardware, and whether a number is
 measured or projected. Stage 1 reports use `M` for the number of markers used
