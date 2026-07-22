@@ -5,11 +5,12 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) direct P=1 comparison and conservative upstream floors for P=8/P=32 at N=500,000, M=700,000; separate engineering diagnostics | The retained A100 P=1 pipeline is 74.38x faster than upstream; `b5f86e9` multi-trait A100 workloads are at least 6.44-12.20x faster than the measured upstream floor |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `38c5f82`, batched CPU `8953759`, and upstream v4.1.2 (`5f924b9`) at N=500,000 and P=32; production projection at M=100,000,000 | The current M=700,000 quantitative missingness run reaches 781.2 variants/s: 12.14x upstream and 1.84x `8953759`; CPU chromosome fan-out remains the recommended placement |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `38c5f82` versus upstream v4.1.2 at N=500,000 and P=32; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | The current 700,000-tested-variant quantitative missingness run reaches 781.2 variants/s, 12.14x upstream; CPU chromosome fan-out remains the recommended placement |
 
-Each report states `N`, `M`, trait count, model, hardware, and whether a number
-is measured or projected. The TSV files hold the detailed run records and
-historical controls.
+Each report states `N`, trait count, model, hardware, and whether a number is
+measured or projected. Stage 1 reports use `M` for the number of markers used
+to fit the model; Stage 2 reports spell out the number of variants tested. The
+TSV files hold the detailed run records and historical controls.
 
 ## Running a benchmark
 
@@ -80,12 +81,13 @@ checksum across systems.
 
 Stage 1:
 
-- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — Stage 1 measurements from revisions
-  `114ef81`, `dc64b54`, `fa7506f`, and upstream v4.1.2 (`5f924b9`), with N,
-  M, trait count, system, and cache state in every row.
-- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — A100 `b5f86e9` versus `c312f41`
-  multi-trait Level 1 comparisons at N=500,000 and M=700,000, plus explicitly
-  labeled N=50,000 and CPU diagnostic comparisons.
+- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — upstream and best branch Stage 1
+  placement measurements, with N, M, trait count, system, revision, and cache
+  state in every row.
+- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — current multi-trait Level 1
+  measurements at N=500,000 and M=700,000, plus explicitly labeled N=50,000
+  and CPU diagnostics. Historical validation rows remain in the TSV but are
+  not presented as report comparators.
 - [`results/2026-07-22-step1-upstream.tsv`](results/2026-07-22-step1-upstream.tsv) — direct upstream v4.1.2
   comparisons, conservative N=500,000 multi-trait lower bounds, and explicit
   records of the N=50,000 workloads for which no defensible upstream inference
@@ -93,41 +95,23 @@ Stage 1:
 
 Stage 2:
 
-- [`results/2026-07-22-step2-optimization.tsv`](results/2026-07-22-step2-optimization.tsv) — current CPU
-  `38c5f82`, batched CPU `8953759`, and upstream v4.1.2 (`5f924b9`) at
-  N=500,000 and P=32. It contains matched chromosome 1 quantitative, binary,
-  and survival runs plus the full M=700,000 quantitative validation.
-- [`results/2026-07-21-step2-upstream.tsv`](results/2026-07-21-step2-upstream.tsv) — upstream v4.1.2 (`5f924b9`)
-  measurements at N=500,000, including the full M=700,000 quantitative anchor
-  and chromosome-sized model/missingness runs.
-- [`results/2026-07-21-step2-upstream-comparison.tsv`](results/2026-07-21-step2-upstream-comparison.tsv) — direct and
-  validated upstream `5f924b9` versus batched CPU `8953759` comparison at
-  N=500,000, M=700,000, and P=32.
-- [`results/2026-07-21-step2-upstream-production.tsv`](results/2026-07-21-step2-upstream-production.tsv) — upstream
-  `5f924b9`, batched CPU `8953759`, and CUDA `8953759` wall-time and cost
-  projections at N=500,000, M=100,000,000, and P=32.
-- [`results/2026-07-20-step2-cpu-block.tsv`](results/2026-07-20-step2-cpu-block.tsv) — oneMKL CPU revision `8953759`
-  phase timings, correction-heavy runs, and validation.
-- [`results/2026-07-20-step2-trait-matrix.tsv`](results/2026-07-20-step2-trait-matrix.tsv) — measured A100/N2 score-only
-  matrix and GPU telemetry.
-- [`results/2026-07-20-step2-large-anchor.tsv`](results/2026-07-20-step2-large-anchor.tsv) — cold-input revision
-  `8953759` measurements at N=500,000, M=700,000, and P=32, plus A100
-  block-size controls; the `--bsize 1000` rows feed the production model.
-- [`results/2026-07-20-step2-production-model.tsv`](results/2026-07-20-step2-production-model.tsv) — N=500,000,
-  M=100,000,000 wall-time and whole-placement cost estimates.
+- [`results/2026-07-22-step2-optimization.tsv`](results/2026-07-22-step2-optimization.tsv) — current CPU and upstream
+  measurements at N=500,000 and P=32, including the 57,821-variant
+  quantitative, binary, and survival panels and the full quantitative
+  validation with 700,000 Stage 2 variants tested. Historical validation rows remain in the
+  TSV but are not presented as report comparators.
+- [`results/2026-07-22-step2-production-current.tsv`](results/2026-07-22-step2-production-current.tsv) — current CPU,
+  upstream, and best measured CUDA production projection for 100 million
+  Stage 2 variants tested.
+- [`results/2026-07-21-step2-upstream.tsv`](results/2026-07-21-step2-upstream.tsv) — upstream v4.1.2 measurements at
+  N=500,000, including the full 700,000-tested-variant quantitative anchor and
+  chromosome-sized model/missingness runs.
 - [`results/2026-07-20-step2-chromosome-allocation.tsv`](results/2026-07-20-step2-chromosome-allocation.tsv) — 100 million
   variants allocated across chromosomes 1-22, X, and Y by GRCh38 length.
 - [`results/2026-07-20-step2-localization.tsv`](results/2026-07-20-step2-localization.tsv) — durable same-region
   localization measurement and machine storage limits.
-- [`results/2026-07-20-step2-sample-scaling.tsv`](results/2026-07-20-step2-sample-scaling.tsv) — matched N=50,000 and
-  N=500,000 runs at M=16,000. These isolate sample-size effects and are not
-  used for production placement estimates.
 - [`results/2026-07-20-step2-prices.tsv`](results/2026-07-20-step2-prices.tsv) — cloud price snapshot and source URLs.
-- [`results/2026-07-20-step2.tsv`](results/2026-07-20-step2.tsv) and
-  [`results/2026-07-20-step2-integrated.tsv`](results/2026-07-20-step2-integrated.tsv) — historical CPU and integrated
-  CUDA controls; use the per-row revision rather than treating them as a
-  single baseline.
-- [`results/2026-07-20-step2-steady-state.tsv`](results/2026-07-20-step2-steady-state.tsv) — historical utilization and
-  concurrency diagnostics.
-- [`results/2026-07-20-step2-cuda.tsv`](results/2026-07-20-step2-cuda.tsv) — standalone kernel diagnostics; these
-  are not end-to-end runtime forecasts.
+
+The remaining Stage 2 TSVs are historical implementation, scaling, and kernel
+diagnostics. They are retained for reproducibility and are not current branch
+comparisons.

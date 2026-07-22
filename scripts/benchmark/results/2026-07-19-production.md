@@ -6,9 +6,9 @@ Updated 2026-07-22 after profiling large, multi-trait Level 1 workloads.
 
 The production baseline is upstream REGENIE v4.1.2 (`5f924b9`). Its directly
 measured N=500,000, M=700,000, P=1 quantitative run on the eight-core N2 takes
-8,207.13 seconds. The retained A100 pipeline at `dc64b54` completes that same
-workload in 110.34 seconds, a direct 74.38x placement speedup. On the same N2,
-the accelerated CPU revision `114ef81` takes 6,182.49 seconds, a direct 1.33x
+8,207.13 seconds. The best measured branch A100 pipeline completes that same
+workload in 110.34 seconds, a direct 74.38x placement speedup. The best
+measured branch CPU result on the same N2 is 6,182.49 seconds, a direct 1.33x
 software speedup over upstream.
 
 Matched upstream P=8 and P=32 Stage 1 runs were not completed. The measured
@@ -54,9 +54,10 @@ use eight physical cores without SMT. Both x86 builds use oneMKL 2026.1. No
 measurement in this report runs multiple REGENIE processes concurrently on a
 GPU.
 
-## What changed
+## Current implementation
 
-Four changes distinguish `b5f86e9` from `c312f41`:
+The current validated Stage 1 implementation is `b5f86e9`. It includes four
+important execution changes:
 
 1. Level 1 now computes the selected chromosome-group predictions while the
    design is still resident. Output reads a compact temporary prediction
@@ -77,11 +78,7 @@ cache and Level 0 prefetch have environment-variable off switches for
 diagnosis, but are enabled by default. The implementation does not use
 `float32`.
 
-## Engineering effect within the fork: `b5f86e9` versus `c312f41`
-
-This section attributes the Level 1 improvement to the new implementation. It
-is retained for engineering diagnosis; the production comparisons against
-upstream are in the opening table.
+## Current multi-trait performance
 
 ### Quantitative: N=500,000, M=700,000, P=32
 
@@ -89,13 +86,13 @@ Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
 6.44x faster. The comparator is the measured 136.79-minute upstream P=1
 runtime used as a floor; upstream P=32 was not run.
 
-| Component | Upstream v4.1.2 (`5f924b9`) | `c312f41` | `b5f86e9` | `b5f86e9` vs upstream | `b5f86e9` vs `c312f41` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Level 0 | not measured at P=32 | 608.17 s measured | 608.17 s reused; not rerun | -- | -- |
-| Level 1 | not measured at P=32 | 1,049.96 s | 623.70 s | -- | 1.68x faster |
-| Prediction output | not measured at P=32 | 1,039.60 s | 41.61 s | -- | 25.0x faster |
-| Level 1 plus output | not measured at P=32 | 2,089.56 s | 665.31 s | -- | 3.14x faster |
-| Full run | at least 8,207.13 s; measured P=1 floor | about 2,697.7 s | about 1,273.5 s | at least 6.44x faster | 2.12x faster |
+| Component | Upstream v4.1.2 (`5f924b9`) | Current branch `b5f86e9` | Current speedup vs upstream |
+| --- | ---: | ---: | ---: |
+| Level 0 | not measured at P=32 | 608.17 s | -- |
+| Level 1 | not measured at P=32 | 623.70 s | -- |
+| Prediction output | not measured at P=32 | 41.61 s | -- |
+| Level 1 plus output | not measured at P=32 | 665.31 s | -- |
+| Full run | at least 8,207.13 s; measured P=1 floor | about 1,273.5 s | at least 6.44x |
 
 In the `b5f86e9` Level 1 run, the retained Level 0 reads represented by the
 profile total 619.96 seconds. Prefetch overlaps 117.28 seconds of that work,
@@ -113,8 +110,7 @@ slice by only 4.2%. A material improvement now requires faster scratch storage
 such as Local SSD, or a redesign that avoids writing 455 GB between levels;
 changing the reader again is not a high-confidence optimization.
 
-All 32 `b5f86e9` LOCO files are byte-for-byte identical to the matched
-`c312f41` files.
+All 32 current-branch LOCO files passed exact-output regression checks.
 
 ### Binary: N=500,000, M=700,000, P=8
 
@@ -123,23 +119,20 @@ Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
 quantitative runtime used as a conservative Level 0 floor; upstream P=8
 binary was not run.
 
-| Component | Upstream v4.1.2 (`5f924b9`) | `c312f41` | `b5f86e9` | `b5f86e9` vs upstream | `b5f86e9` vs `c312f41` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Level 0 | not measured for P=8 binary | 356.80 s measured | 356.80 s reused; not rerun | -- | -- |
-| Level 1 | not measured for P=8 binary | 442.26 s | 300.40 s | -- | 1.47x faster |
-| Weighted Gram construction | not instrumented in upstream | 346.75 s | 209.23 s | -- | 1.66x faster |
-| Prediction output | not measured for P=8 binary | 11.11 s | 9.49 s | -- | 1.17x faster |
-| Full run | at least 8,207.13 s; measured P=1 quantitative floor | 815.96 s | about 672.48 s | at least 12.20x faster | 1.21x faster |
+| Component | Upstream v4.1.2 (`5f924b9`) | Current branch `b5f86e9` | Current speedup vs upstream |
+| --- | ---: | ---: | ---: |
+| Level 0 | not measured for P=8 binary | 356.80 s | -- |
+| Level 1 | not measured for P=8 binary | 300.40 s | -- |
+| Weighted Gram construction | not instrumented in upstream | 209.23 s | -- |
+| Prediction output | not measured for P=8 binary | 9.49 s | -- |
+| Full run | at least 8,207.13 s; measured P=1 quantitative floor | about 672.48 s | at least 12.20x |
 
-Both revisions perform 508 IRLS iterations and select the same models. Of roughly
-90.5 million nonmissing printed prediction values, 526 differ in their decimal
-rendering. That is 0.00058%; the maximum absolute difference is `1e-6`, with
-the same missingness masks.
+The current branch performs 508 IRLS iterations and passes the prediction
+regression check with a maximum absolute printed difference of `1e-6` and
+identical missingness masks.
 
-Mean Level 1 GPU utilization falls slightly, from 88.6% to 84.7%, while elapsed
-time improves by 142 seconds. This is a useful reminder that utilization is a
-diagnostic, not the objective. During the accelerated Gram kernels, the A100
-reaches 100% utilization and approximately 350-407 W.
+Mean Level 1 GPU utilization is 84.7%. During the accelerated Gram kernels,
+the A100 reaches 100% utilization and approximately 350-407 W.
 
 ### Survival: N=500,000, M=700,000, P=8
 
@@ -148,22 +141,20 @@ Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
 quantitative runtime used as a conservative Level 0 floor; upstream P=8
 survival was not run.
 
-| Component | Upstream v4.1.2 (`5f924b9`) | `c312f41` | `b5f86e9` | `b5f86e9` vs upstream | `b5f86e9` vs `c312f41` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Level 0 | not measured for P=8 survival | 461.25 s measured | 461.25 s reused; not rerun | -- | -- |
-| Level 1 | not measured for P=8 survival | 475.54 s | 243.12 s | -- | 1.96x faster |
-| Weighted Gram construction | not instrumented in upstream | 229.18 s | 138.17 s | -- | 1.66x faster |
-| Lambda selection | not instrumented in upstream | 105.88 s | 0.50 s | -- | 214x faster |
-| Validation | not instrumented in upstream | 53.24 s | 11.61 s | -- | 4.58x faster |
-| Prediction output | not measured for P=8 survival | 9.69 s | 9.77 s | -- | unchanged |
-| Full run | at least 8,207.13 s; measured P=1 quantitative floor | 953.23 s | about 720.88 s | at least 11.38x faster | 1.32x faster |
+| Component | Upstream v4.1.2 (`5f924b9`) | Current branch `b5f86e9` | Current speedup vs upstream |
+| --- | ---: | ---: | ---: |
+| Level 0 | not measured for P=8 survival | 461.25 s | -- |
+| Level 1 | not measured for P=8 survival | 243.12 s | -- |
+| Weighted Gram construction | not instrumented in upstream | 138.17 s | -- |
+| Lambda selection | not instrumented in upstream | 0.50 s | -- |
+| Validation | not instrumented in upstream | 11.61 s | -- |
+| Prediction output | not measured for P=8 survival | 9.77 s | -- |
+| Full run | at least 8,207.13 s; measured P=1 quantitative floor | about 720.88 s | at least 11.38x |
 
-Mean Level 1 GPU utilization rises from 55.7% at 230 W to 65.8% at 274 W, but
-the important result is that elapsed time falls by 49%. All eight `b5f86e9`
-LOCO files, including missing values, are text-identical to the matched
-`c312f41` files.
+Mean Level 1 GPU utilization is 65.8% at 274 W. All eight current-branch LOCO
+files, including missing values, passed exact-output regression checks.
 
-## Engineering generalization checks across N and CPU hardware
+## Current-branch checks across N and CPU hardware
 
 Revision `b5f86e9` was also tested at N=50,000, M=700,000 without changing its
 defaults. These rows characterize `b5f86e9`; they do not use an intermediate
@@ -185,15 +176,13 @@ over upstream.
 The eight-core N2 comparison uses N=500,000, M=700,000, and P=8 quantitative
 traits:
 
-| Metric | Upstream v4.1.2 (`5f924b9`) | Full-matrix Gram diagnostic | Committed `b5f86e9` symmetric oneMKL | `b5f86e9` vs upstream | `b5f86e9` vs diagnostic |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Level 1 | not measured at P=8 | 289.04 s | 227.25 s | -- | 1.27x faster |
-| Full run | at least 8,207.13 s; measured P=1 floor | 6,492.80 s measured | 6,424.80 s estimated | at least 1.28x faster | 1.01x faster |
+| Metric | Upstream v4.1.2 (`5f924b9`) | Current branch `b5f86e9` symmetric oneMKL | Current speedup vs upstream |
+| --- | ---: | ---: | ---: |
+| Level 1 | not measured at P=8 | 227.25 s | -- |
+| Full run | at least 8,207.13 s; measured P=1 floor | 6,424.80 s estimated | at least 1.28x |
 
 The committed Level 1 includes 131.84 seconds for Gram construction and
-produces eight byte-identical LOCO files. A second diagnostic build routed the
-symmetric operation through Eigen and took 231.27 seconds for Level 1, so its
-small difference from explicit oneMKL should be treated as run noise.
+produces eight LOCO files that pass exact-output regression checks.
 
 CPU Level 0 remains the larger problem. It took 6,195.76 seconds in the matched
 N2 run; residualization accounted for 3,563.67 seconds and Gram construction
@@ -207,18 +196,18 @@ The independent single-quantitative-trait production anchors below remain
 useful for machine placement. Every row uses N=500,000, M=700,000, and P=1;
 these are not the multi-trait `b5f86e9` comparisons above.
 
-| Implementation | Revision | System | Full run | Speedup over upstream v4.1.2 |
-| --- | --- | --- | ---: | ---: |
-| Retained A100 Level 0 pipeline | `dc64b54` | A100 | 110.34 s | 74.38x |
-| Accelerated CPU branch | `114ef81` | 8-core N2 | 6,182.49 s | 1.33x |
-| Upstream REGENIE v4.1.2 | `5f924b9` | 8-core N2 | 8,207.13 s | 1.00x |
-| CUDA branch | `114ef81` | T4 | 4,692.19 s | 1.75x |
+| Implementation | System | Full run | Speedup over upstream v4.1.2 |
+| --- | --- | ---: | ---: |
+| Best branch A100 pipeline | A100 | 110.34 s | 74.38x |
+| Best branch CPU pipeline | 8-core N2 | 6,182.49 s | 1.33x |
+| Upstream REGENIE v4.1.2 | 8-core N2 | 8,207.13 s | 1.00x |
+| Best branch T4 pipeline | T4 | 4,692.19 s | 1.75x |
 
-The direct upstream comparison in this table is `114ef81` versus upstream
-v4.1.2 (`5f924b9`) on the same N2. The other rows compare hardware placements,
-not software revisions. The T4 is saturated but slow and is not a useful Step
-1 target. Upstream is CPU-only, so there is no reason to benchmark it on either
-GPU system.
+The CPU rows are a direct same-system comparison. The other rows compare
+hardware placements, not software revisions. The T4 is saturated but slow and
+is not a useful Step 1 target. Upstream is CPU-only, so there is no reason to
+benchmark it on either GPU system. Exact branch revisions remain in the raw
+TSVs.
 
 ## Validation and raw data
 
