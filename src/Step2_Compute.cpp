@@ -27,6 +27,8 @@
 #include "Step2_Compute.hpp"
 
 #include <chrono>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 #ifdef WITH_CUDA
@@ -34,6 +36,35 @@ std::unique_ptr<Step2ComputeBackend> make_cuda_step2_compute_backend(
   int device, bool automatic);
 bool cuda_step2_compute_backend_available(int device, std::string& reason);
 #endif
+
+bool should_use_cpu_quantitative_block_scoring(
+    Eigen::Index samples, Eigen::Index phenotypes, bool complete_masks) {
+  if(samples <= 0 || phenotypes <= 0) return false;
+
+  // Keep a diagnostic override so crossover measurements can compare both
+  // paths without maintaining benchmark-only binaries.
+  const char* value =
+    std::getenv("REGENIE_STEP2_QT_BLOCK_MIN_PHENOTYPES");
+  if(value && *value) {
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if(end != value && *end == '\0' && parsed >= 1 &&
+       parsed <= std::numeric_limits<int>::max())
+      return phenotypes >= static_cast<Eigen::Index>(parsed);
+  }
+
+  // With phenotype-specific missingness, the per-variant implementation
+  // repeatedly rebuilds masked genotype projections; even a two-trait panel
+  // amortizes the blockwise crossproducts. Complete traits have a cheaper
+  // fallback, so retain it for narrow or modest-sized panels.
+  if(!complete_masks) return phenotypes >= 2;
+  if(phenotypes >= 12) return true;
+  if(phenotypes < 4) return false;
+
+  const Eigen::Index minimum_samples =
+    (2000000 + phenotypes - 1) / phenotypes;
+  return samples >= minimum_samples;
+}
 
 namespace {
 
@@ -80,10 +111,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
         Eigen::Dynamic>>& observed_masks,
       bool complete_masks, Step2ComputeTimings* timings) override {
     clear();
-    // The packed single-variant path is faster and uses much less memory for
-    // small QT panels. Blockwise GEMM pays off once residuals can be reused
-    // across a meaningfully wide phenotype panel.
-    if(residuals.rows() <= 0 || residuals.cols() < 16 ||
+    if(!should_use_cpu_quantitative_block_scoring(
+         residuals.rows(), residuals.cols(), complete_masks) ||
        covariates.rows() != residuals.rows() || covariates.cols() <= 0 ||
        outcome_covariate_products.rows() != residuals.cols() ||
        outcome_covariate_products.cols() != covariates.cols() ||

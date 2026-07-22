@@ -119,6 +119,9 @@ class Step2ComputeBackend {
     Step2ComputeTimings* timings = nullptr) = 0;
 };
 
+bool should_use_cpu_quantitative_block_scoring(
+  Eigen::Index samples, Eigen::Index phenotypes, bool complete_masks);
+
 std::unique_ptr<Step2ComputeBackend> make_step2_compute_backend(
   const std::string& requested_backend, int device);
 

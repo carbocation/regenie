@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -44,6 +45,22 @@ void require_close(const Eigen::MatrixXd& actual,
 }
 
 void check_quantitative(Step2ComputeBackend& backend) {
+  if(std::getenv("REGENIE_STEP2_QT_BLOCK_MIN_PHENOTYPES")) {
+    if(!should_use_cpu_quantitative_block_scoring(5000, 1, true))
+      throw std::runtime_error("quantitative block override is invalid");
+  } else {
+    if(should_use_cpu_quantitative_block_scoring(5000, 1, true) ||
+       should_use_cpu_quantitative_block_scoring(500000, 2, true) ||
+       should_use_cpu_quantitative_block_scoring(100000, 8, true) ||
+       should_use_cpu_quantitative_block_scoring(50000, 11, true) ||
+       !should_use_cpu_quantitative_block_scoring(500000, 4, true) ||
+       !should_use_cpu_quantitative_block_scoring(250000, 8, true) ||
+       !should_use_cpu_quantitative_block_scoring(50000, 12, true) ||
+       should_use_cpu_quantitative_block_scoring(5000, 1, false) ||
+       !should_use_cpu_quantitative_block_scoring(5000, 2, false))
+      throw std::runtime_error("quantitative block dispatch is invalid");
+  }
+
   const Eigen::Index samples = 11;
   const Eigen::Index phenotypes = 16;
   const Eigen::Index covariates = 3;
@@ -120,12 +137,14 @@ void check_quantitative(Step2ComputeBackend& backend) {
   require_close(denominators, expected_missing_denominators,
     "missing quantitative denominator");
 
-  const Eigen::MatrixXd narrow = residuals.leftCols(15);
-  const Eigen::MatrixXd narrow_products = products.topRows(15);
-  const auto narrow_observed = observed.leftCols(15).eval();
-  if(backend.prepare_quantitative(narrow, design, narrow_products,
-       narrow_observed, true, nullptr) || backend.ready())
-    throw std::runtime_error("small quantitative panel bypass failed");
+  if(!std::getenv("REGENIE_STEP2_QT_BLOCK_MIN_PHENOTYPES")) {
+    const Eigen::MatrixXd narrow = residuals.leftCols(11);
+    const Eigen::MatrixXd narrow_products = products.topRows(11);
+    const auto narrow_observed = observed.leftCols(11).eval();
+    if(backend.prepare_quantitative(narrow, design, narrow_products,
+         narrow_observed, true, nullptr) || backend.ready())
+      throw std::runtime_error("small quantitative panel bypass failed");
+  }
 }
 
 void check_binary(Step2ComputeBackend& backend) {

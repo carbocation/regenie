@@ -4407,6 +4407,12 @@ void Data::prepare_step2_compute_backend() {
       pheno_data.new_cov, pheno_data.YtX, pheno_data.masked_indivs,
       complete_masks,
       params.profile_step2 ? &step2_compute_timings : nullptr);
+    if(step2_compute_backend->ready() &&
+       Gblock.step2_pgen_direct_qt_enabled) {
+      Gblock.step2_pgen_direct_qt_enabled = false;
+      Gblock.step2_pgen_direct_qt_terms_valid = false;
+      Gblock.step2_pgen_direct_qt_terms.resize(0, 0);
+    }
     return;
   }
 
@@ -4488,7 +4494,9 @@ void Data::compute_res(){
     (params.n_variants >= 1000) &&
     (params.prop_zero_thr < 1);
   Gblock.step2_qt_sparse_residuals_valid =
-    step2_qt_sparse_base_eligible && (params.n_pheno >= 16);
+    step2_qt_sparse_base_eligible &&
+    should_use_cpu_quantitative_block_scoring(
+      params.n_samples, params.n_pheno, step2_qt_masks_complete);
   Gblock.step2_pgen_direct_qt_enabled =
     step2_qt_sparse_base_eligible && step2_qt_masks_complete &&
     (params.n_pheno == 1);
@@ -4713,7 +4721,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   Gblock.step2_qt_YtG_valid = false;
   const bool batched_dense_qt_base_eligible =
     use_unscaled_dense_qt && qt_phenotypes_have_complete_masks &&
-    (params.file_type == "pgen") && (params.n_pheno >= 16);
+    (params.file_type == "pgen") &&
+    should_use_cpu_quantitative_block_scoring(
+      params.n_samples, params.n_pheno, true);
   size_t dense_qt_score_candidates = 0;
   if(batched_dense_qt_base_eligible) {
     const double sparse_zero_threshold =

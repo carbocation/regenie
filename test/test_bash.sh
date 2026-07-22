@@ -474,24 +474,39 @@ done
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
-# PGEN quantitative traits with phenotype-specific missingness
-rgcmd="--step 2 \
-  --pgen ${mntpt}example/example \
-  --covarFile ${mntpt}example/covariates.txt \
-  --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
-  --remove ${mntpt}example/fid_iid_to_remove.txt \
-  --bsize 200 \
-  --force-qt \
-  --ignore-pred \
-  --out ${mntpt}test/test_bin_out_pgen_qt_missing"
+# Quantitative traits with phenotype-specific missingness. PGEN should select
+# block scoring automatically and retain the materialized BED result exactly.
+for file_type in bed pgen; do
+  rgcmd="--step 2 \
+    --${file_type} ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt \
+    --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --force-qt \
+    --ignore-pred \
+    --step2-profile \
+    --out ${mntpt}test/test_bin_out_${file_type}_qt_missing"
 
-./$regenie_bin $rgcmd
+  ./$regenie_bin $rgcmd
+done
 
 for phenotype in Y1 Y2; do
   if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie")" != "1001" ]; then
     print_err
+  elif ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_bed_qt_missing_${phenotype}.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie"
+  then
+    print_err
   fi
 done
+
+if ! grep -Eq '^STEP2_PROFILE scope=compute_backend name=cpu .* scored_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing.log"
+then
+  print_custom_err "Step 2 PGEN missing-QT block scoring was not exercised."
+fi
 
 
 (( i++ ))
