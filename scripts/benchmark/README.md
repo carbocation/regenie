@@ -4,8 +4,8 @@ The reports in this directory answer two practical questions:
 
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
-| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000, M=700,000 with 32 quantitative traits or eight binary/survival models; N=50,000 generalization checks; matched eight-core CPU run | A100 Level 1 is 1.47-1.96x faster for binary and survival models, while quantitative Level 1 is now limited mainly by reading retained Level 0 data |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Upstream/current N=500,000, M=700,000 comparisons for 32 quantitative, binary, and survival traits; N=500,000, M=100,000,000 placement model | Current CPU is 6.6-18.0x faster than upstream; use one co-located Spot N2 worker per chromosome |
+| [Stage 1 production benchmark](results/2026-07-19-production.md) | A100 `b5f86e9` versus parent `c312f41` at N=500,000, M=700,000, with P=32 quantitative or P=8 binary/survival traits; separate N=50,000 and CPU checks | Versus `c312f41`, `b5f86e9` cuts A100 Level 1 by 1.47x for binary and 1.96x for survival; this is not an upstream comparison |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Batched CPU revision `8953759` versus upstream v4.1.2 (`5f924b9`) at N=500,000, M=700,000, P=32; production projection at M=100,000,000 | Versus upstream `5f924b9`, `8953759` is 6.6-18.0x faster on the same N2; the recommended placement is one co-located Spot N2 worker per chromosome |
 
 Each report states `N`, `M`, trait count, model, hardware, and whether a number
 is measured or projected. The TSV files hold the detailed run records and
@@ -80,30 +80,31 @@ checksum across systems.
 
 Stage 1:
 
-- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — retained run-level measurements for
-  the earlier Stage 1 work.
-- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — matched multi-trait Level 1 controls and
-  current measurements at N=500,000, plus smaller-sample and CPU
-  generalization checks.
+- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — Stage 1 measurements from revisions
+  `114ef81`, `dc64b54`, `fa7506f`, and upstream v4.1.2 (`5f924b9`), with N,
+  M, trait count, system, and cache state in every row.
+- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — A100 `b5f86e9` versus `c312f41`
+  multi-trait Level 1 comparisons at N=500,000 and M=700,000, plus explicitly
+  labeled N=50,000 and CPU diagnostic comparisons.
 
 Stage 2:
 
-- [`results/2026-07-21-step2-upstream.tsv`](results/2026-07-21-step2-upstream.tsv) — upstream v4.1.2 and matched
-  current measurements at N=500,000, including the full M=700,000 anchor and
-  chromosome-sized model/missingness comparisons.
+- [`results/2026-07-21-step2-upstream.tsv`](results/2026-07-21-step2-upstream.tsv) — upstream v4.1.2 (`5f924b9`)
+  measurements at N=500,000, including the full M=700,000 quantitative anchor
+  and chromosome-sized model/missingness runs.
 - [`results/2026-07-21-step2-upstream-comparison.tsv`](results/2026-07-21-step2-upstream-comparison.tsv) — direct and
-  validated steady-state upstream/current comparison at N=500,000 and
-  M=700,000.
-- [`results/2026-07-21-step2-upstream-production.tsv`](results/2026-07-21-step2-upstream-production.tsv) — upstream,
-  current CPU, and current A100 wall-time and cost projections at 100 million
-  variants.
-- [`results/2026-07-20-step2-cpu-block.tsv`](results/2026-07-20-step2-cpu-block.tsv) — current oneMKL CPU measurements,
+  validated upstream `5f924b9` versus batched CPU `8953759` comparison at
+  N=500,000, M=700,000, and P=32.
+- [`results/2026-07-21-step2-upstream-production.tsv`](results/2026-07-21-step2-upstream-production.tsv) — upstream
+  `5f924b9`, batched CPU `8953759`, and CUDA `8953759` wall-time and cost
+  projections at N=500,000, M=100,000,000, and P=32.
+- [`results/2026-07-20-step2-cpu-block.tsv`](results/2026-07-20-step2-cpu-block.tsv) — oneMKL CPU revision `8953759`
   phase timings, correction-heavy runs, and validation.
 - [`results/2026-07-20-step2-trait-matrix.tsv`](results/2026-07-20-step2-trait-matrix.tsv) — measured A100/N2 score-only
   matrix and GPU telemetry.
-- [`results/2026-07-20-step2-large-anchor.tsv`](results/2026-07-20-step2-large-anchor.tsv) — cold-input N=500,000,
-  M=700,000 measurements and A100 block-size controls; the `--bsize 1000`
-  rows feed the production model.
+- [`results/2026-07-20-step2-large-anchor.tsv`](results/2026-07-20-step2-large-anchor.tsv) — cold-input revision
+  `8953759` measurements at N=500,000, M=700,000, and P=32, plus A100
+  block-size controls; the `--bsize 1000` rows feed the production model.
 - [`results/2026-07-20-step2-production-model.tsv`](results/2026-07-20-step2-production-model.tsv) — N=500,000,
   M=100,000,000 wall-time and whole-placement cost estimates.
 - [`results/2026-07-20-step2-chromosome-allocation.tsv`](results/2026-07-20-step2-chromosome-allocation.tsv) — 100 million
@@ -115,8 +116,9 @@ Stage 2:
   used for production placement estimates.
 - [`results/2026-07-20-step2-prices.tsv`](results/2026-07-20-step2-prices.tsv) — cloud price snapshot and source URLs.
 - [`results/2026-07-20-step2.tsv`](results/2026-07-20-step2.tsv) and
-  [`results/2026-07-20-step2-integrated.tsv`](results/2026-07-20-step2-integrated.tsv) — earlier CPU and integrated CUDA
-  controls.
+  [`results/2026-07-20-step2-integrated.tsv`](results/2026-07-20-step2-integrated.tsv) — historical CPU and integrated
+  CUDA controls; use the per-row revision rather than treating them as a
+  single baseline.
 - [`results/2026-07-20-step2-steady-state.tsv`](results/2026-07-20-step2-steady-state.tsv) — historical utilization and
   concurrency diagnostics.
 - [`results/2026-07-20-step2-cuda.tsv`](results/2026-07-20-step2-cuda.tsv) — standalone kernel diagnostics; these
