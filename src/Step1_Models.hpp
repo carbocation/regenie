@@ -84,6 +84,10 @@ struct ridgel1 {
   Eigen::MatrixXd beta_snp_step1; // MxR
   std::vector<Eigen::MatrixXd> top_snp_pgs;
   std::future<void> l0_write_future;
+  double profile_l0_write_service_ms = 0;
+  double profile_l0_write_wait_ms = 0;
+  uint64_t profile_l0_write_bytes = 0;
+  uint64_t profile_l0_async_writes = 0;
 };
 
 

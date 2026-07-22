@@ -83,6 +83,55 @@ int step1_level1_l0_read_threads(const struct param* params) {
     requested, std::max(1, params->threads)));
 }
 
+uint64_t step1_level0_async_write_limit_bytes() {
+  const char* value = std::getenv("REGENIE_STEP1_LEVEL0_ASYNC_WRITE_MB");
+  if(!value || !*value) return uint64_t(1024) * 1000000;
+  char* end = nullptr;
+  const unsigned long long requested_mb = std::strtoull(value, &end, 10);
+  if(!end || *end || requested_mb >
+       std::numeric_limits<uint64_t>::max() / 1000000)
+    throw std::invalid_argument(
+      "REGENIE_STEP1_LEVEL0_ASYNC_WRITE_MB must be a nonnegative integer");
+  return static_cast<uint64_t>(requested_mb) * 1000000;
+}
+
+void launch_level0_write(
+  struct ridgel1* l1, const std::vector<std::ofstream*>& output_files,
+  std::shared_ptr<Eigen::MatrixXd> predictions,
+  Eigen::Index prediction_rows, Eigen::Index phenotype_columns) {
+
+  if(!l1 || !predictions || prediction_rows < 0 || phenotype_columns < 0 ||
+     predictions->rows() != prediction_rows ||
+     predictions->cols() !=
+       static_cast<Eigen::Index>(output_files.size()) * phenotype_columns)
+    throw std::invalid_argument(
+      "asynchronous Level 0 write layout is inconsistent");
+  l1->l0_write_future = std::async(std::launch::async,
+    [l1, output_files, predictions, prediction_rows,
+     phenotype_columns] () {
+      const auto write_start = std::chrono::high_resolution_clock::now();
+      const Eigen::Index phenotype_elements =
+        prediction_rows * phenotype_columns;
+      uint64_t written_bytes = 0;
+      for(size_t slot = 0; slot < output_files.size(); ++slot) {
+        if(!output_files[slot]) continue;
+        output_files[slot]->write(reinterpret_cast<char*>(
+          predictions->data() + slot * phenotype_elements),
+          phenotype_elements * sizeof(double));
+        if(output_files[slot]->fail())
+          throw std::runtime_error(
+            "cannot successfully write temporary level 0 predictions to disk");
+        written_bytes += static_cast<uint64_t>(phenotype_elements) *
+          sizeof(double);
+      }
+      l1->profile_l0_write_service_ms +=
+        std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - write_start).count();
+      l1->profile_l0_write_bytes += written_bytes;
+      ++l1->profile_l0_async_writes;
+    });
+}
+
 class Level1L0ReadPipeline {
  public:
   Level1L0ReadPipeline(
@@ -996,21 +1045,8 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     predictions->swap(Xout);
     const Eigen::Index prediction_rows = params->n_samples;
     const Eigen::Index phenotype_columns = params->n_ridge_l0;
-    l1->l0_write_future = std::async(std::launch::async,
-      [output_files, predictions, prediction_rows,
-       phenotype_columns] () {
-        const Eigen::Index phenotype_elements =
-          prediction_rows * phenotype_columns;
-        for(size_t ph = 0; ph < output_files.size(); ++ph) {
-          if(!output_files[ph]) continue;
-          output_files[ph]->write(reinterpret_cast<char*>(
-            predictions->data() + ph * phenotype_elements),
-            phenotype_elements * sizeof(double));
-          if(output_files[ph]->fail())
-            throw std::runtime_error(
-              "cannot successfully write temporary level 0 predictions to disk");
-        }
-      });
+    launch_level0_write(
+      l1, output_files, predictions, prediction_rows, phenotype_columns);
     sout << "done";
     const auto t3 = std::chrono::high_resolution_clock::now();
     const auto duration =
@@ -1114,6 +1150,33 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     cerr << "Wmat (Y1):\n" << l1->test_mat[0][0].topRows(5).middleCols(block_eff * params->n_ridge_l0, params->n_ridge_l0) << endl;
   }
 
+  std::vector<int> active_phenotypes;
+  active_phenotypes.reserve(params->n_pheno);
+  for(int ph = 0; ph < params->n_pheno; ++ph)
+    if(params->pheno_pass(ph)) active_phenotypes.push_back(ph);
+
+  const uint64_t prediction_rows = static_cast<uint64_t>(params->n_samples);
+  const uint64_t prediction_columns =
+    static_cast<uint64_t>(params->n_ridge_l0) * active_phenotypes.size();
+  uint64_t grouped_prediction_bytes = 0;
+  if(prediction_rows > 0 &&
+     prediction_columns <=
+       std::numeric_limits<uint64_t>::max() / prediction_rows &&
+     prediction_rows * prediction_columns <=
+       std::numeric_limits<uint64_t>::max() / sizeof(double))
+    grouped_prediction_bytes =
+      prediction_rows * prediction_columns * sizeof(double);
+  const bool async_grouped_write =
+    params->write_l0_pred && active_phenotypes.size() > 1 &&
+    grouped_prediction_bytes > 0 && grouped_prediction_bytes <=
+      step1_level0_async_write_limit_bytes();
+  std::shared_ptr<MatrixXd> grouped_predictions;
+  if(async_grouped_write)
+    grouped_predictions.reset(new MatrixXd(
+      params->n_samples,
+      active_phenotypes.size() * params->n_ridge_l0));
+  size_t phenotype_slot = 0;
+
   // center and scale using the whole sample
   for(int ph = 0; ph < params->n_pheno; ++ph ) {
 
@@ -1127,7 +1190,8 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     if(params->print_block_betas)
       params->beta_print_out[ph].array().colwise() *= p_invsd.transpose().array();
 
-    if(params->write_l0_pred) Xout = MatrixXd::Zero(params->n_samples, params->n_ridge_l0);
+    if(params->write_l0_pred && !async_grouped_write)
+      Xout = MatrixXd::Zero(params->n_samples, params->n_ridge_l0);
 
     cum_size_folds = 0;
     for(int i = 0; i < params->cv_folds; ++i ) {
@@ -1141,9 +1205,37 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
 
       if(params->write_l0_pred) {
         if (params->trait_mode != 3) {
-          Xout.block(cum_size_folds, 0, params->cv_sizes(i), params->n_ridge_l0) = l1->test_mat[ph][i].block(0, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0);
+          if(async_grouped_write)
+            grouped_predictions->block(
+              cum_size_folds,
+              static_cast<Eigen::Index>(phenotype_slot) *
+                params->n_ridge_l0,
+              params->cv_sizes(i), params->n_ridge_l0) =
+                l1->test_mat[ph][i].block(
+                  0, block_eff * params->n_ridge_l0,
+                  params->cv_sizes(i), params->n_ridge_l0);
+          else
+            Xout.block(
+              cum_size_folds, 0, params->cv_sizes(i),
+              params->n_ridge_l0) = l1->test_mat[ph][i].block(
+                0, block_eff * params->n_ridge_l0,
+                params->cv_sizes(i), params->n_ridge_l0);
         } else {
-          Xout.block(cum_size_folds, 0, params->cv_sizes(i), params->n_ridge_l0) = l1->test_mat_conc[ph].block(cum_size_folds, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0);
+          if(async_grouped_write)
+            grouped_predictions->block(
+              cum_size_folds,
+              static_cast<Eigen::Index>(phenotype_slot) *
+                params->n_ridge_l0,
+              params->cv_sizes(i), params->n_ridge_l0) =
+                l1->test_mat_conc[ph].block(
+                  cum_size_folds, block_eff * params->n_ridge_l0,
+                  params->cv_sizes(i), params->n_ridge_l0);
+          else
+            Xout.block(
+              cum_size_folds, 0, params->cv_sizes(i),
+              params->n_ridge_l0) = l1->test_mat_conc[ph].block(
+                cum_size_folds, block_eff * params->n_ridge_l0,
+                params->cv_sizes(i), params->n_ridge_l0);
         }
       }
       cum_size_folds += params->cv_sizes(i);
@@ -1153,16 +1245,38 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     if(params->write_l0_pred) {
       if(cache_level1_design) {
         Step1ComputeTimings cache_timings;
-        compute_backend->append_level1_design_cache(
-          static_cast<Eigen::Index>(block) * params->n_ridge_l0,
-          Xout, params->profile_step1 ? &cache_timings : nullptr);
+        if(async_grouped_write)
+          compute_backend->append_level1_design_cache(
+            static_cast<Eigen::Index>(block) * params->n_ridge_l0,
+            grouped_predictions->middleCols(
+              static_cast<Eigen::Index>(phenotype_slot) *
+                params->n_ridge_l0,
+              params->n_ridge_l0),
+            params->profile_step1 ? &cache_timings : nullptr);
+        else
+          compute_backend->append_level1_design_cache(
+            static_cast<Eigen::Index>(block) * params->n_ridge_l0,
+            Xout, params->profile_step1 ? &cache_timings : nullptr);
         if(params->profile_step1)
           l0->profile_backend_upload_ms += cache_timings.upload_ms;
       }
-      write_l0_file(files->write_preds_files[ph].get(), Xout, sout);
+      if(!async_grouped_write)
+        write_l0_file(files->write_preds_files[ph].get(), Xout, sout);
       //if(block ==0 && ph == 0 ) sout << endl << "Out " << endl <<  Xout.block(0, 0, 3, 3) << endl;
     }
 
+    ++phenotype_slot;
+  }
+
+  if(async_grouped_write) {
+    finish_l0_write(l1);
+    std::vector<std::ofstream*> output_files;
+    output_files.reserve(active_phenotypes.size());
+    for(const int ph : active_phenotypes)
+      output_files.push_back(files->write_preds_files[ph].get());
+    launch_level0_write(
+      l1, output_files, grouped_predictions, params->n_samples,
+      params->n_ridge_l0);
   }
 
   // if printing betas to file (average over folds) [assume snp IDs are unique]
@@ -1316,7 +1430,12 @@ void write_l0_file(ofstream* ofs, MatrixXd& Xout, mstream& sout){
 }
 
 void finish_l0_write(struct ridgel1* l1) {
-  if(l1->l0_write_future.valid()) l1->l0_write_future.get();
+  if(!l1->l0_write_future.valid()) return;
+  const auto wait_start = std::chrono::high_resolution_clock::now();
+  l1->l0_write_future.get();
+  l1->profile_l0_write_wait_ms +=
+    std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - wait_start).count();
 }
 
 

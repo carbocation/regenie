@@ -1993,6 +1993,17 @@ void Data::print_step1_profile() {
         << " estimated_overlap_ms=" << overlap_ms
         << "\n";
   }
+  if(l1_ests.profile_l0_async_writes > 0) {
+    out << "STEP1_PROFILE scope=level0_write"
+        << " async_writes=" << l1_ests.profile_l0_async_writes
+        << " bytes=" << l1_ests.profile_l0_write_bytes
+        << " service_ms=" << l1_ests.profile_l0_write_service_ms
+        << " wait_ms=" << l1_ests.profile_l0_write_wait_ms
+        << " estimated_overlap_ms=" << std::max(
+          0.0, l1_ests.profile_l0_write_service_ms -
+            l1_ests.profile_l0_write_wait_ms)
+        << "\n";
+  }
   out << "STEP1_PROFILE scope=genotype_preprocess"
       << " backend_blocks=" << step1_profile.preprocess_backend_blocks
       << " fallback_blocks=" << step1_profile.preprocess_fallback_blocks
