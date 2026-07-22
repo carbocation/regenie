@@ -5,7 +5,7 @@ The reports in this directory answer two practical questions:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) direct P=1 comparison and conservative upstream floors for P=8/P=32 at N=500,000, M=700,000; separate engineering diagnostics | The retained A100 P=1 pipeline is 74.38x faster than upstream; `b5f86e9` multi-trait A100 workloads are at least 6.44-12.20x faster than the measured upstream floor |
-| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `38c5f82` versus upstream v4.1.2 at N=500,000 and P=32; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | The current 700,000-tested-variant quantitative missingness run reaches 781.2 variants/s, 12.14x upstream; CPU chromosome fan-out remains the recommended placement |
+| [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `d189bfd` versus upstream v4.1.2 at N=500,000 and P=32; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | The current code reaches 781.2 variants/s for the 700,000-variant quantitative panel and 435.7 variants/s for the 57,821-variant survival panel, 12.14x and 18.43x upstream; CPU chromosome fan-out remains the recommended placement |
 
 Each report states `N`, trait count, model, hardware, and whether a number is
 measured or projected. Stage 1 reports use `M` for the number of markers used
