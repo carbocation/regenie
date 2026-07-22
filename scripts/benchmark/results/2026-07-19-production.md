@@ -4,41 +4,35 @@ Updated 2026-07-22 after profiling large, multi-trait Level 1 workloads.
 
 ## Result
 
-The A100 remains the right machine for Stage 1. Compared with parent revision
-`c312f41`, revision `b5f86e9` cuts Level 1 time by 1.47x for eight binary traits
-and 1.96x for eight survival models at N=500,000 and M=700,000. This is a
-comparison with the immediately preceding accelerated branch, **not with
-upstream REGENIE**. In the 32-trait quantitative workload, prediction-output
-time falls from 17.3 minutes at `c312f41` to 42 seconds at `b5f86e9`.
+The production baseline is upstream REGENIE v4.1.2 (`5f924b9`). Its directly
+measured N=500,000, M=700,000, P=1 quantitative run on the eight-core N2 takes
+8,207.13 seconds. The retained A100 pipeline at `dc64b54` completes that same
+workload in 110.34 seconds, a direct 74.38x placement speedup. On the same N2,
+the accelerated CPU revision `114ef81` takes 6,182.49 seconds, a direct 1.33x
+software speedup over upstream.
 
-The CPU path also improves: relative to a matched full-matrix Gram diagnostic
-build, the committed `b5f86e9` symmetric oneMKL path reduces an eight-trait
-quantitative Level 1 run on eight physical N2 cores from 289 to 227 seconds.
-That CPU comparison is described separately below. All calculations remain
-double precision, and the ridge grids, convergence criteria, and fitted models
-are unchanged.
+Matched upstream P=8 and P=32 Stage 1 runs were not completed. The measured
+upstream P=1 quantitative time can still serve as a conservative floor for the
+larger multi-trait workloads: adding outcomes does not remove the genotype,
+Level 0, or single-outcome work already present at P=1. On that basis,
+`b5f86e9` on A100 is at least 6.44x faster for P=32 quantitative, 12.20x for
+P=8 binary, and 11.38x for P=8 survival. These are lower bounds, not estimates
+of the exact upstream multi-trait runtime.
 
-| Model | N | M | Traits | System | `c312f41` Level 1 | `b5f86e9` Level 1 | `b5f86e9` / `c312f41` speedup | `c312f41` full run | `b5f86e9` full run |
-| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Quantitative, 0-10% input missingness | 500,000 | 700,000 | 32 | A100 | 1,049.96 s | 623.70 s | 1.68x | 45.0 min measured | 21.2 min estimated |
-| Binary, 0-10% input missingness | 500,000 | 700,000 | 8 | A100 | 442.26 s | 300.40 s | 1.47x | 13.60 min measured | 11.21 min estimated |
-| Survival, 0-10% input missingness | 500,000 | 700,000 | 8 | A100 | 475.54 s | 243.12 s | 1.96x | 15.89 min measured | 12.01 min estimated |
+| Model | N | M | P | Fork placement and full runtime | Upstream v4.1.2 comparator | Upstream basis | Minimum speedup over upstream |
+| --- | ---: | ---: | ---: | --- | ---: | --- | ---: |
+| Quantitative, 0-10% input missingness | 500,000 | 700,000 | 32 | `b5f86e9` A100: 21.2 min estimated | at least 136.79 min | Direct P=1 quantitative measurement used as a floor | at least 6.44x |
+| Binary, 0-10% input missingness | 500,000 | 700,000 | 8 | `b5f86e9` A100: 11.21 min estimated | at least 136.79 min | Direct P=1 quantitative measurement used as a conservative Level 0 floor | at least 12.20x |
+| Survival, 0-10% input missingness | 500,000 | 700,000 | 8 | `b5f86e9` A100: 12.01 min estimated | at least 136.79 min | Direct P=1 quantitative measurement used as a conservative Level 0 floor | at least 11.38x |
+| Quantitative, 0-10% input missingness | 500,000 | 700,000 | 8 | `b5f86e9` N2: 107.08 min estimated | at least 136.79 min | Direct P=1 quantitative measurement used as a floor | at least 1.28x |
 
-The `b5f86e9` A100 measurements use retained Level 0 files. Its estimated
-full-run totals replace the matched `c312f41` run's Level 1 and output times
-with the `b5f86e9` measurements while keeping the measured `c312f41` Level 0
-time. This avoids rerunning an unchanged Level 0 merely to obtain a new total.
-The N2 comparison uses a separate full-matrix Gram control described below.
-The N=50,000 checks are complete end-to-end runs.
-
-### Comparison map
-
-| Question | Workload | Compared implementation | Baseline | Upstream comparison? |
-| --- | --- | --- | --- | --- |
-| Did the new Level 1 work help the large multi-trait A100 workloads? | N=500,000, M=700,000; P=32 quantitative or P=8 binary/survival | `b5f86e9` | Parent revision `c312f41` | No |
-| Does the result generalize to a smaller N? | N=50,000, M=700,000, P=8 binary/survival | `b5f86e9` | Earlier multi-trait revision `fa7506f` | No |
-| Does the symmetric CPU Gram calculation help? | N=500,000, M=700,000, P=8 quantitative on N2 | Committed `b5f86e9` oneMKL path | Matched `b5f86e9` diagnostic build using the original full-matrix Gram | No |
-| How much faster is the accelerated CPU branch than released REGENIE? | N=500,000, M=700,000, P=1 quantitative on N2 | `114ef81` | Upstream v4.1.2 (`5f924b9`) | Yes |
+The fork runtimes in this table are estimated full runs: measured `b5f86e9`
+Level 1 and output times are combined with matched measured Level 0 times. The
+upstream floor is measured, but it has fewer outcomes; consequently only the
+minimum speedup is reported. No upstream number is shown for the N=50,000
+binary and survival checks later in this report. The only Stage 1 upstream
+measurement has N=500,000 and P=1 quantitative, and scaling it across both N
+and model would not be defensible.
 
 ## Workloads
 
@@ -83,9 +77,17 @@ cache and Level 0 prefetch have environment-variable off switches for
 diagnosis, but are enabled by default. The implementation does not use
 `float32`.
 
-## A100 comparison: `b5f86e9` versus `c312f41`
+## Engineering effect within the fork: `b5f86e9` versus `c312f41`
+
+This section attributes the Level 1 improvement to the new implementation. It
+is retained for engineering diagnosis; the production comparisons against
+upstream are in the opening table.
 
 ### Quantitative: N=500,000, M=700,000, P=32
+
+Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
+6.44x faster. The comparator is the measured 136.79-minute upstream P=1
+runtime used as a floor; upstream P=32 was not run.
 
 | Component | `c312f41` | `b5f86e9` | Ratio |
 | --- | ---: | ---: | ---: |
@@ -104,6 +106,11 @@ All 32 `b5f86e9` LOCO files are byte-for-byte identical to the matched
 `c312f41` files.
 
 ### Binary: N=500,000, M=700,000, P=8
+
+Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
+12.20x faster. The comparator is the measured 136.79-minute upstream P=1
+quantitative runtime used as a conservative Level 0 floor; upstream P=8
+binary was not run.
 
 | Component | `c312f41` | `b5f86e9` | Ratio |
 | --- | ---: | ---: | ---: |
@@ -125,6 +132,11 @@ reaches 100% utilization and approximately 350-407 W.
 
 ### Survival: N=500,000, M=700,000, P=8
 
+Against upstream v4.1.2, the estimated `b5f86e9` A100 full run is at least
+11.38x faster. The comparator is the measured 136.79-minute upstream P=1
+quantitative runtime used as a conservative Level 0 floor; upstream P=8
+survival was not run.
+
 | Component | `c312f41` | `b5f86e9` | Ratio |
 | --- | ---: | ---: | ---: |
 | Level 0 | 461.25 s measured | 461.25 s reused; not rerun | -- |
@@ -140,21 +152,24 @@ the important result is that elapsed time falls by 49%. All eight `b5f86e9`
 LOCO files, including missing values, are text-identical to the matched
 `c312f41` files.
 
-## Generalization checks across N and CPU hardware
+## Engineering generalization checks across N and CPU hardware
 
 Revision `b5f86e9` was also tested at N=50,000, M=700,000 without changing its
-defaults. These rows compare it with revision `fa7506f`, an earlier retained
-multi-trait A100 implementation; they are not upstream comparisons.
+defaults. These rows characterize `b5f86e9`; they do not use an intermediate
+fork revision as a performance baseline.
 
-| Model | N | M | Traits | `fa7506f` full run | `b5f86e9` full run | `fa7506f` Level 1 | `b5f86e9` Level 1 |
+No upstream estimate is reported because the available upstream Stage 1 run
+has N=500,000, P=1, and a quantitative model. Scaling across both N and model
+would be speculative.
+
+| Model | N | M | P | `b5f86e9` full run | Level 0 | Level 1 | Output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Binary, complete | 50,000 | 700,000 | 8 | 95.34 s | 62.00 s | 63.68 s | 35.03 s |
-| Survival, complete | 50,000 | 700,000 | 8 | 133.90 s | 57.81 s | 97.87 s | 26.85 s |
+| Binary, complete | 50,000 | 700,000 | 8 | 62.00 s | 22.72 s | 35.03 s | 2.68 s |
+| Survival, complete | 50,000 | 700,000 | 8 | 57.81 s | 26.67 s | 26.85 s | 2.71 s |
 
-Relative to `fa7506f`, the complete `b5f86e9` end-to-end runs are 1.54x faster
-for binary traits and 2.32x faster for survival traits. The benefit therefore
-survives a tenfold change in sample count and applies to two different
-iterative models.
+These complete end-to-end runs show that the implementation works at a tenfold
+smaller N and for two iterative models. They are not used to claim a speedup
+over upstream.
 
 On the eight-core N2, a matched `b5f86e9` diagnostic build using the original
 full-matrix CPU Gram calculation took 289.04 seconds for Level 1 at N=500,000,
@@ -166,24 +181,29 @@ change; it is neither an upstream comparison nor a comparison with
 Eigen and took 231.27 seconds, so its small difference from explicit oneMKL
 should be treated as run noise.
 
+For production context, the estimated 107.08-minute `b5f86e9` N2 full run is
+at least 1.28x faster than upstream v4.1.2. That again uses the measured
+136.79-minute upstream P=1 quantitative run as a floor because upstream P=8
+was not run.
+
 CPU Level 0 remains the larger problem. It took 6,195.76 seconds in the matched
 N2 run; residualization accounted for 3,563.67 seconds and Gram construction
 for 1,471.21 seconds. The process averaged roughly four busy cores during Level
 0 despite having eight available. Improving that path is more valuable for a
 CPU-only Stage 1 run than further tuning the now-four-minute Level 1 phase.
 
-## Overall Stage 1 placement
+## Direct P=1 upstream anchor
 
 The independent single-quantitative-trait production anchors below remain
 useful for machine placement. Every row uses N=500,000, M=700,000, and P=1;
 these are not the multi-trait `b5f86e9` comparisons above.
 
-| Implementation | Revision | System | Full run |
-| --- | --- | --- | ---: |
-| Retained A100 Level 0 pipeline | `dc64b54` | A100 | 110.34 s |
-| Accelerated CPU branch | `114ef81` | 8-core N2 | 6,182.49 s |
-| Upstream REGENIE v4.1.2 | `5f924b9` | 8-core N2 | 8,207.13 s |
-| CUDA branch | `114ef81` | T4 | 4,692.19 s |
+| Implementation | Revision | System | Full run | Speedup over upstream v4.1.2 |
+| --- | --- | --- | ---: | ---: |
+| Retained A100 Level 0 pipeline | `dc64b54` | A100 | 110.34 s | 74.38x |
+| Accelerated CPU branch | `114ef81` | 8-core N2 | 6,182.49 s | 1.33x |
+| Upstream REGENIE v4.1.2 | `5f924b9` | 8-core N2 | 8,207.13 s | 1.00x |
+| CUDA branch | `114ef81` | T4 | 4,692.19 s | 1.75x |
 
 The direct upstream comparison in this table is `114ef81` versus upstream
 v4.1.2 (`5f924b9`) on the same N2. The other rows compare hardware placements,
@@ -200,4 +220,6 @@ auto-backend, and Cox targets.
 The new measurements are in
 [`2026-07-22-step1-level1.tsv`](2026-07-22-step1-level1.tsv). Earlier Stage 1
 runs, including the upstream, T4, single-trait, and first multi-trait anchors,
-remain in [`2026-07-19-production.tsv`](2026-07-19-production.tsv).
+remain in [`2026-07-19-production.tsv`](2026-07-19-production.tsv). Direct and
+lower-bound upstream comparisons are collected in
+[`2026-07-22-step1-upstream.tsv`](2026-07-22-step1-upstream.tsv).
