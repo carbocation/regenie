@@ -90,7 +90,7 @@ if [ ! -f "${REGENIE_PATH}test/fit_bin_out.log" ] || \
   print_custom_err "$fail_msg"
 elif [ "`grep \"0.4504\" ${REGENIE_PATH}test/fit_bin_out.log | grep \"min value\"`" = "" ]; then
   print_custom_err "$fail_msg"
-elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "11" ]; then
+elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "12" ]; then
   print_custom_err "Step 1 profiling output is incomplete."
 elif ! grep -q '^STEP1_PROFILE version=9 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 profiling header is missing."
@@ -189,7 +189,7 @@ if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie")" != "10
   print_err
 elif [ "$(grep -c '^STEP2_PROFILE stage=' "${REGENIE_PATH}test/test_bin_out_firth.log")" != "8" ]; then
   print_custom_err "Step 2 profiling output is incomplete."
-elif ! grep -q '^STEP2_PROFILE version=1 mode=single_variant file_type=bgen trait=bt ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+elif ! grep -q '^STEP2_PROFILE version=2 mode=single_variant backend=cpu file_type=bgen trait=bt ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
   print_custom_err "Step 2 profiling header is missing."
 elif ! grep -q '^STEP2_PROFILE scope=setup ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
   print_custom_err "Step 2 setup profiling output is missing."
@@ -197,7 +197,7 @@ elif ! grep -q '^STEP2_PROFILE scope=bgen_parse ' "${REGENIE_PATH}test/test_bin_
   print_custom_err "Step 2 BGEN profiling output is missing."
 elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
   print_custom_err "Step 2 variant profiling output is missing."
-elif ! grep -q '^STEP2_PROFILE_FINAL version=1 mode=single_variant ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+elif ! grep -q '^STEP2_PROFILE_FINAL version=2 mode=single_variant backend=cpu ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
   print_custom_err "Step 2 final profiling output is missing."
 fi
 
@@ -392,10 +392,10 @@ rgcmd="--step 2 \
 
 ./$regenie_bin $rgcmd
 
-if ! grep -q ' batched_dense_qt_blocks=5 ' \
+if ! grep -Eq '^STEP2_PROFILE scope=compute_backend name=cpu .* scored_blocks=5 .*scored_variants=1000 ' \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16.log"
 then
-  print_custom_err "Step 2 PGEN batched dense-QT scores were not exercised."
+  print_custom_err "Step 2 PGEN blockwise dense-QT scores were not exercised."
 fi
 
 for phenotype in Y1 Y2; do
@@ -427,10 +427,10 @@ if ! grep -q ' shared_denom_sparse_qt_variants=1000 ' \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
 then
   print_custom_err "Step 2 PGEN shared sparse-QT denominator was not exercised."
-elif ! grep -q ' packed_sparse_variants=1000 ' \
+elif ! grep -Eq '^STEP2_PROFILE scope=compute_backend name=cpu .* scored_blocks=5 .*scored_variants=1000 ' \
   "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
 then
-  print_custom_err "Step 2 packed PGEN sparse-vector construction was not exercised."
+  print_custom_err "Step 2 PGEN sparse-threshold block scores were not exercised."
 fi
 
 for phenotype in Y1 Y2; do
