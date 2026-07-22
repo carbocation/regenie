@@ -3248,9 +3248,10 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       snp_data->n_zero = filters->ind_in_analysis.size() -
         params->n_samples + packed_stats.zeros;
       requires_mean_imputation = packed_stats.missing > 0;
-      // CUDA packed scoring returns exact phenotype-specific allele sums and
-      // nonmissing counts with the score matrices. Avoid expanding and
-      // revisiting the dense genotype solely for this bookkeeping.
+      // The CPU scorer needs the expanded genotype, but the packed hardcalls
+      // are still the cheaper source for phenotype-specific allele counts.
+      // Packed CUDA scoring obtains these counts from its score matrices and
+      // leaves this branch disabled.
       if(has_trait_missingness && !retain_unexpanded_packed) {
         update_autosomal_trait_counts_from_packed(packed_data, snp_data,
           filters->missing_sample_indices_by_pheno);
