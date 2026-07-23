@@ -1809,6 +1809,7 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
       Step1ComputeTimings timings;
       if(step1_compute_backend->cache_preprocessed_fold_systems(
            fold_starts, fold_counts, pheno_data.phenotypes,
+           params.pheno_pass,
            params.profile_step1 ? &timings : nullptr)) {
         if(params.profile_step1) {
           step1_profile.gty_ms += timings.crossproduct_ms;

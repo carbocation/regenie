@@ -549,6 +549,75 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
         "packed hardcall cached fold ridge conformance failed");
   }
 
+  if(cached_fold_products_supported) {
+    Eigen::Array<bool, Eigen::Dynamic, 1> active_outcomes =
+      Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(
+        outcomes.cols(), false);
+    active_outcomes(0) = true;
+    if(!candidate.cache_preprocessed_fold_systems(
+         cached_fold_starts, cached_fold_counts, outcomes,
+         active_outcomes))
+      throw std::runtime_error(
+        "active-outcome cached fold systems were not supported");
+    std::vector<Eigen::MatrixXd> active_predictions;
+    std::vector<Eigen::MatrixXd> active_coefficients;
+    if(!candidate.ridge_predict_cached_preprocessed_systems(
+         cached_fold_starts, cached_fold_counts, ridge_parameters,
+         active_predictions, active_coefficients))
+      throw std::runtime_error(
+        "active-outcome cached fold ridge was not supported");
+    if(active_predictions.size() != cached_fold_count ||
+       active_coefficients.size() != cached_fold_count)
+      throw std::runtime_error(
+        "active-outcome cached fold ridge returned invalid metadata");
+    const Eigen::MatrixXd active_outcome = outcomes.leftCols(1);
+    const Eigen::MatrixXd active_crossproduct = imputed * active_outcome;
+    for(int fold = 0; fold < cached_fold_count; ++fold) {
+      const Eigen::MatrixXd held_out_genotypes = imputed.middleCols(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd held_out_outcome = active_outcome.middleRows(
+        cached_fold_starts(fold), cached_fold_counts(fold));
+      const Eigen::MatrixXd training_gram = expected_gram -
+        held_out_genotypes * held_out_genotypes.transpose();
+      const Eigen::MatrixXd training_crossproduct = active_crossproduct -
+        held_out_genotypes * held_out_outcome;
+      oracle->factorize_ridge_system(
+        training_gram, training_crossproduct);
+      oracle->ridge_predict_factorized(
+        held_out_genotypes, true, ridge_parameters, no_outcomes, false,
+        expected_predictions, expected_coefficients);
+      if(relative_error(active_predictions[fold], expected_predictions) >
+           preprocessing_tolerance ||
+         relative_error(active_coefficients[fold], expected_coefficients) >
+           preprocessing_tolerance)
+        throw std::runtime_error(
+          "active-outcome cached fold ridge conformance failed");
+    }
+    Eigen::MatrixXd expected_active_normalized(
+      samples, ridge_parameters.size());
+    for(int fold = 0; fold < cached_fold_count; ++fold)
+      expected_active_normalized.middleRows(
+        cached_fold_starts(fold), cached_fold_counts(fold)) =
+          active_predictions[fold];
+    const Eigen::RowVectorXd active_means =
+      expected_active_normalized.colwise().mean();
+    const Eigen::RowVectorXd active_inverse_standard_deviations =
+      ((samples - 1.0) /
+       (expected_active_normalized.colwise().squaredNorm().array() -
+        samples * active_means.array().square())).sqrt();
+    expected_active_normalized.rowwise() -= active_means;
+    expected_active_normalized.array().rowwise() *=
+      active_inverse_standard_deviations.array();
+    Eigen::MatrixXd active_normalized;
+    if(!candidate.ridge_predict_cached_preprocessed_systems_normalized(
+         cached_fold_starts, cached_fold_counts, ridge_parameters,
+         samples, -1, active_normalized) ||
+       relative_error(active_normalized, expected_active_normalized) >
+         8e-11)
+      throw std::runtime_error(
+        "active-outcome normalized cached ridge conformance failed");
+  }
+
   oracle->factorize_ridge_system(expected_gram, expected_crossproduct);
   oracle->ridge_predict_factorized(imputed, true,
     ridge_parameters, no_outcomes, false,

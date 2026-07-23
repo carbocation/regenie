@@ -198,6 +198,21 @@ bool Step1ComputeBackend::cache_preprocessed_fold_systems(
   return false;
 }
 
+bool Step1ComputeBackend::cache_preprocessed_fold_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+  const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
+    active_phenotypes,
+  Step1ComputeTimings* timings) {
+  if(active_phenotypes.size() != phenotypes.cols())
+    throw std::invalid_argument(
+      "Step 1 cached fold systems received an incompatible active-outcome mask");
+  if(!active_phenotypes.all()) return false;
+  return cache_preprocessed_fold_systems(
+    start_columns, column_counts, phenotypes, timings);
+}
+
 void Step1ComputeBackend::ridge_predict_preprocessed(
   Eigen::Index start_column,
   Eigen::Index column_count,

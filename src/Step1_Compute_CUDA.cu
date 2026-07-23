@@ -1893,13 +1893,31 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
       Step1ComputeTimings* timings) override {
 
+      const Eigen::Array<bool, Eigen::Dynamic, 1> active_phenotypes =
+        Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(
+          phenotypes.cols(), true);
+      return cache_preprocessed_fold_systems(
+        start_columns, column_counts, phenotypes, active_phenotypes,
+        timings);
+    }
+
+    bool cache_preprocessed_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
+        active_phenotypes,
+      Step1ComputeTimings* timings) override {
+
       invalidate_resident_fold_systems();
       const Eigen::Index system_count_index = start_columns.size();
       if(!level0_resident_folds_enabled_ || !level0_cholesky_enabled_ ||
          !level0_fold_batch_enabled_ || system_count_index < 2)
         return false;
       if(!resident_valid_ || column_counts.size() != system_count_index ||
-         phenotypes.rows() != resident_columns_)
+         phenotypes.rows() != resident_columns_ ||
+         active_phenotypes.size() != phenotypes.cols() ||
+         active_phenotypes.count() == 0)
         throw std::invalid_argument(
           "Step 1 resident fold products received incompatible dimensions");
       for(Eigen::Index system = 0; system < system_count_index; ++system) {
@@ -1915,6 +1933,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_rows_, "resident fold product row count");
       const int phenotype_count = checked_int(
         phenotypes.cols(), "resident fold product phenotype count");
+      std::vector<int> active_phenotype_indices;
+      active_phenotype_indices.reserve(active_phenotypes.count());
+      for(Eigen::Index phenotype = 0;
+          phenotype < active_phenotypes.size(); ++phenotype)
+        if(active_phenotypes(phenotype))
+          active_phenotype_indices.push_back(
+            static_cast<int>(phenotype));
       const Eigen::Index gram_elements = resident_rows_ * resident_rows_;
       const Eigen::Index rhs_elements = resident_rows_ * phenotypes.cols();
       ensure_level0_cholesky_lane_count(system_count);
@@ -2056,6 +2081,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
       resident_fold_system_count_ = system_count_index;
       resident_fold_rhs_count_ = phenotypes.cols();
+      // Keep every RHS in cuBLAS/cuSOLVER so active outcomes retain the
+      // validated arithmetic; only their device-to-host results are compacted.
+      if(active_phenotype_indices.size() ==
+           static_cast<size_t>(phenotypes.cols()))
+        active_phenotype_indices.clear();
+      resident_fold_output_indices_.swap(active_phenotype_indices);
       resident_fold_systems_valid_ = true;
       resident_fold_systems_design_orientation_ = false;
       return true;
@@ -2773,12 +2804,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "normalized Level 0 prediction parameter count");
       const int outcome_count = checked_int(resident_fold_rhs_count_,
         "normalized Level 0 prediction outcome count");
+      const int output_outcome_count =
+        resident_fold_output_indices_.empty() ? outcome_count : checked_int(
+          resident_fold_output_indices_.size(),
+          "normalized Level 0 prediction output count");
       const int columns = checked_int(
         ridge_parameters.size() * resident_fold_rhs_count_,
         "normalized Level 0 prediction column count");
+      const int output_columns = checked_int(
+        static_cast<Eigen::Index>(parameter_count) * output_outcome_count,
+        "normalized Level 0 output column count");
       const int element_count = checked_element_count(
         rows, columns, "normalized Level 0 predictions");
-      normalized_predictions.resize(rows, columns);
+      normalized_predictions.resize(rows, output_columns);
       if(rows == 0 || columns == 0) {
         normalized_predictions.setZero();
         return true;
@@ -2885,7 +2923,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       if(timings) phase_start = ComputeClock::now();
       const size_t normalized_bytes =
-        static_cast<size_t>(element_count) * sizeof(double);
+        static_cast<size_t>(normalized_predictions.size()) * sizeof(double);
       bool unregister_normalized_predictions = false;
       const cudaError_t registration_status = cudaHostRegister(
         normalized_predictions.data(), normalized_bytes,
@@ -2895,11 +2933,26 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       } else {
         cudaGetLastError();
       }
-      check_cuda(cudaMemcpy(normalized_predictions.data(),
-        normalized_destination,
-        normalized_bytes,
-        cudaMemcpyDeviceToHost),
-        "copy normalized Level 0 predictions from CUDA device");
+      if(resident_fold_output_indices_.empty()) {
+        check_cuda(cudaMemcpy(normalized_predictions.data(),
+          normalized_destination, normalized_bytes,
+          cudaMemcpyDeviceToHost),
+          "copy normalized Level 0 predictions from CUDA device");
+      } else {
+        const size_t outcome_bytes = static_cast<size_t>(rows) *
+          parameter_count * sizeof(double);
+        for(int output = 0; output < output_outcome_count; ++output) {
+          const int source_outcome = resident_fold_output_indices_[output];
+          check_cuda(cudaMemcpy(
+            normalized_predictions.data() +
+              static_cast<Eigen::Index>(output) * parameter_count * rows,
+            normalized_destination +
+              static_cast<Eigen::Index>(source_outcome) * parameter_count *
+                rows,
+            outcome_bytes, cudaMemcpyDeviceToHost),
+            "copy selected normalized Level 0 predictions from CUDA device");
+        }
+      }
       if(unregister_normalized_predictions)
         check_cuda(cudaHostUnregister(normalized_predictions.data()),
           "cudaHostUnregister(normalized Level 0 predictions)");
@@ -2953,6 +3006,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const int parameter_count = checked_int(
         ridge_parameters.size(),
         "cached fold Cholesky ridge parameter count");
+      const int output_right_hand_side_count =
+        resident_fold_output_indices_.empty() ? right_hand_side_count :
+          checked_int(resident_fold_output_indices_.size(),
+            "cached fold Cholesky output count");
       const long long combination_count_long =
         static_cast<long long>(right_hand_side_count) * parameter_count;
       if(combination_count_long > INT_MAX)
@@ -2960,6 +3017,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "cached fold Cholesky ridge combination count exceeds integer limits");
       const int combination_count =
         static_cast<int>(combination_count_long);
+      const int output_combination_count = checked_int(
+        static_cast<Eigen::Index>(output_right_hand_side_count) *
+          parameter_count,
+        "cached fold Cholesky output combination count");
 
       predictions.resize(system_count);
       coefficients.resize(system_count);
@@ -2967,8 +3028,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const Eigen::Index sample_count = column_counts(
           static_cast<Eigen::Index>(system));
         if(copy_results_to_host) {
-          predictions[system].resize(sample_count, combination_count);
-          coefficients[system].resize(size_index, combination_count);
+          predictions[system].resize(sample_count, output_combination_count);
+          coefficients[system].resize(
+            size_index, output_combination_count);
         }
       }
       if(size == 0 || right_hand_side_count == 0 ||
@@ -3154,15 +3216,46 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(timings) phase_start = ComputeClock::now();
         for(size_t system = 0; system < system_count; ++system) {
           CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
-          check_cuda(cudaMemcpyAsync(coefficients[system].data(),
-            lane.coefficients, coefficients[system].size() * sizeof(double),
-            cudaMemcpyDeviceToHost, lane.stream),
-            "copy cached fold Cholesky coefficients from CUDA device");
-          if(predictions[system].size() > 0)
-            check_cuda(cudaMemcpyAsync(predictions[system].data(),
-              lane.predictions, predictions[system].size() * sizeof(double),
+          if(resident_fold_output_indices_.empty()) {
+            check_cuda(cudaMemcpyAsync(coefficients[system].data(),
+              lane.coefficients,
+              coefficients[system].size() * sizeof(double),
               cudaMemcpyDeviceToHost, lane.stream),
-              "copy cached fold Cholesky predictions from CUDA device");
+              "copy cached fold Cholesky coefficients from CUDA device");
+            if(predictions[system].size() > 0)
+              check_cuda(cudaMemcpyAsync(predictions[system].data(),
+                lane.predictions,
+                predictions[system].size() * sizeof(double),
+                cudaMemcpyDeviceToHost, lane.stream),
+                "copy cached fold Cholesky predictions from CUDA device");
+            continue;
+          }
+          const Eigen::Index sample_count = column_counts(
+            static_cast<Eigen::Index>(system));
+          for(int parameter = 0; parameter < parameter_count; ++parameter) {
+            for(int output = 0;
+                output < output_right_hand_side_count; ++output) {
+              const int source_outcome =
+                resident_fold_output_indices_[output];
+              const Eigen::Index source_column =
+                parameter * right_hand_side_count + source_outcome;
+              const Eigen::Index destination_column =
+                parameter * output_right_hand_side_count + output;
+              check_cuda(cudaMemcpyAsync(
+                coefficients[system].col(destination_column).data(),
+                lane.coefficients + source_column * size_index,
+                static_cast<size_t>(size_index) * sizeof(double),
+                cudaMemcpyDeviceToHost, lane.stream),
+                "copy selected cached fold Cholesky coefficients");
+              if(sample_count > 0)
+                check_cuda(cudaMemcpyAsync(
+                  predictions[system].col(destination_column).data(),
+                  lane.predictions + source_column * sample_count,
+                  static_cast<size_t>(sample_count) * sizeof(double),
+                  cudaMemcpyDeviceToHost, lane.stream),
+                  "copy selected cached fold Cholesky predictions");
+            }
+          }
         }
         synchronize_level0_cholesky_lanes(system_count);
         if(timings) timings->download_ms += elapsed_ms(phase_start);
@@ -5543,6 +5636,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     void invalidate_resident_fold_systems() {
       resident_fold_system_count_ = 0;
       resident_fold_rhs_count_ = 0;
+      resident_fold_output_indices_.clear();
       resident_fold_systems_valid_ = false;
       resident_fold_systems_design_orientation_ = false;
     }
@@ -5789,6 +5883,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     Eigen::Index level1_design_cached_columns_;
     Eigen::Index resident_fold_system_count_;
     Eigen::Index resident_fold_rhs_count_;
+    std::vector<int> resident_fold_output_indices_;
     bool resident_fold_systems_valid_;
     bool resident_fold_systems_design_orientation_;
     bool packed_static_inputs_valid_;

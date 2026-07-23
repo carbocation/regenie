@@ -124,6 +124,14 @@ class Step1ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
       Step1ComputeTimings* timings = nullptr);
 
+    virtual bool cache_preprocessed_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
+        active_phenotypes,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void ridge_predict_preprocessed(
       Eigen::Index start_column,
       Eigen::Index column_count,

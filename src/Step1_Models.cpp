@@ -957,6 +957,14 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   vector<MatrixXd> fold_predictions;
   vector<MatrixXd> fold_coefficients;
   Step1ComputeTimings batched_timings;
+  std::vector<int> active_phenotypes;
+  active_phenotypes.reserve(params->n_pheno);
+  std::vector<int> phenotype_slots(params->n_pheno, -1);
+  for(int ph = 0; ph < params->n_pheno; ++ph) {
+    if(!params->pheno_pass(ph)) continue;
+    phenotype_slots[ph] = active_phenotypes.size();
+    active_phenotypes.push_back(ph);
+  }
   bool all_phenotypes_complete = true;
   for(int ph = 0; ph < params->n_pheno; ++ph) {
     if(!params->pheno_pass(ph)) continue;
@@ -1036,10 +1044,10 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
       }
     }
     finish_l0_write(l1);
-    std::vector<std::ofstream*> output_files(params->n_pheno, nullptr);
-    for(int ph = 0; ph < params->n_pheno; ++ph)
-      if(params->pheno_pass(ph))
-        output_files[ph] = files->write_preds_files[ph].get();
+    std::vector<std::ofstream*> output_files;
+    output_files.reserve(active_phenotypes.size());
+    for(const int ph : active_phenotypes)
+      output_files.push_back(files->write_preds_files[ph].get());
     std::shared_ptr<Eigen::MatrixXd> predictions(
       new Eigen::MatrixXd());
     predictions->swap(Xout);
@@ -1055,14 +1063,6 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     return;
   }
 
-  std::vector<int> active_phenotypes;
-  active_phenotypes.reserve(params->n_pheno);
-  std::vector<int> phenotype_slots(params->n_pheno, -1);
-  for(int ph = 0; ph < params->n_pheno; ++ph) {
-    if(!params->pheno_pass(ph)) continue;
-    phenotype_slots[ph] = active_phenotypes.size();
-    active_phenotypes.push_back(ph);
-  }
   const uint64_t prediction_rows = static_cast<uint64_t>(params->n_samples);
   const uint64_t prediction_columns =
     static_cast<uint64_t>(params->n_ridge_l0) * active_phenotypes.size();
@@ -1137,12 +1137,20 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
       }
     }
 
+    const bool compact_batched_predictions = used_cached_cholesky &&
+      active_phenotypes.size() < static_cast<size_t>(params->n_pheno) &&
+      batched_predictions.cols() == params->n_ridge_l0 *
+        static_cast<Eigen::Index>(active_phenotypes.size());
+    const int batched_phenotype_count = compact_batched_predictions ?
+      static_cast<int>(active_phenotypes.size()) : params->n_pheno;
+
     for(int j = 0; j < params->n_ridge_l0; ++j ) {
 
       // store predictions
       for(int ph = 0; ph < params->n_pheno; ++ph ) {
         if( !params->pheno_pass(ph) ) continue;
-        const int combination = j * params->n_pheno + ph;
+        const int combination = j * batched_phenotype_count +
+          (compact_batched_predictions ? phenotype_slots[ph] : ph);
         VectorXd prediction = batched_predictions.col(combination).array() *
           masked_in_folds[i].col(ph).array().cast<double>();
         p_sum(j, ph) += prediction.sum();
