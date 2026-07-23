@@ -59,6 +59,8 @@ struct ridgel0 {
   double profile_backend_upload_ms = 0;
   double profile_backend_download_ms = 0;
   double profile_backend_ridge_compute_ms = 0;
+  uint64_t profile_pinned_download_count = 0;
+  uint64_t profile_pinned_download_bytes = 0;
   uint64_t profile_cholesky_ridge_folds = 0;
   uint64_t profile_batched_cholesky_ridge_blocks = 0;
   uint64_t profile_eigendecomposition_ridge_folds = 0;

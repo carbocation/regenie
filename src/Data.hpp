@@ -65,6 +65,8 @@ struct Step1Profile {
   double ridge_transfer_ms = 0;
   double ridge_backend_compute_ms = 0;
   double ridge_host_orchestration_ms = 0;
+  uint64_t ridge_pinned_download_count = 0;
+  uint64_t ridge_pinned_download_bytes = 0;
   uint64_t ridge_cholesky_folds = 0;
   uint64_t ridge_batched_cholesky_blocks = 0;
   uint64_t ridge_eigendecomposition_folds = 0;

@@ -698,6 +698,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         (level0_resident_folds_enabled_ ? "enabled" : "disabled");
       result << ", registered packed input " <<
         (register_packed_hardcalls_enabled_ ? "enabled" : "disabled");
+      result << ", pinned level0 download enabled";
       result << ")";
       return result.str();
     }
@@ -3278,6 +3279,47 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       if(copy_results_to_host) {
         if(timings) phase_start = ComputeClock::now();
+        std::vector<bool> prediction_registered(system_count, false);
+        std::vector<bool> coefficient_registered(system_count, false);
+        // Pageable destinations can serialize these otherwise independent
+        // fold-lane copies. Registration failure deliberately falls back to
+        // the CUDA runtime's pageable-copy behavior.
+        for(size_t system = 0; system < system_count; ++system) {
+          if(predictions[system].size() > 0) {
+            const size_t bytes =
+              static_cast<size_t>(predictions[system].size()) *
+                sizeof(double);
+            const cudaError_t status = cudaHostRegister(
+              predictions[system].data(), bytes,
+              cudaHostRegisterPortable);
+            if(status == cudaSuccess) {
+              prediction_registered[system] = true;
+              if(timings) {
+                timings->pinned_download_count++;
+                timings->pinned_download_bytes += bytes;
+              }
+            } else {
+              cudaGetLastError();
+            }
+          }
+          if(coefficients[system].size() > 0) {
+            const size_t bytes =
+              static_cast<size_t>(coefficients[system].size()) *
+                sizeof(double);
+            const cudaError_t status = cudaHostRegister(
+              coefficients[system].data(), bytes,
+              cudaHostRegisterPortable);
+            if(status == cudaSuccess) {
+              coefficient_registered[system] = true;
+              if(timings) {
+                timings->pinned_download_count++;
+                timings->pinned_download_bytes += bytes;
+              }
+            } else {
+              cudaGetLastError();
+            }
+          }
+        }
         for(size_t system = 0; system < system_count; ++system) {
           CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
           if(resident_fold_output_indices_.empty()) {
@@ -3322,6 +3364,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           }
         }
         synchronize_level0_cholesky_lanes(system_count);
+        for(size_t system = 0; system < system_count; ++system) {
+          if(prediction_registered[system])
+            check_cuda(cudaHostUnregister(predictions[system].data()),
+              "cudaHostUnregister(cached fold predictions)");
+          if(coefficient_registered[system])
+            check_cuda(cudaHostUnregister(coefficients[system].data()),
+              "cudaHostUnregister(cached fold coefficients)");
+        }
         if(timings) timings->download_ms += elapsed_ms(phase_start);
       }
       if(timings) {

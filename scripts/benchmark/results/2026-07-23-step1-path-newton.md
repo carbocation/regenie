@@ -1,11 +1,12 @@
-# Experimental Stage 1 Level 1 path-Newton continuation
+# Stage 1 Level 1 path-Newton continuation
 
 Date: 2026-07-23
 
-Status: retained as an experimental, default-off feature. Enable it with:
+Status: retained and enabled by default after full P=8/P=32 Stage 2
+validation. It can be disabled for diagnostic compatibility with:
 
 ```bash
-REGENIE_STEP1_LEVEL1_PATH_NEWTON=1 regenie ...
+REGENIE_STEP1_LEVEL1_PATH_NEWTON=0 regenie ...
 ```
 
 Do not treat this as a byte-identical optimization. It preserves the
@@ -108,7 +109,8 @@ corrections.
 
 ## Decision
 
-The scaling result is large and repeatable enough to retain the implementation
-for research. The final Stage 2 outputs are scientifically equivalent under
-the checks above but do not satisfy the stricter near-byte-identical contract,
-so the feature remains off by default pending an explicit policy decision.
+The scaling result is large and repeatable enough to retain the implementation.
+The final Stage 2 outputs are scientifically equivalent under the checks above
+and their differences are within the project's historically accepted
+numerical envelope, so path-Newton is enabled by default. The environment
+override remains only as a diagnostic compatibility escape hatch.

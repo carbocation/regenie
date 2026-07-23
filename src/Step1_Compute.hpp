@@ -51,6 +51,8 @@ struct Step1ComputeTimings {
   uint64_t resident_reuse_count = 0;
   uint64_t pinned_staging_upload_count = 0;
   uint64_t pinned_staging_upload_bytes = 0;
+  uint64_t pinned_download_count = 0;
+  uint64_t pinned_download_bytes = 0;
   uint64_t packed_hardcall_upload_count = 0;
   uint64_t packed_hardcall_upload_bytes = 0;
   uint64_t registered_packed_upload_count = 0;

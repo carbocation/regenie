@@ -1677,6 +1677,10 @@ void Data::level_0_calculations() {
       const double download_before_ms = params.profile_step1 ? l0.profile_backend_download_ms : 0;
       const double backend_ridge_before_ms = params.profile_step1 ?
         l0.profile_backend_ridge_compute_ms : 0;
+      const uint64_t pinned_download_count_before = params.profile_step1 ?
+        l0.profile_pinned_download_count : 0;
+      const uint64_t pinned_download_bytes_before = params.profile_step1 ?
+        l0.profile_pinned_download_bytes : 0;
       const uint64_t cholesky_folds_before = params.profile_step1 ?
         l0.profile_cholesky_ridge_folds : 0;
       const uint64_t batched_cholesky_blocks_before = params.profile_step1 ?
@@ -1704,6 +1708,10 @@ void Data::level_0_calculations() {
         step1_profile.ridge_eigensolve_ms += eigensolve_ms;
         step1_profile.ridge_transfer_ms += upload_ms + download_ms;
         step1_profile.ridge_backend_compute_ms += backend_ridge_ms;
+        step1_profile.ridge_pinned_download_count +=
+          l0.profile_pinned_download_count - pinned_download_count_before;
+        step1_profile.ridge_pinned_download_bytes +=
+          l0.profile_pinned_download_bytes - pinned_download_bytes_before;
         step1_profile.ridge_cholesky_folds +=
           l0.profile_cholesky_ridge_folds - cholesky_folds_before;
         step1_profile.ridge_batched_cholesky_blocks +=
@@ -2066,6 +2074,10 @@ void Data::print_step1_profile() {
       << " eigensolve_transform_ms=" << step1_profile.ridge_eigensolve_ms
       << " backend_compute_ms=" << step1_profile.ridge_backend_compute_ms
       << " transfer_ms=" << step1_profile.ridge_transfer_ms
+      << " pinned_downloads=" <<
+        step1_profile.ridge_pinned_download_count
+      << " pinned_download_bytes=" <<
+        step1_profile.ridge_pinned_download_bytes
       << " host_orchestration_ms=" <<
         step1_profile.ridge_host_orchestration_ms
       << "\n";

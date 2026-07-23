@@ -72,8 +72,8 @@ bool step1_level1_l0_prefetch_enabled() {
 
 bool step1_level1_path_newton_enabled() {
   const char* value = std::getenv("REGENIE_STEP1_LEVEL1_PATH_NEWTON");
-  if(!value || !*value || std::string(value) == "0") return false;
-  if(std::string(value) == "1") return true;
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
   throw std::invalid_argument(
     "REGENIE_STEP1_LEVEL1_PATH_NEWTON must be '0' or '1'");
 }
@@ -1020,6 +1020,10 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     l0->profile_backend_upload_ms += batched_timings.upload_ms;
     l0->profile_backend_download_ms += batched_timings.download_ms;
     l0->profile_backend_ridge_compute_ms += batched_timings.ridge_ms;
+    l0->profile_pinned_download_count +=
+      batched_timings.pinned_download_count;
+    l0->profile_pinned_download_bytes +=
+      batched_timings.pinned_download_bytes;
     l0->profile_cholesky_ridge_folds += params->cv_folds;
     l0->profile_batched_cholesky_ridge_blocks++;
   }
@@ -1138,6 +1142,8 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
         l0->profile_backend_upload_ms += timings.upload_ms;
         l0->profile_backend_download_ms += timings.download_ms;
         l0->profile_backend_ridge_compute_ms += timings.ridge_ms;
+        l0->profile_pinned_download_count += timings.pinned_download_count;
+        l0->profile_pinned_download_bytes += timings.pinned_download_bytes;
         if(used_cholesky)
           l0->profile_cholesky_ridge_folds++;
         else
@@ -1400,6 +1406,10 @@ void ridge_level_0_loocv(const int block, struct in_files* files, struct param* 
       l0->profile_backend_upload_ms += ridge_timings.upload_ms;
       l0->profile_backend_download_ms += ridge_timings.download_ms;
       l0->profile_backend_ridge_compute_ms += ridge_timings.ridge_ms;
+      l0->profile_pinned_download_count +=
+        ridge_timings.pinned_download_count;
+      l0->profile_pinned_download_bytes +=
+        ridge_timings.pinned_download_bytes;
     }
 
     if(params->print_block_betas && chunk == 0) { // assumes P=1
