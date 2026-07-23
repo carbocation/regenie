@@ -1,16 +1,18 @@
-# REGENIE benchmarks
+# REGENIE performance benchmarks
 
-The reports in this directory answer two practical questions:
+These reports compare the best tested version of this branch with upstream
+REGENIE v4.1.2. Start with the report for the stage you plan to run:
 
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
-| [Stage 1 production benchmark](results/2026-07-19-production.md) | Upstream v4.1.2 (`5f924b9`) versus the best branch pipeline at N=500,000 and M=700,000; direct N=50,000 binary/survival checks are shown alongside the N=500,000 results | The A100 placement is 11.45x faster for P=32 quantitative, 32.70-34.68x for P=8 binary, and 19.16-19.96x for P=8 survival |
+| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000; 700,000 model-fitting variants; quantitative, binary, and survival traits with 0-10% missingness | Direct current A100 measurements versus upstream v4.1.2 on an eight-core N2, plus a same-N2 software comparison |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `3ab5fbb` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=32 with 0-10% missingness, current processes 848.2 quantitative, 792.7 binary, and 524.9 survival variants/s; CPU chromosome fan-out remains the recommended production placement |
 
-Each report states `N`, trait count, model, hardware, and whether a number is
-measured or projected. Stage 1 reports use `M` for the number of markers used
-to fit the model; Stage 2 reports spell out the number of variants tested. The
-TSV files hold the detailed run records and historical controls.
+Every headline table states the sample count, trait count, model, hardware,
+and whether a value was measured or projected. “Stage 1 variants” means the
+markers used to fit the model. “Stage 2 variants tested” means the variants
+read and tested during association analysis; the reports do not call both of
+these quantities `M`.
 
 ## Running a benchmark
 
@@ -82,16 +84,13 @@ checksum across systems.
 Stage 1:
 
 - [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — upstream and best branch Stage 1
-  placement measurements, with N, M, trait count, system, revision, and cache
-  state in every row.
-- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — current multi-trait Level 1
-  measurements at N=500,000 and M=700,000, plus explicitly labeled N=50,000
-  and CPU diagnostics. Historical validation rows remain in the TSV but are
-  not presented as report comparators.
+  placement measurements, with sample count, Stage 1 variants, trait count,
+  system, revision, and cache state in every row.
+- [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — focused
+  latest or best-applicable branch measurements at N=500,000 and 700,000
+  Stage 1 variants. Intermediate branch revisions are not included.
 - [`results/2026-07-22-step1-upstream.tsv`](results/2026-07-22-step1-upstream.tsv) — direct upstream v4.1.2
-  comparisons and measured-trait projections for slow multi-trait runs,
-  including direct N=50,000 binary and survival checks paired in the report
-  with the N=500,000 production results.
+  comparisons and clearly labeled projections for slow multi-trait runs.
 
 Stage 2:
 
