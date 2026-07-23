@@ -1055,6 +1055,37 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     return;
   }
 
+  std::vector<int> active_phenotypes;
+  active_phenotypes.reserve(params->n_pheno);
+  std::vector<int> phenotype_slots(params->n_pheno, -1);
+  for(int ph = 0; ph < params->n_pheno; ++ph) {
+    if(!params->pheno_pass(ph)) continue;
+    phenotype_slots[ph] = active_phenotypes.size();
+    active_phenotypes.push_back(ph);
+  }
+  const uint64_t prediction_rows = static_cast<uint64_t>(params->n_samples);
+  const uint64_t prediction_columns =
+    static_cast<uint64_t>(params->n_ridge_l0) * active_phenotypes.size();
+  uint64_t grouped_prediction_bytes = 0;
+  if(prediction_rows > 0 &&
+     prediction_columns <=
+       std::numeric_limits<uint64_t>::max() / prediction_rows &&
+     prediction_rows * prediction_columns <=
+       std::numeric_limits<uint64_t>::max() / sizeof(double))
+    grouped_prediction_bytes =
+      prediction_rows * prediction_columns * sizeof(double);
+  const bool async_grouped_write =
+    params->write_l0_pred && active_phenotypes.size() > 1 &&
+    grouped_prediction_bytes > 0 && grouped_prediction_bytes <=
+      step1_level0_async_write_limit_bytes();
+  std::shared_ptr<MatrixXd> grouped_predictions;
+  if(async_grouped_write)
+    grouped_predictions.reset(new MatrixXd(
+      params->n_samples,
+      active_phenotypes.size() * params->n_ridge_l0));
+  const bool direct_grouped_write =
+    async_grouped_write && !cache_level1_design && !params->debug;
+
   cum_size_folds = 0;
   for(int i = 0; i < params->cv_folds; ++i ) {
     if(used_batched_cholesky) {
@@ -1121,7 +1152,13 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
           params->beta_print_out[ph].row(j) +=
             batched_coefficients.col(combination).transpose();
 
-        if (params->trait_mode != 3) {
+        if(direct_grouped_write) {
+          grouped_predictions->block(
+            cum_size_folds,
+            static_cast<Eigen::Index>(phenotype_slots[ph]) *
+              params->n_ridge_l0 + j,
+            params->cv_sizes(i), 1) = prediction;
+        } else if (params->trait_mode != 3) {
           l1->test_mat[ph][i].col(block_eff * params->n_ridge_l0 + j) = prediction;
         } else {
           l1->test_mat_conc[ph].block(cum_size_folds,
@@ -1150,31 +1187,6 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     cerr << "Wmat (Y1):\n" << l1->test_mat[0][0].topRows(5).middleCols(block_eff * params->n_ridge_l0, params->n_ridge_l0) << endl;
   }
 
-  std::vector<int> active_phenotypes;
-  active_phenotypes.reserve(params->n_pheno);
-  for(int ph = 0; ph < params->n_pheno; ++ph)
-    if(params->pheno_pass(ph)) active_phenotypes.push_back(ph);
-
-  const uint64_t prediction_rows = static_cast<uint64_t>(params->n_samples);
-  const uint64_t prediction_columns =
-    static_cast<uint64_t>(params->n_ridge_l0) * active_phenotypes.size();
-  uint64_t grouped_prediction_bytes = 0;
-  if(prediction_rows > 0 &&
-     prediction_columns <=
-       std::numeric_limits<uint64_t>::max() / prediction_rows &&
-     prediction_rows * prediction_columns <=
-       std::numeric_limits<uint64_t>::max() / sizeof(double))
-    grouped_prediction_bytes =
-      prediction_rows * prediction_columns * sizeof(double);
-  const bool async_grouped_write =
-    params->write_l0_pred && active_phenotypes.size() > 1 &&
-    grouped_prediction_bytes > 0 && grouped_prediction_bytes <=
-      step1_level0_async_write_limit_bytes();
-  std::shared_ptr<MatrixXd> grouped_predictions;
-  if(async_grouped_write)
-    grouped_predictions.reset(new MatrixXd(
-      params->n_samples,
-      active_phenotypes.size() * params->n_ridge_l0));
   size_t phenotype_slot = 0;
 
   // center and scale using the whole sample
@@ -1195,7 +1207,19 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
 
     cum_size_folds = 0;
     for(int i = 0; i < params->cv_folds; ++i ) {
-      if( params->trait_mode != 3){
+      if(direct_grouped_write) {
+        grouped_predictions->block(
+          cum_size_folds,
+          static_cast<Eigen::Index>(phenotype_slot) *
+            params->n_ridge_l0,
+          params->cv_sizes(i), params->n_ridge_l0).rowwise() -= p_mean;
+        grouped_predictions->block(
+          cum_size_folds,
+          static_cast<Eigen::Index>(phenotype_slot) *
+            params->n_ridge_l0,
+          params->cv_sizes(i), params->n_ridge_l0).array().rowwise() *=
+            p_invsd.array();
+      } else if( params->trait_mode != 3){
         l1->test_mat[ph][i].block(0, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0).rowwise() -= p_mean;
         l1->test_mat[ph][i].block(0, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0).array().rowwise() *= p_invsd.array();
       } else {
@@ -1203,7 +1227,7 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
         l1->test_mat_conc[ph].block(cum_size_folds, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0).array().rowwise() *= p_invsd.array();
       }
 
-      if(params->write_l0_pred) {
+      if(params->write_l0_pred && !direct_grouped_write) {
         if (params->trait_mode != 3) {
           if(async_grouped_write)
             grouped_predictions->block(
