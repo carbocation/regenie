@@ -72,8 +72,8 @@ bool step1_level1_l0_prefetch_enabled() {
 
 bool step1_level1_path_newton_enabled() {
   const char* value = std::getenv("REGENIE_STEP1_LEVEL1_PATH_NEWTON");
-  if(!value || !*value || std::string(value) == "1") return true;
-  if(std::string(value) == "0") return false;
+  if(!value || !*value || std::string(value) == "0") return false;
+  if(std::string(value) == "1") return true;
   throw std::invalid_argument(
     "REGENIE_STEP1_LEVEL1_PATH_NEWTON must be '0' or '1'");
 }

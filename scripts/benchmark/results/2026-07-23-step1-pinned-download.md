@@ -2,7 +2,8 @@
 
 Date: 2026-07-23
 
-Status: retained and enabled by default. No feature flag is required.
+Status: retained and enabled unconditionally. No feature flag is required for
+the byte-exact Level 0 transport change.
 
 ## Research question
 
@@ -94,8 +95,7 @@ IRLS and path-Newton runs, have a graceful fallback, and match the existing
 complete-case design. They should remain unconditional rather than hidden
 behind a feature flag.
 
-Path-Newton is also enabled by default after its full P=8/P=32 Stage 2
-validation placed its numerical differences within the project's historically
-accepted envelope. `REGENIE_STEP1_LEVEL1_PATH_NEWTON=0` remains available as
-a diagnostic compatibility escape hatch. A user-facing command-line opt-in is
-therefore not needed for either performance improvement.
+Path-Newton is a separate, non-byte-identical experiment. Its full P=8/P=32
+Stage 2 validation placed the numerical differences within the project's
+historically accepted envelope, but it remains disabled by default and can be
+enabled explicitly with `REGENIE_STEP1_LEVEL1_PATH_NEWTON=1`.

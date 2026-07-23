@@ -2,11 +2,11 @@
 
 Date: 2026-07-23
 
-Status: retained and enabled by default after full P=8/P=32 Stage 2
-validation. It can be disabled for diagnostic compatibility with:
+Status: retained as an experimental opt-in after full P=8/P=32 Stage 2
+validation. It can be enabled with:
 
 ```bash
-REGENIE_STEP1_LEVEL1_PATH_NEWTON=0 regenie ...
+REGENIE_STEP1_LEVEL1_PATH_NEWTON=1 regenie ...
 ```
 
 Do not treat this as a byte-identical optimization. It preserves the
@@ -112,5 +112,6 @@ corrections.
 The scaling result is large and repeatable enough to retain the implementation.
 The final Stage 2 outputs are scientifically equivalent under the checks above
 and their differences are within the project's historically accepted
-numerical envelope, so path-Newton is enabled by default. The environment
-override remains only as a diagnostic compatibility escape hatch.
+numerical envelope. Because it changes printed final Stage 2 results, however,
+it remains disabled by default and available only through the explicit
+environment opt-in above.
