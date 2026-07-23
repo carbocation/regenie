@@ -272,6 +272,15 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& solutions,
       Step1ComputeTimings* timings = nullptr);
 
+    // Solve against the Gram from the most recent cached weighted-design
+    // product/solve. Returns false when that resident state is unavailable.
+    virtual bool solve_cached_weighted_gram(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void compute_cached_design_crossproduct(
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Eigen::MatrixXd& crossproduct,

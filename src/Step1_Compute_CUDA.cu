@@ -579,6 +579,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
         resident_valid_(false), resident_design_rows_(0),
         resident_design_columns_(0), resident_design_valid_(false),
+        cached_weighted_gram_valid_(false),
         resident_design_uses_level1_cache_(false),
         level1_design_rows_(0), level1_design_columns_(0),
         level1_design_cached_columns_(0),
@@ -1697,6 +1698,69 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       compute_cached_weighted_design_products_device(
         weights, outcomes, timings);
       diagonal_penalty_solve_device(features, outcome_count,
+        ridge_parameters, penalty_multipliers, solutions, timings);
+      return true;
+    }
+
+    bool solve_cached_weighted_gram(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_valid_ || !cached_weighted_gram_valid_ ||
+         right_hand_sides.rows() != resident_design_columns_ ||
+         penalty_multipliers.size() != resident_design_columns_)
+        return false;
+      if(!right_hand_sides.allFinite() ||
+         !ridge_parameters.allFinite() ||
+         (ridge_parameters.array() < 0).any() ||
+         !penalty_multipliers.allFinite() ||
+         (penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 cached weighted Gram solve requires finite inputs and non-negative penalties");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int features = checked_int(
+        resident_design_columns_, "cached weighted Gram feature count");
+      const int right_hand_side_count = checked_int(
+        right_hand_sides.cols(), "cached weighted Gram outcome count");
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "cached weighted Gram parameter count");
+      const long long solution_column_count_long =
+        static_cast<long long>(right_hand_side_count) * parameter_count;
+      if(solution_column_count_long > INT_MAX)
+        throw std::runtime_error(
+          "CUDA cached weighted Gram solution column count exceeds integer limits");
+      solutions.resize(features,
+        static_cast<Eigen::Index>(solution_column_count_long));
+      if(features == 0 || right_hand_side_count == 0 ||
+         parameter_count == 0) {
+        solutions.setZero();
+        return true;
+      }
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(features) * features;
+      if(gram_capacity_ < gram_elements) return false;
+
+      ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        right_hand_sides.size(),
+        "cudaMalloc(cached weighted Gram right hand sides)");
+      const Eigen::MatrixXd packed_right_hand_sides =
+        contiguous_copy_if_needed(right_hand_sides);
+      const double* right_hand_side_data =
+        packed_right_hand_sides.size() ?
+          packed_right_hand_sides.data() : right_hand_sides.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_crossproduct_, right_hand_side_data,
+        static_cast<size_t>(right_hand_sides.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached weighted Gram right hand sides to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      diagonal_penalty_solve_device(features, right_hand_side_count,
         ridge_parameters, penalty_multipliers, solutions, timings);
       return true;
     }
@@ -5291,6 +5355,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Step1ComputeTimings* timings) {
 
+      cached_weighted_gram_valid_ = false;
       const int rows = checked_int(
         resident_design_rows_, "cached weighted design row count");
       const int features = checked_int(
@@ -5390,6 +5455,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
         timings->resident_design_reuse_count++;
       }
+      cached_weighted_gram_valid_ = true;
     }
 
     void diagonal_penalty_solve_device(
@@ -5652,6 +5718,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       resident_design_rows_ = 0;
       resident_design_columns_ = 0;
       resident_design_valid_ = false;
+      cached_weighted_gram_valid_ = false;
       resident_design_uses_level1_cache_ = false;
       if(resident_fold_systems_design_orientation_)
         invalidate_resident_fold_systems();
@@ -5877,6 +5944,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     Eigen::Index resident_design_rows_;
     Eigen::Index resident_design_columns_;
     bool resident_design_valid_;
+    bool cached_weighted_gram_valid_;
     bool resident_design_uses_level1_cache_;
     Eigen::Index level1_design_rows_;
     Eigen::Index level1_design_columns_;

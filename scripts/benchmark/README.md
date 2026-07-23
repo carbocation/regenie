@@ -91,6 +91,10 @@ Stage 1:
   Stage 1 variants. Intermediate branch revisions are not included.
 - [`results/2026-07-22-step1-upstream.tsv`](results/2026-07-22-step1-upstream.tsv) — direct upstream v4.1.2
   comparisons and clearly labeled projections for slow multi-trait runs.
+- [`results/2026-07-23-step1-path-newton.md`](results/2026-07-23-step1-path-newton.md) and
+  [`TSV`](results/2026-07-23-step1-path-newton.tsv) — default-off Level 1
+  ridge-path continuation experiment at N=500,000, 700,000 model-fitting
+  variants, and P=8/P=32, including full downstream Stage 2 validation.
 
 Stage 2:
 

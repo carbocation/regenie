@@ -70,6 +70,14 @@ bool step1_level1_l0_prefetch_enabled() {
     "REGENIE_STEP1_LEVEL1_L0_PREFETCH must be '0' or '1'");
 }
 
+bool step1_level1_path_newton_enabled() {
+  const char* value = std::getenv("REGENIE_STEP1_LEVEL1_PATH_NEWTON");
+  if(!value || !*value || std::string(value) == "0") return false;
+  if(std::string(value) == "1") return true;
+  throw std::invalid_argument(
+    "REGENIE_STEP1_LEVEL1_PATH_NEWTON must be '0' or '1'");
+}
+
 int step1_level1_l0_read_threads(const struct param* params) {
   const char* value = std::getenv("REGENIE_STEP1_LEVEL1_L0_READ_THREADS");
   if(!value || !*value)
@@ -1915,6 +1923,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   double check_l0_ms = 0;
   double cache_wall_ms = 0;
   double irls_wall_ms = 0;
+  double path_newton_wall_ms = 0;
   double validation_ms = 0;
   double prediction_cache_wall_ms = 0;
   double prediction_cache_write_ms = 0;
@@ -1926,7 +1935,11 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   uint64_t weighted_product_calls = 0;
   uint64_t score_calls = 0;
   uint64_t solve_calls = 0;
+  uint64_t path_newton_solves = 0;
+  uint64_t path_newton_score_calls = 0;
+  uint64_t path_newton_converged_models = 0;
   uint64_t resident_design_phenotypes = 0;
+  const bool use_path_newton = step1_level1_path_newton_enabled();
 
   int niter_cur;
   int ph_eff;
@@ -2033,8 +2046,80 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         // use warm starts (i.e. set final beta of previous ridge param 
         // as initial beta for current ridge param)
         betaold = betanew;
+        bool path_newton_converged = false;
+        if(use_path_newton && resident_design && j > 0) {
+          const auto path_start =
+            std::chrono::high_resolution_clock::now();
+          // At the previous ridge solution, changing only lambda changes the
+          // penalized score by exactly -(lambda_new-lambda_old) D beta. Reuse
+          // the previous IRLS Hessian for a few monotone chord-Newton
+          // corrections; ordinary IRLS resumes from the best accepted point.
+          ArrayXd path_score = score -
+            (params->tau[ph](j) - params->tau[ph](j - 1)) *
+              l1->ridge_param_mult * betanew;
+          current_tau(0) = params->tau[ph](j);
+          double path_score_max = path_score.abs().maxCoeff();
+          for(int correction = 0; correction < 4; ++correction) {
+            const MatrixXd path_right_hand_side = path_score.matrix();
+            MatrixXd path_step;
+            if(!compute_backend->solve_cached_weighted_gram(
+                 path_right_hand_side, current_tau,
+                 l1->ridge_param_mult.matrix(), path_step,
+                 profile_timings) ||
+               path_step.cols() != 1 || !path_step.allFinite())
+              break;
 
-        while(niter_cur++ < params->niter_max_ridge){
+            const ArrayXd path_candidate =
+              betaold + path_step.col(0).array();
+            ++path_newton_solves;
+            ++solve_calls;
+
+            predict_resident(path_candidate);
+            cached_score_outcome.setZero();
+            for(int k = 0; k < params->cv_folds; ++k ) {
+              if(k == i) continue;
+              const Eigen::Index start = fold_offsets[k];
+              const Eigen::Index count = fold_offsets[k + 1] - start;
+              etavec = l1->test_offset[ph][k].array() +
+                cached_predictions.segment(start, count).array();
+              get_pvec(pivec, etavec, params->numtol_eps);
+              cached_score_outcome.col(0).segment(start, count) =
+                masked_in_folds[k].col(ph).array().select(
+                  l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix();
+            }
+            MatrixXd path_crossproduct;
+            compute_backend->compute_cached_design_crossproduct(
+              cached_score_outcome, path_crossproduct, profile_timings);
+            ++path_newton_score_calls;
+            ++score_calls;
+            const ArrayXd candidate_score =
+              path_crossproduct.col(0).array() -
+                params->tau[ph](j) * l1->ridge_param_mult * path_candidate;
+            const double candidate_score_max =
+              candidate_score.abs().maxCoeff();
+            if(!std::isfinite(candidate_score_max) ||
+               candidate_score_max >= path_score_max)
+              break;
+
+            betaold = path_candidate;
+            score = candidate_score;
+            path_score = candidate_score;
+            path_score_max = candidate_score_max;
+            if(path_score_max < params->l1_ridge_tol) {
+              betanew = betaold;
+              path_newton_converged = true;
+              ++path_newton_converged_models;
+              break;
+            }
+          }
+          path_newton_wall_ms +=
+            std::chrono::duration<double, std::milli>(
+              std::chrono::high_resolution_clock::now() -
+                path_start).count();
+        }
+
+        while(!path_newton_converged &&
+              niter_cur++ < params->niter_max_ridge){
           const auto iteration_start =
             std::chrono::high_resolution_clock::now();
           int current_line_search_iterations = 0;
@@ -2395,6 +2480,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
       << " check_l0_ms=" << check_l0_ms
       << " cache_wall_ms=" << cache_wall_ms
       << " irls_wall_ms=" << irls_wall_ms
+      << " path_newton_wall_ms=" << path_newton_wall_ms
       << " validation_ms=" << validation_ms
       << " prediction_cache_wall_ms=" << prediction_cache_wall_ms
       << " prediction_cache_write_ms=" << prediction_cache_write_ms
@@ -2413,6 +2499,10 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
       << " weighted_product_calls=" << weighted_product_calls
       << " score_calls=" << score_calls
       << " solve_calls=" << solve_calls
+      << " path_newton_solves=" << path_newton_solves
+      << " path_newton_score_calls=" << path_newton_score_calls
+      << " path_newton_converged_models=" <<
+           path_newton_converged_models
       << " upload_ms=" << level1_timings.upload_ms
       << " gram_ms=" << level1_timings.gram_ms
       << " crossproduct_ms=" << level1_timings.crossproduct_ms

@@ -1962,6 +1962,20 @@ void run_conformance(Step1ComputeBackend& candidate) {
   const bool resident_design_supported = candidate.cache_design_partitions(
     resident_partitions, &resident_design_timings);
   if(resident_design_supported) {
+    const Eigen::MatrixXd unavailable_cached_gram_rhs =
+      Eigen::MatrixXd::Ones(6, 1);
+    const Eigen::VectorXd unavailable_cached_gram_ridge =
+      Eigen::VectorXd::Constant(1, 0.5);
+    const Eigen::VectorXd unavailable_cached_gram_penalty =
+      Eigen::VectorXd::Ones(6);
+    Eigen::MatrixXd unavailable_cached_gram_solution;
+    if(candidate.solve_cached_weighted_gram(
+         unavailable_cached_gram_rhs, unavailable_cached_gram_ridge,
+         unavailable_cached_gram_penalty, unavailable_cached_gram_solution,
+         &resident_design_timings))
+      throw std::runtime_error(
+        "cached weighted Gram solve succeeded before a Gram was computed");
+
     Eigen::MatrixXd resident_design(23, 6);
     Eigen::Index resident_start = 0;
     for(const Eigen::MatrixXd& partition : resident_partitions) {
@@ -2132,6 +2146,24 @@ void run_conformance(Step1ComputeBackend& candidate) {
     const Eigen::MatrixXd expected_resident_score =
       resident_design.transpose() * resident_outcomes;
 
+    const Eigen::MatrixXd resident_cached_gram_rhs =
+      deterministic_matrix(resident_design.cols(), 2, 0.61);
+    Eigen::MatrixXd expected_resident_cached_gram_solutions;
+    oracle->diagonal_penalty_solve(expected_resident_gram,
+      resident_cached_gram_rhs, resident_ridge_parameters,
+      resident_penalty_multipliers,
+      expected_resident_cached_gram_solutions);
+    Eigen::MatrixXd resident_cached_gram_solutions;
+    const bool resident_cached_gram_solve_supported =
+      candidate.solve_cached_weighted_gram(
+        resident_cached_gram_rhs, resident_ridge_parameters,
+        resident_penalty_multipliers, resident_cached_gram_solutions,
+        &resident_design_timings);
+    if(std::string(candidate.name()) == "cuda" &&
+       !resident_cached_gram_solve_supported)
+      throw std::runtime_error(
+        "CUDA backend did not support the cached weighted Gram solve");
+
     const double resident_prediction_error = relative_error(
       resident_predictions, expected_resident_predictions);
     const double resident_gram_error = relative_error(
@@ -2140,12 +2172,17 @@ void run_conformance(Step1ComputeBackend& candidate) {
       resident_crossproduct, expected_resident_crossproduct);
     const double resident_solve_error = resident_solve_supported ?
       relative_error(resident_solutions, expected_resident_solutions) : 0.0;
+    const double resident_cached_gram_solve_error =
+      resident_cached_gram_solve_supported ?
+        relative_error(resident_cached_gram_solutions,
+          expected_resident_cached_gram_solutions) : 0.0;
     const double resident_score_error = relative_error(
       resident_score, expected_resident_score);
     if(resident_prediction_error > 5e-12 ||
        resident_gram_error > 5e-12 ||
        resident_crossproduct_error > 5e-12 ||
        resident_solve_error > 5e-12 ||
+       resident_cached_gram_solve_error > 5e-12 ||
        resident_score_error > 5e-12 ||
        resident_design_timings.resident_design_upload_count != 3 ||
        resident_design_timings.resident_design_upload_bytes !=
@@ -2196,6 +2233,10 @@ void run_conformance(Step1ComputeBackend& candidate) {
                    resident_crossproduct_error
               << " fused_solve_supported=" << resident_solve_supported
               << " fused_solve_relative_error=" << resident_solve_error
+              << " cached_gram_solve_supported=" <<
+                   resident_cached_gram_solve_supported
+              << " cached_gram_solve_relative_error=" <<
+                   resident_cached_gram_solve_error
               << " crossproduct_relative_error=" << resident_score_error
               << " grouped_prediction_relative_error=" <<
                    resident_group_prediction_error

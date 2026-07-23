@@ -421,6 +421,20 @@ bool Step1ComputeBackend::solve_cached_weighted_design(
   return false;
 }
 
+bool Step1ComputeBackend::solve_cached_weighted_gram(
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  Eigen::MatrixXd& solutions,
+  Step1ComputeTimings* timings) {
+  (void)right_hand_sides;
+  (void)ridge_parameters;
+  (void)penalty_multipliers;
+  (void)solutions;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::compute_cached_design_crossproduct(
   const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
   Eigen::MatrixXd& crossproduct,
