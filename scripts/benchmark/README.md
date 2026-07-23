@@ -97,8 +97,9 @@ Stage 1:
   variants, and P=8/P=32, including full downstream Stage 2 validation.
 - [`results/2026-07-23-step1-pinned-download.md`](results/2026-07-23-step1-pinned-download.md)
   and [`TSV`](results/2026-07-23-step1-pinned-download.tsv) — unconditional,
-  byte-exact CUDA Level 0 download optimization at P=8/P=32 and its combined
-  30.0% P=32 Stage 1 reduction.
+  byte-exact CUDA Level 0 download optimization, including isolated and
+  combined four-cell P=8/P=32 profiles and the combined 30.0% P=32 Stage 1
+  reduction.
 
 Stage 2:
 
