@@ -318,8 +318,14 @@ void accumulate_step1_pipelined_block_profile(
 class Step1Level0PipelineSession {
   public:
     explicit Step1Level0PipelineSession(
-      Step1ComputeBackend& level0_backend)
-      : level0_static_input_scope_(level0_backend, 1) {}
+      std::unique_ptr<Step1ComputeBackend>& level0_backend)
+      : level0_backend_(level0_backend),
+        level0_static_input_scope_(*level0_backend, 1) {}
+
+    ~Step1Level0PipelineSession() noexcept {
+      wait_for_async_work();
+      release_packed_hardcall_buffers_noexcept();
+    }
 
     void reserve_prefetch_buffer(size_t packed_capacity) {
       prefetch_buffer_.packed_hardcalls.reserve(packed_capacity);
@@ -410,26 +416,54 @@ class Step1Level0PipelineSession {
         });
     }
 
-    void swap_pipeline_backend(
-      std::unique_ptr<Step1ComputeBackend>& level0_backend) {
-      level0_backend.swap(pipeline_backend_);
+    void swap_pipeline_backend() {
+      level0_backend_.swap(pipeline_backend_);
     }
 
     Step1PgenPrefetchBuffer& prefetch_buffer() {
       return prefetch_buffer_;
     }
 
-    void release_packed_hardcall_buffers(
-      Step1ComputeBackend& level0_backend) {
-      level0_backend.release_packed_hardcall_buffers();
+    void release_packed_hardcall_buffers() {
+      try {
+        level0_backend_->release_packed_hardcall_buffers();
+      } catch(...) {
+        try {
+          if(pipeline_backend_)
+            pipeline_backend_->release_packed_hardcall_buffers();
+        } catch(...) {}
+        throw;
+      }
       if(pipeline_backend_)
         pipeline_backend_->release_packed_hardcall_buffers();
     }
 
   private:
+    void wait_for_async_work() noexcept {
+      try {
+        if(pipeline_future_.valid())
+          pipeline_future_.wait();
+      } catch(...) {}
+      try {
+        if(prefetch_future_.valid())
+          prefetch_future_.wait();
+      } catch(...) {}
+    }
+
+    void release_packed_hardcall_buffers_noexcept() noexcept {
+      try {
+        level0_backend_->release_packed_hardcall_buffers();
+      } catch(...) {}
+      try {
+        if(pipeline_backend_)
+          pipeline_backend_->release_packed_hardcall_buffers();
+      } catch(...) {}
+    }
+
     // The pipeline future precedes its generation scope on destruction, the
     // prefetch future precedes its buffer, and both scopes precede the
     // swappable backend that either may still reference after a swap.
+    std::unique_ptr<Step1ComputeBackend>& level0_backend_;
     std::unique_ptr<Step1ComputeBackend> pipeline_backend_;
     Step1Level0StaticInputScope level0_static_input_scope_;
     Step1PgenPrefetchBuffer prefetch_buffer_;
@@ -494,7 +528,6 @@ template <typename GenoBlock, typename ScaleVector, typename VariantInfo,
           typename OutputStream>
 void install_step1_pipelined_block(
   Step1Level0PipelineSession& session,
-  std::unique_ptr<Step1ComputeBackend>& level0_backend,
   GenoBlock& genotype_block,
   ScaleVector& genotype_scales,
   Step1Level0PipelineResult& result,
@@ -510,7 +543,7 @@ void install_step1_pipelined_block(
   OutputStream& output,
   double wait_ms) {
 
-  session.swap_pipeline_backend(level0_backend);
+  session.swap_pipeline_backend();
   genotype_block.Gmat.resize(block_size, 0);
   genotype_block.step1_pgen_packed_hardcalls.clear();
   genotype_block.step1_pgen_packed_stride_bytes = 0;
@@ -1771,7 +1804,7 @@ void Data::level_0_calculations() {
     pgen_packed_hardcalls && pgen_prefetch_enabled;
   step1_sample_weights =
     in_filters.ind_in_analysis.matrix().cast<double>();
-  Step1Level0PipelineSession level0_pipeline(*step1_compute_backend);
+  Step1Level0PipelineSession level0_pipeline(step1_compute_backend);
   if(pgen_packed_hardcalls && pgen_block_bytes > 0 &&
      pgen_block_bytes <= std::numeric_limits<size_t>::max()) {
     const size_t packed_capacity = static_cast<size_t>(pgen_block_bytes);
@@ -1851,7 +1884,7 @@ void Data::level_0_calculations() {
           throw std::runtime_error(
             "Step 1 pipelined packed PGEN block could not be preprocessed by the selected backend");
         install_step1_pipelined_block(
-          level0_pipeline, step1_compute_backend, Gblock, scale_G, result,
+          level0_pipeline, Gblock, scale_G, result,
           bs, block, in_filters.step1_snp_count, snpinfo, params.numtol,
           pgen_profile, params.profile_step1, step1_profile,
           block_preprocessed_by_pipeline, sout, wait_ms);
@@ -1968,8 +2001,7 @@ void Data::level_0_calculations() {
     }
   }
 
-  level0_pipeline.release_packed_hardcall_buffers(
-    *step1_compute_backend);
+  level0_pipeline.release_packed_hardcall_buffers();
   finish_l0_write(&l1_ests);
 
   // close streams
