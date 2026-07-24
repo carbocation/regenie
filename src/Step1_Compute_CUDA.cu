@@ -721,6 +721,67 @@ struct CudaResidentDesign {
   }
 };
 
+struct CudaLevel1DesignCache {
+  CudaDeviceBuffer<double> values;
+  Eigen::Index rows = 0;
+  Eigen::Index columns = 0;
+  Eigen::Index cached_columns = 0;
+
+  void allocate(Eigen::Index new_rows, Eigen::Index new_columns,
+    Eigen::Index elements, const char* label) {
+    if(elements < 0)
+      throw std::runtime_error(
+        std::string("negative CUDA allocation size for ") + label);
+    values.ensure(static_cast<size_t>(elements), label);
+    rows = new_rows;
+    columns = new_columns;
+    cached_columns = 0;
+  }
+
+  bool accepts_append(Eigen::Index start_column,
+    Eigen::Index appended_rows, Eigen::Index appended_columns) const {
+    return values.data() && rows > 0 && appended_rows == rows &&
+      start_column == cached_columns && start_column >= 0 &&
+      appended_columns >= 0 &&
+      start_column <= columns - appended_columns;
+  }
+
+  bool accepts_append(Eigen::Index start_column,
+    double appended_rows, Eigen::Index appended_columns) const {
+    return appended_rows == rows &&
+      accepts_append(start_column, rows, appended_columns);
+  }
+
+  const double* data() const {
+    return values.data();
+  }
+
+  double* column_data(Eigen::Index start_column) {
+    return values.data() + start_column * rows;
+  }
+
+  void record_append(Eigen::Index appended_columns) {
+    cached_columns += appended_columns;
+  }
+
+  bool complete(Eigen::Index expected_rows,
+    Eigen::Index expected_columns) const {
+    return values.data() && rows == expected_rows &&
+      columns == expected_columns && cached_columns == columns;
+  }
+
+  bool allocated() const {
+    return values.data() != nullptr;
+  }
+
+  void release(const char* operation) {
+    values.release(operation);
+    rows = 0;
+    columns = 0;
+    cached_columns = 0;
+  }
+};
+
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
@@ -735,8 +796,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
-        level1_design_rows_(0), level1_design_columns_(0),
-        level1_design_cached_columns_(0),
         level0_phenotypes_host_(nullptr),
         level0_phenotype_rows_(0), level0_phenotype_columns_(0),
         factorized_size_(-1),
@@ -1431,12 +1490,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          reserve_bytes > free_bytes - required_bytes)
         return false;
 
-      ensure_capacity(d_level1_design_,
+      level1_design_.allocate(rows, columns,
         static_cast<Eigen::Index>(required_elements_long),
         "cudaMalloc(persistent Level 1 design)");
-      level1_design_rows_ = rows;
-      level1_design_columns_ = columns;
-      level1_design_cached_columns_ = 0;
       return true;
     }
 
@@ -1445,11 +1501,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>& columns,
       Step1ComputeTimings* timings) override {
 
-      if(!d_level1_design_ || level1_design_rows_ <= 0 ||
-         columns.rows() != level1_design_rows_ ||
-         start_column != level1_design_cached_columns_ ||
-         start_column < 0 || columns.cols() < 0 ||
-         start_column > level1_design_columns_ - columns.cols())
+      if(!level1_design_.accepts_append(
+           start_column, columns.rows(), columns.cols()))
         throw std::invalid_argument(
           "Step 1 persistent Level 1 design append is out of order or has incompatible dimensions");
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
@@ -1457,12 +1510,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(timings) transfer_start = ComputeClock::now();
       if(columns.size() > 0)
         check_cuda(cudaMemcpy(
-          d_level1_design_ + start_column * level1_design_rows_,
+          level1_design_.column_data(start_column),
           columns.data(),
           static_cast<size_t>(columns.size()) * sizeof(double),
           cudaMemcpyHostToDevice),
           "append persistent Level 1 design columns to CUDA device");
-      level1_design_cached_columns_ += columns.cols();
+      level1_design_.record_append(columns.cols());
       if(timings) {
         timings->upload_ms += elapsed_ms(transfer_start);
         timings->resident_design_upload_count++;
@@ -1474,9 +1527,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     bool activate_level1_design_cache(
       Eigen::Index rows, Eigen::Index columns) override {
 
-      if(!d_level1_design_ || rows != level1_design_rows_ ||
-         columns != level1_design_columns_ ||
-         level1_design_cached_columns_ != level1_design_columns_)
+      if(!level1_design_.complete(rows, columns))
         return false;
       invalidate_resident_design();
       invalidate_resident_genotypes();
@@ -1488,14 +1539,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     void release_level1_design_cache() override {
       if(resident_design_.uses_level1_cache())
         invalidate_resident_design();
-      if(d_level1_design_) {
+      if(level1_design_.allocated())
         check_cuda(cudaSetDevice(device_), "cudaSetDevice");
-        d_level1_design_.release(
-          "cudaFree(persistent Level 1 design)");
-      }
-      level1_design_rows_ = 0;
-      level1_design_columns_ = 0;
-      level1_design_cached_columns_ = 0;
+      level1_design_.release(
+        "cudaFree(persistent Level 1 design)");
     }
 
     void predict_cached_design(
@@ -2346,7 +2393,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           const double* design_chunk = nullptr;
           int design_leading_dimension = 0;
           if(resident_design_.uses_level1_cache()) {
-            design_chunk = d_level1_design_ + start_rows(fold) + start;
+            design_chunk =
+              level1_design_.column_data(0) + start_rows(fold) + start;
             design_leading_dimension = checked_int(
               resident_design_.rows,
               "persistent Level 1 design leading dimension");
@@ -2919,12 +2967,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          effective_sample_count != resident_genotypes_.columns)
         return false;
       if(cache_level1_design &&
-         (resident_fold_systems_.rhs_count != 1 || !d_level1_design_ ||
-          level1_design_rows_ <= 0 ||
-          level1_start_column != level1_design_cached_columns_ ||
-          ridge_parameters.size() >
-            level1_design_columns_ - level1_start_column ||
-          effective_sample_count != level1_design_rows_))
+         (resident_fold_systems_.rhs_count != 1 ||
+          !level1_design_.accepts_append(level1_start_column,
+            effective_sample_count,
+            ridge_parameters.size())))
         return false;
       Eigen::Index covered_rows = 0;
       for(Eigen::Index fold = 0; fold < start_columns.size(); ++fold) {
@@ -2969,8 +3015,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(timings) phase_start = ComputeClock::now();
       double* assembled_predictions = nullptr;
       if(cache_level1_design) {
-        assembled_predictions = d_level1_design_ +
-          level1_start_column * level1_design_rows_;
+        assembled_predictions =
+          level1_design_.column_data(level1_start_column);
       } else {
         ensure_capacity(d_level0_prediction_block_, element_count,
           "cudaMalloc(Level 0 prediction block)");
@@ -3099,7 +3145,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "cudaHostUnregister(normalized Level 0 predictions)");
       if(timings) timings->download_ms += elapsed_ms(phase_start);
       if(cache_level1_design)
-        level1_design_cached_columns_ += parameter_count;
+        level1_design_.record_append(parameter_count);
       return true;
     }
 
@@ -3282,7 +3328,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
               check_cublas(cublasDgemm(lane.blas,
                 CUBLAS_OP_N, CUBLAS_OP_N,
                 sample_count, combination_count, size, &alpha,
-                d_level1_design_ + start,
+                level1_design_.column_data(0) + start,
                 checked_int(resident_design_.rows,
                   "persistent Level 1 design leading dimension"),
                 lane.coefficients, size, &beta,
@@ -5833,7 +5879,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
     const double* resident_design_data() const {
       return resident_design_.data(
-        d_resident_genotypes_, d_level1_design_);
+        d_resident_genotypes_, level1_design_.data());
     }
 
     const double* resident_genotype_columns(
@@ -5988,7 +6034,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaDeviceBuffer<double> d_predictions_;
     CudaDeviceBuffer<double> d_outcomes_;
     CudaDeviceBuffer<double> d_projected_;
-    CudaDeviceBuffer<double> d_level1_design_;
     CudaDeviceBuffer<double> d_level1_ones_;
     CudaDeviceBuffer<double> d_level0_phenotypes_;
     CudaDeviceBuffer<double> d_level0_prediction_block_;
@@ -6005,9 +6050,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaDeviceBuffer<unsigned int> d_packed_row_counts_;
     CudaResidentGenotypes resident_genotypes_;
     CudaResidentDesign resident_design_;
-    Eigen::Index level1_design_rows_;
-    Eigen::Index level1_design_columns_;
-    Eigen::Index level1_design_cached_columns_;
+    CudaLevel1DesignCache level1_design_;
     CudaResidentFoldSystems resident_fold_systems_;
     CudaPackedStaticInputs packed_static_inputs_;
     const double* level0_phenotypes_host_;

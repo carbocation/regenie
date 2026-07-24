@@ -1047,8 +1047,24 @@ void check_persistent_level1_design_cache(
   }
 
   Step1ComputeTimings timings;
+  if(candidate.activate_level1_design_cache(rows, features))
+    throw std::runtime_error(
+      "incomplete persistent Level 1 design cache activated");
+  bool rejected_out_of_order_append = false;
+  try {
+    candidate.append_level1_design_cache(
+      1, design.leftCols(1), &timings);
+  } catch(const std::invalid_argument&) {
+    rejected_out_of_order_append = true;
+  }
+  if(!rejected_out_of_order_append)
+    throw std::runtime_error(
+      "persistent Level 1 design cache accepted an out-of-order append");
   candidate.append_level1_design_cache(
     0, design.leftCols(2), &timings);
+  if(candidate.activate_level1_design_cache(rows, features))
+    throw std::runtime_error(
+      "partially populated persistent Level 1 design cache activated");
   candidate.append_level1_design_cache(
     2, design.rightCols(features - 2), &timings);
   if(!candidate.activate_level1_design_cache(rows, features))
