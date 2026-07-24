@@ -505,6 +505,22 @@ class CudaDeviceBuffer {
   CudaDeviceBuffer(const CudaDeviceBuffer&) = delete;
   CudaDeviceBuffer& operator=(const CudaDeviceBuffer&) = delete;
 
+  CudaDeviceBuffer(CudaDeviceBuffer&& other) noexcept
+      : data_(other.data_), capacity_(other.capacity_) {
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+  }
+
+  CudaDeviceBuffer& operator=(CudaDeviceBuffer&& other) noexcept {
+    if(this == &other) return *this;
+    if(data_) cudaFree(data_);
+    data_ = other.data_;
+    capacity_ = other.capacity_;
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+    return *this;
+  }
+
   operator T*() noexcept {
     return data_;
   }
@@ -551,22 +567,14 @@ struct CudaLevel0CholeskyLane {
   cudaStream_t stream = nullptr;
   cublasHandle_t blas = nullptr;
   cusolverDnHandle_t solver = nullptr;
-  double* gram = nullptr;
-  double* factor = nullptr;
-  double* right_hand_sides = nullptr;
-  double* solve = nullptr;
-  double* coefficients = nullptr;
-  double* predictions = nullptr;
-  double* workspace = nullptr;
-  int* info = nullptr;
-  size_t gram_capacity = 0;
-  size_t factor_capacity = 0;
-  size_t right_hand_sides_capacity = 0;
-  size_t solve_capacity = 0;
-  size_t coefficients_capacity = 0;
-  size_t predictions_capacity = 0;
-  size_t workspace_capacity = 0;
-  size_t info_capacity = 0;
+  CudaDeviceBuffer<double> gram;
+  CudaDeviceBuffer<double> factor;
+  CudaDeviceBuffer<double> right_hand_sides;
+  CudaDeviceBuffer<double> solve;
+  CudaDeviceBuffer<double> coefficients;
+  CudaDeviceBuffer<double> predictions;
+  CudaDeviceBuffer<double> workspace;
+  CudaDeviceBuffer<int> info;
 };
 
 enum class CudaFoldSystemOrientation {
@@ -2156,15 +2164,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
         const Eigen::Index fold = static_cast<Eigen::Index>(system);
         const Eigen::Index sample_count = column_counts(fold);
-        ensure_capacity(lane.gram, lane.gram_capacity, gram_elements,
+        ensure_capacity(lane.gram, gram_elements,
           "cudaMalloc(resident fold Gram matrix)");
-        ensure_capacity(lane.right_hand_sides,
-          lane.right_hand_sides_capacity, rhs_elements,
+        ensure_capacity(lane.right_hand_sides, rhs_elements,
           "cudaMalloc(resident fold right-hand sides)");
         if(phenotype_count > 0 && !cache_full_phenotypes) {
           packed_phenotypes[system] = phenotypes.middleRows(
             start_columns(fold), sample_count);
-          ensure_capacity(lane.predictions, lane.predictions_capacity,
+          ensure_capacity(lane.predictions,
             packed_phenotypes[system].size(),
             "cudaMalloc(resident fold phenotype staging)");
         }
@@ -2335,15 +2342,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
         const Eigen::Index fold = static_cast<Eigen::Index>(system);
         const Eigen::Index sample_count = row_counts(fold);
-        ensure_capacity(lane.gram, lane.gram_capacity, gram_elements,
+        ensure_capacity(lane.gram, gram_elements,
           "cudaMalloc(resident design fold Gram matrix)");
-        ensure_capacity(lane.right_hand_sides,
-          lane.right_hand_sides_capacity, rhs_elements,
+        ensure_capacity(lane.right_hand_sides, rhs_elements,
           "cudaMalloc(resident design fold right-hand sides)");
         if(outcome_count > 0) {
           packed_outcomes[system] = outcomes.middleRows(
             start_rows(fold), sample_count);
-          ensure_capacity(lane.predictions, lane.predictions_capacity,
+          ensure_capacity(lane.predictions,
             packed_outcomes[system].size(),
             "cudaMalloc(resident design fold outcome staging)");
         }
@@ -2789,37 +2795,36 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       std::vector<int> workspace_sizes(system_count, 0);
       for(size_t system = 0; system < system_count; ++system) {
         CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
-        ensure_capacity(lane.gram, lane.gram_capacity, gram_elements,
+        ensure_capacity(lane.gram, gram_elements,
           "cudaMalloc(batched Cholesky Gram matrix)");
         const bool factor_grew = static_cast<size_t>(gram_elements) >
-          lane.factor_capacity;
-        ensure_capacity(lane.factor, lane.factor_capacity, gram_elements,
+          lane.factor.capacity();
+        ensure_capacity(lane.factor, gram_elements,
           "cudaMalloc(batched Cholesky factorization matrix)");
-        ensure_capacity(lane.right_hand_sides,
-          lane.right_hand_sides_capacity, rhs_elements,
+        ensure_capacity(lane.right_hand_sides, rhs_elements,
           "cudaMalloc(batched Cholesky right-hand sides)");
-        ensure_capacity(lane.solve, lane.solve_capacity, rhs_elements,
+        ensure_capacity(lane.solve, rhs_elements,
           "cudaMalloc(batched Cholesky solve workspace)");
-        ensure_capacity(lane.coefficients, lane.coefficients_capacity,
+        ensure_capacity(lane.coefficients,
           coefficient_elements,
           "cudaMalloc(batched Cholesky coefficients)");
-        ensure_capacity(lane.predictions, lane.predictions_capacity,
+        ensure_capacity(lane.predictions,
           predictions[system].size(),
           "cudaMalloc(batched Cholesky predictions)");
-        ensure_capacity(lane.info, lane.info_capacity,
+        ensure_capacity(lane.info,
           2 * parameter_count,
           "cudaMalloc(batched Cholesky solver status)");
-        if(factor_grew || lane.workspace_capacity == 0) {
+        if(factor_grew || lane.workspace.capacity() == 0) {
           check_cusolver(cusolverDnDpotrf_bufferSize(lane.solver,
             CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
             &workspace_sizes[system]),
             "cusolverDnDpotrf_bufferSize(batched resident ridge)");
-          ensure_capacity(lane.workspace, lane.workspace_capacity,
+          ensure_capacity(lane.workspace,
             workspace_sizes[system],
             "cudaMalloc(batched Cholesky solver workspace)");
         } else {
           workspace_sizes[system] = checked_int(
-            static_cast<Eigen::Index>(lane.workspace_capacity),
+            static_cast<Eigen::Index>(lane.workspace.capacity()),
             "batched Cholesky solver workspace size");
         }
       }
@@ -3239,38 +3244,38 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       std::vector<int> workspace_sizes(system_count, 0);
       for(size_t system = 0; system < system_count; ++system) {
         CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
-        if(lane.gram_capacity < static_cast<size_t>(gram_elements) ||
-           lane.right_hand_sides_capacity <
+        if(lane.gram.capacity() < static_cast<size_t>(gram_elements) ||
+           lane.right_hand_sides.capacity() <
              static_cast<size_t>(rhs_elements))
           throw std::runtime_error(
             "Step 1 cached fold systems were released before ridge prediction");
         const bool factor_grew = static_cast<size_t>(gram_elements) >
-          lane.factor_capacity;
-        ensure_capacity(lane.factor, lane.factor_capacity, gram_elements,
+          lane.factor.capacity();
+        ensure_capacity(lane.factor, gram_elements,
           "cudaMalloc(cached fold Cholesky factorization matrix)");
-        ensure_capacity(lane.solve, lane.solve_capacity, rhs_elements,
+        ensure_capacity(lane.solve, rhs_elements,
           "cudaMalloc(cached fold Cholesky solve workspace)");
-        ensure_capacity(lane.coefficients, lane.coefficients_capacity,
+        ensure_capacity(lane.coefficients,
           coefficient_elements,
           "cudaMalloc(cached fold Cholesky coefficients)");
-        ensure_capacity(lane.predictions, lane.predictions_capacity,
+        ensure_capacity(lane.predictions,
           column_counts(static_cast<Eigen::Index>(system)) *
             combination_count,
           "cudaMalloc(cached fold Cholesky predictions)");
-        ensure_capacity(lane.info, lane.info_capacity,
+        ensure_capacity(lane.info,
           2 * parameter_count,
           "cudaMalloc(cached fold Cholesky solver status)");
-        if(factor_grew || lane.workspace_capacity == 0) {
+        if(factor_grew || lane.workspace.capacity() == 0) {
           check_cusolver(cusolverDnDpotrf_bufferSize(lane.solver,
             CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
             &workspace_sizes[system]),
             "cusolverDnDpotrf_bufferSize(cached fold ridge)");
-          ensure_capacity(lane.workspace, lane.workspace_capacity,
+          ensure_capacity(lane.workspace,
             workspace_sizes[system],
             "cudaMalloc(cached fold Cholesky solver workspace)");
         } else {
           workspace_sizes[system] = checked_int(
-            static_cast<Eigen::Index>(lane.workspace_capacity),
+            static_cast<Eigen::Index>(lane.workspace.capacity()),
             "cached fold Cholesky solver workspace size");
         }
       }
@@ -5726,14 +5731,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     static void release_level0_cholesky_lane(
       CudaLevel0CholeskyLane& lane) {
       if(lane.stream) cudaStreamSynchronize(lane.stream);
-      if(lane.info) cudaFree(lane.info);
-      if(lane.workspace) cudaFree(lane.workspace);
-      if(lane.predictions) cudaFree(lane.predictions);
-      if(lane.coefficients) cudaFree(lane.coefficients);
-      if(lane.solve) cudaFree(lane.solve);
-      if(lane.right_hand_sides) cudaFree(lane.right_hand_sides);
-      if(lane.factor) cudaFree(lane.factor);
-      if(lane.gram) cudaFree(lane.gram);
       if(lane.solver) cusolverDnDestroy(lane.solver);
       if(lane.blas) cublasDestroy(lane.blas);
       if(lane.stream) cudaStreamDestroy(lane.stream);
@@ -5757,7 +5754,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             "create batched Cholesky cuBLAS handle");
           check_cublas(cublasSetStream(lane.blas, lane.stream),
             "set batched Cholesky cuBLAS stream");
-          level0_cholesky_lanes_.push_back(lane);
+          level0_cholesky_lanes_.push_back(std::move(lane));
         } catch(...) {
           release_level0_cholesky_lane(lane);
           throw;
@@ -5963,43 +5960,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       CudaDeviceBuffer<unsigned char>& buffer,
       size_t required, const char* label) {
       buffer.ensure(required, label);
-    }
-
-    static void ensure_capacity(double*& pointer, size_t& capacity,
-      Eigen::Index required, const char* label) {
-      if(required < 0)
-        throw std::runtime_error(
-          std::string("negative CUDA allocation size for ") + label);
-      const size_t required_size = static_cast<size_t>(required);
-      if(required_size <= capacity) return;
-      if(required_size > std::numeric_limits<size_t>::max() / sizeof(double))
-        throw std::runtime_error(std::string("CUDA allocation size overflow for ") + label);
-      if(pointer) check_cuda(cudaFree(pointer), "cudaFree while growing buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
-        required_size * sizeof(double)), label);
-      capacity = required_size;
-    }
-
-    static void ensure_capacity(int*& pointer, size_t& capacity,
-      Eigen::Index required, const char* label) {
-      if(required < 0)
-        throw std::runtime_error(
-          std::string("negative CUDA allocation size for ") + label);
-      const size_t required_size = static_cast<size_t>(required);
-      if(required_size <= capacity) return;
-      if(required_size >
-         std::numeric_limits<size_t>::max() / sizeof(int))
-        throw std::runtime_error(
-          std::string("CUDA allocation size overflow for ") + label);
-      if(pointer) check_cuda(cudaFree(pointer),
-        "cudaFree while growing integer buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
-        required_size * sizeof(int)), label);
-      capacity = required_size;
     }
 
     int device_;
