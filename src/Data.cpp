@@ -267,6 +267,53 @@ struct Step1Level0PipelineResult {
   bool processed = false;
 };
 
+void accumulate_step1_pipelined_block_profile(
+  Step1Profile& profile,
+  const Step1Level0PipelineResult& result,
+  double pipeline_wait_ms) {
+
+  const Step1ComputeTimings& timings = result.preprocess;
+  profile.pgen_prefetched_blocks++;
+  profile.pgen_prefetch_service_ms += result.prefetch.service_ms;
+  profile.pgen_prefetch_wait_ms += result.prefetch_wait_ms;
+  profile.level0_pipelined_blocks++;
+  profile.level0_pipeline_service_ms += result.service_ms;
+  profile.level0_pipeline_wait_ms += pipeline_wait_ms;
+  profile.preprocess_wall_ms += result.preprocess_wall_ms;
+  profile.preprocess_backend_compute_ms += timings.preprocess_ms;
+  profile.preprocess_upload_ms += timings.upload_ms;
+  profile.preprocess_download_ms += timings.download_ms;
+  profile.preprocess_data_setup_ms += result.data_setup_ms;
+  profile.preprocess_backend_wall_ms +=
+    timings.packed_hardcall_backend_wall_ms;
+  profile.preprocess_pinned_staging_upload_count +=
+    timings.pinned_staging_upload_count;
+  profile.preprocess_pinned_staging_upload_bytes +=
+    timings.pinned_staging_upload_bytes;
+  profile.preprocess_packed_hardcall_blocks +=
+    timings.packed_hardcall_upload_count;
+  profile.preprocess_packed_hardcall_upload_bytes +=
+    timings.packed_hardcall_upload_bytes;
+  profile.preprocess_registered_packed_uploads +=
+    timings.registered_packed_upload_count;
+  profile.preprocess_registered_packed_upload_bytes +=
+    timings.registered_packed_upload_bytes;
+  profile.preprocess_packed_hardcall_expand_ms +=
+    timings.packed_hardcall_expand_ms;
+  profile.preprocess_packed_hardcall_validation_ms +=
+    timings.packed_hardcall_validation_ms;
+  profile.preprocess_packed_hardcall_allocation_ms +=
+    timings.packed_hardcall_allocation_ms;
+  profile.preprocess_packed_hardcall_host_prepare_ms +=
+    timings.packed_hardcall_host_prepare_ms;
+  profile.preprocess_packed_hardcall_backend_wall_ms +=
+    timings.packed_hardcall_backend_wall_ms;
+  profile.preprocess_backend_blocks++;
+  profile.preprocess_host_orchestration_ms += std::max(
+    0.0, result.preprocess_wall_ms - timings.preprocess_ms -
+      timings.upload_ms - timings.download_ms);
+}
+
 struct Step1NextBlock {
   bool available = false;
   int chromosome_variant_count = 0;
@@ -299,6 +346,50 @@ Step1NextBlock find_next_step1_block(
     return next;
   }
   return next;
+}
+
+struct Step1CvProfileSnapshot {
+  ProfileClock::time_point wall_start;
+  double gram_ms = 0;
+  double gty_ms = 0;
+  double eigensolve_ms = 0;
+  double upload_ms = 0;
+  double download_ms = 0;
+  double backend_ridge_ms = 0;
+};
+
+Step1CvProfileSnapshot snapshot_step1_cv_profile(
+  const Step1Profile& profile) {
+
+  Step1CvProfileSnapshot snapshot;
+  snapshot.wall_start = ProfileClock::now();
+  snapshot.gram_ms = profile.gram_ms;
+  snapshot.gty_ms = profile.gty_ms;
+  snapshot.eigensolve_ms = profile.eigensolve_ms;
+  snapshot.upload_ms = profile.backend_upload_ms;
+  snapshot.download_ms = profile.backend_download_ms;
+  snapshot.backend_ridge_ms = profile.backend_ridge_compute_ms;
+  return snapshot;
+}
+
+void accumulate_step1_cv_profile(
+  Step1Profile& profile,
+  const Step1CvProfileSnapshot& before) {
+
+  const double cv_wall_ms = elapsed_ms(before.wall_start);
+  const double cv_backend_compute_ms =
+    profile.gram_ms - before.gram_ms +
+    profile.gty_ms - before.gty_ms +
+    profile.eigensolve_ms - before.eigensolve_ms +
+    profile.backend_ridge_compute_ms - before.backend_ridge_ms;
+  const double cv_transfer_ms =
+    profile.backend_upload_ms - before.upload_ms +
+    profile.backend_download_ms - before.download_ms;
+  profile.cv_wall_ms += cv_wall_ms;
+  profile.cv_backend_compute_ms += cv_backend_compute_ms;
+  profile.cv_transfer_ms += cv_transfer_ms;
+  profile.cv_host_orchestration_ms += std::max(
+    0.0, cv_wall_ms - cv_backend_compute_ms - cv_transfer_ms);
 }
 
 struct Step1RidgeProfileSnapshot {
@@ -1527,53 +1618,9 @@ void Data::level_0_calculations() {
         if(pgen_profile)
           accumulate_step1_pgen_profile(
             *pgen_profile, result.prefetch.profile);
-        if(params.profile_step1) {
-          const Step1ComputeTimings& timings = result.preprocess;
-          step1_profile.pgen_prefetched_blocks++;
-          step1_profile.pgen_prefetch_service_ms +=
-            result.prefetch.service_ms;
-          step1_profile.pgen_prefetch_wait_ms +=
-            result.prefetch_wait_ms;
-          step1_profile.level0_pipelined_blocks++;
-          step1_profile.level0_pipeline_service_ms += result.service_ms;
-          step1_profile.level0_pipeline_wait_ms += wait_ms;
-          step1_profile.preprocess_wall_ms +=
-            result.preprocess_wall_ms;
-          step1_profile.preprocess_backend_compute_ms +=
-            timings.preprocess_ms;
-          step1_profile.preprocess_upload_ms += timings.upload_ms;
-          step1_profile.preprocess_download_ms += timings.download_ms;
-          step1_profile.preprocess_data_setup_ms +=
-            result.data_setup_ms;
-          step1_profile.preprocess_backend_wall_ms +=
-            timings.packed_hardcall_backend_wall_ms;
-          step1_profile.preprocess_pinned_staging_upload_count +=
-            timings.pinned_staging_upload_count;
-          step1_profile.preprocess_pinned_staging_upload_bytes +=
-            timings.pinned_staging_upload_bytes;
-          step1_profile.preprocess_packed_hardcall_blocks +=
-            timings.packed_hardcall_upload_count;
-          step1_profile.preprocess_packed_hardcall_upload_bytes +=
-            timings.packed_hardcall_upload_bytes;
-          step1_profile.preprocess_registered_packed_uploads +=
-            timings.registered_packed_upload_count;
-          step1_profile.preprocess_registered_packed_upload_bytes +=
-            timings.registered_packed_upload_bytes;
-          step1_profile.preprocess_packed_hardcall_expand_ms +=
-            timings.packed_hardcall_expand_ms;
-          step1_profile.preprocess_packed_hardcall_validation_ms +=
-            timings.packed_hardcall_validation_ms;
-          step1_profile.preprocess_packed_hardcall_allocation_ms +=
-            timings.packed_hardcall_allocation_ms;
-          step1_profile.preprocess_packed_hardcall_host_prepare_ms +=
-            timings.packed_hardcall_host_prepare_ms;
-          step1_profile.preprocess_packed_hardcall_backend_wall_ms +=
-            timings.packed_hardcall_backend_wall_ms;
-          step1_profile.preprocess_backend_blocks++;
-          step1_profile.preprocess_host_orchestration_ms += std::max(
-            0.0, result.preprocess_wall_ms - timings.preprocess_ms -
-              timings.upload_ms - timings.download_ms);
-        }
+        if(params.profile_step1)
+          accumulate_step1_pipelined_block_profile(
+            step1_profile, result, wait_ms);
         sout << " block [" << block + 1 << "] : " << bs <<
           " snps (" << static_cast<long long>(
             result.prefetch.service_ms) << "ms prefetched; " <<
@@ -1701,39 +1748,12 @@ void Data::level_0_calculations() {
       }
 
       // calc working matrices for ridge regressions across folds
-      ProfileClock::time_point cv_start;
-      double cv_gram_before_ms = 0;
-      double cv_gty_before_ms = 0;
-      double cv_eigensolve_before_ms = 0;
-      double cv_upload_before_ms = 0;
-      double cv_download_before_ms = 0;
-      double cv_ridge_before_ms = 0;
-      if(params.profile_step1) {
-        cv_start = ProfileClock::now();
-        cv_gram_before_ms = step1_profile.gram_ms;
-        cv_gty_before_ms = step1_profile.gty_ms;
-        cv_eigensolve_before_ms = step1_profile.eigensolve_ms;
-        cv_upload_before_ms = step1_profile.backend_upload_ms;
-        cv_download_before_ms = step1_profile.backend_download_ms;
-        cv_ridge_before_ms = step1_profile.backend_ridge_compute_ms;
-      }
+      Step1CvProfileSnapshot cv_profile_before;
+      if(params.profile_step1)
+        cv_profile_before = snapshot_step1_cv_profile(step1_profile);
       calc_cv_matrices(&l0);
-      if(params.profile_step1) {
-        const double cv_wall_ms = elapsed_ms(cv_start);
-        const double cv_backend_compute_ms =
-          step1_profile.gram_ms - cv_gram_before_ms +
-          step1_profile.gty_ms - cv_gty_before_ms +
-          step1_profile.eigensolve_ms - cv_eigensolve_before_ms +
-          step1_profile.backend_ridge_compute_ms - cv_ridge_before_ms;
-        const double cv_transfer_ms =
-          step1_profile.backend_upload_ms - cv_upload_before_ms +
-          step1_profile.backend_download_ms - cv_download_before_ms;
-        step1_profile.cv_wall_ms += cv_wall_ms;
-        step1_profile.cv_backend_compute_ms += cv_backend_compute_ms;
-        step1_profile.cv_transfer_ms += cv_transfer_ms;
-        step1_profile.cv_host_orchestration_ms += std::max(
-          0.0, cv_wall_ms - cv_backend_compute_ms - cv_transfer_ms);
-      }
+      if(params.profile_step1)
+        accumulate_step1_cv_profile(step1_profile, cv_profile_before);
 
       if(level0_pipeline_enabled && pgen_prefetch_pending) {
         pgen_prefetch_pending = false;
