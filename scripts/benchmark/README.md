@@ -7,6 +7,7 @@ REGENIE v4.1.2. Start with the report for the stage you plan to run:
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000; 700,000 model-fitting variants; quantitative, binary, and survival traits with 0-10% missingness | Latest byte-exact default on A100 versus upstream v4.1.2 on an eight-core N2, plus a clearly separated opt-in path-Newton sensitivity |
 | [CUDA Step 1 refactor cross-model gate](results/2026-07-24-step1-cuda-refactor-gate.md) | A100; N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Refactor revision `340677f3` had no regression across all three models, flat backend compute timings, zero fallbacks, and 24/24 byte-identical LOCO files |
+| [CUDA Step 1 maintainability-refactor gate](results/2026-07-24-step1-maintainability-refactor.md) | N2 CPU validation and A100 N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Final Stage 1 revision `99f1152d` preserved upstream-origin numerical paths, changed end-to-end time by -0.94% to +0.17%, and produced 24/24 byte-identical LOCO files |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `3ab5fbb` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=32 with 0-10% missingness, current processes 848.2 quantitative, 792.7 binary, and 524.9 survival variants/s; CPU chromosome fan-out remains the recommended production placement |
 
 Every headline table states the sample count, trait count, model, hardware,
@@ -101,6 +102,9 @@ Stage 1:
   byte-exact CUDA Level 0 download optimization, including the quantitative,
   binary, and survival P=8/P=32 safety gate and isolated/combined binary
   profiles.
+- [`results/2026-07-24-step1-maintainability-refactor.md`](results/2026-07-24-step1-maintainability-refactor.md) —
+  final Stage 1 structural cleanup gate at N=500,000, 700,000 model-fitting
+  variants, and P=8 across quantitative, binary, and survival traits.
 
 Stage 2:
 
