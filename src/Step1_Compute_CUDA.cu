@@ -632,6 +632,54 @@ struct CudaPackedStaticInputs {
   }
 };
 
+struct CudaResidentGenotypes {
+  const double* host_data = nullptr;
+  Eigen::Index rows = 0;
+  Eigen::Index columns = 0;
+  bool valid = false;
+
+  void activate(const double* new_host_data, Eigen::Index new_rows,
+    Eigen::Index new_columns) {
+    host_data = new_host_data;
+    rows = new_rows;
+    columns = new_columns;
+    valid = true;
+  }
+
+  void invalidate() {
+    host_data = nullptr;
+    rows = 0;
+    columns = 0;
+    valid = false;
+  }
+
+  const double* device_columns(const double* device_data,
+    const Eigen::Ref<const Eigen::MatrixXd>& matrix,
+    Eigen::Index start_column, Eigen::Index column_count) const {
+
+    if(!valid || !host_data || matrix.rows() != rows ||
+       matrix.innerStride() != 1 || matrix.outerStride() != rows ||
+       start_column < 0 || column_count < 0 ||
+       start_column > matrix.cols() - column_count)
+      return nullptr;
+
+    const std::uintptr_t resident_address =
+      reinterpret_cast<std::uintptr_t>(host_data);
+    const std::uintptr_t matrix_address =
+      reinterpret_cast<std::uintptr_t>(matrix.data());
+    if(matrix_address < resident_address) return nullptr;
+    const std::uintptr_t byte_offset = matrix_address - resident_address;
+    if(byte_offset % sizeof(double) != 0) return nullptr;
+    const Eigen::Index element_offset =
+      static_cast<Eigen::Index>(byte_offset / sizeof(double));
+    if(rows <= 0 || element_offset % rows != 0) return nullptr;
+    const Eigen::Index first_column = element_offset / rows;
+    if(first_column < 0 || first_column > columns - matrix.cols())
+      return nullptr;
+    return device_data + (first_column + start_column) * rows;
+  }
+};
+
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
@@ -646,8 +694,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
-        resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
-        resident_valid_(false), resident_design_rows_(0),
+        resident_design_rows_(0),
         resident_design_columns_(0), resident_design_valid_(false),
         cached_weighted_gram_valid_(false),
         resident_design_uses_level1_cache_(false),
@@ -815,9 +862,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         static_cast<size_t>(rows) * packed_stride_bytes;
       row_scales.resize(rows);
       if(rows == 0) {
-        resident_rows_ = 0;
-        resident_columns_ = columns;
-        resident_valid_ = true;
+        resident_genotypes_.activate(nullptr, 0, columns);
         if(timings) {
           timings->packed_hardcall_allocation_ms +=
             elapsed_ms(allocation_start);
@@ -986,10 +1031,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->preprocess_ms +=
           scale_events->record_stop_and_elapsed_ms();
 
-      resident_host_data_ = nullptr;
-      resident_rows_ = variants;
-      resident_columns_ = samples;
-      resident_valid_ = true;
+      resident_genotypes_.activate(nullptr, variants, samples);
       if(timings)
         timings->packed_hardcall_backend_wall_ms +=
           elapsed_ms(backend_wall_start);
@@ -1145,10 +1187,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "copy normalized genotype preprocessing block from CUDA device");
         if(timings) timings->download_ms += elapsed_ms(transfer_start);
       }
-      resident_host_data_ = genotypes.data();
-      resident_rows_ = genotypes.rows();
-      resident_columns_ = genotypes.cols();
-      resident_valid_ = true;
+      resident_genotypes_.activate(
+        genotypes.data(), genotypes.rows(), genotypes.cols());
       return true;
     }
 
@@ -1857,14 +1897,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1GramMode mode,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_valid_ || start_column < 0 || column_count < 0 ||
-         start_column > resident_columns_ - column_count ||
+      if(!resident_genotypes_.valid || start_column < 0 || column_count < 0 ||
+         start_column > resident_genotypes_.columns - column_count ||
          phenotypes.rows() != column_count)
         throw std::invalid_argument(
           "Step 1 resident genotype products received incompatible dimensions");
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_rows_, "resident genotype product row count");
+        resident_genotypes_.rows, "resident genotype product row count");
       const int columns = checked_int(
         column_count, "resident genotype product sample count");
       const int phenotype_count = checked_int(
@@ -1904,7 +1944,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
 
       const double* device_genotypes = d_resident_genotypes_ +
-        start_column * resident_rows_;
+        start_column * resident_genotypes_.rows;
       const double alpha = 1.0;
       const double beta = 0.0;
       if(phenotype_count > 0) {
@@ -1988,15 +2028,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(!level0_resident_folds_enabled_ || !level0_cholesky_enabled_ ||
          !level0_fold_batch_enabled_ || system_count_index < 2)
         return false;
-      if(!resident_valid_ || column_counts.size() != system_count_index ||
-         phenotypes.rows() != resident_columns_ ||
+      if(!resident_genotypes_.valid || column_counts.size() != system_count_index ||
+         phenotypes.rows() != resident_genotypes_.columns ||
          active_phenotypes.size() != phenotypes.cols() ||
          active_phenotypes.count() == 0)
         throw std::invalid_argument(
           "Step 1 resident fold products received incompatible dimensions");
       for(Eigen::Index system = 0; system < system_count_index; ++system) {
         if(start_columns(system) < 0 || column_counts(system) < 0 ||
-           start_columns(system) > resident_columns_ - column_counts(system))
+           start_columns(system) > resident_genotypes_.columns - column_counts(system))
           throw std::invalid_argument(
             "Step 1 resident fold products received an invalid fold");
       }
@@ -2004,7 +2044,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const size_t system_count = static_cast<size_t>(system_count_index);
       const int rows = checked_int(
-        resident_rows_, "resident fold product row count");
+        resident_genotypes_.rows, "resident fold product row count");
       const int phenotype_count = checked_int(
         phenotypes.cols(), "resident fold product phenotype count");
       std::vector<int> active_phenotype_indices;
@@ -2014,8 +2054,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(active_phenotypes(phenotype))
           active_phenotype_indices.push_back(
             static_cast<int>(phenotype));
-      const Eigen::Index gram_elements = resident_rows_ * resident_rows_;
-      const Eigen::Index rhs_elements = resident_rows_ * phenotypes.cols();
+      const Eigen::Index gram_elements = resident_genotypes_.rows * resident_genotypes_.rows;
+      const Eigen::Index rhs_elements = resident_genotypes_.rows * phenotypes.cols();
       ensure_level0_cholesky_lane_count(system_count);
       ensure_capacity(d_gram_, gram_elements,
         "cudaMalloc(resident fold total Gram matrix)");
@@ -2088,7 +2128,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const int samples = checked_int(column_counts(fold),
           "resident fold product sample count");
         const double* device_genotypes = d_resident_genotypes_ +
-          static_cast<Eigen::Index>(start) * resident_rows_;
+          static_cast<Eigen::Index>(start) * resident_genotypes_.rows;
         const double* device_fold_phenotypes = phenotype_count == 0 ?
           nullptr : (cache_full_phenotypes ?
             d_level0_phenotypes_ + start : lane.predictions);
@@ -2382,9 +2422,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(ridge_factorized_size_ < 0)
         throw std::runtime_error(
           "Step 1 resident ridge prediction requested before factorization");
-      if(!resident_valid_ || resident_rows_ != ridge_factorized_size_ ||
+      if(!resident_genotypes_.valid || resident_genotypes_.rows != ridge_factorized_size_ ||
          start_column < 0 || column_count < 0 ||
-         start_column > resident_columns_ - column_count)
+         start_column > resident_genotypes_.columns - column_count)
         throw std::invalid_argument(
           "Step 1 resident ridge prediction received incompatible dimensions");
       if((ridge_parameters.array() < 0).any())
@@ -2484,7 +2524,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const int count = checked_int(
           count_index, "resident ridge prediction chunk sample count");
         const double* device_prediction_chunk = d_resident_genotypes_ +
-          (start_column + start) * resident_rows_;
+          (start_column + start) * resident_genotypes_.rows;
         if(timings) timings->resident_reuse_count++;
 
         std::unique_ptr<CudaEventPair> prediction_events;
@@ -2525,11 +2565,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeTimings* timings) override {
 
       if(!level0_cholesky_enabled_) return false;
-      if(!resident_valid_ || gram.rows() != gram.cols() ||
-         gram.rows() != resident_rows_ ||
-         right_hand_sides.rows() != resident_rows_ ||
+      if(!resident_genotypes_.valid || gram.rows() != gram.cols() ||
+         gram.rows() != resident_genotypes_.rows ||
+         right_hand_sides.rows() != resident_genotypes_.rows ||
          start_column < 0 || column_count < 0 ||
-         start_column > resident_columns_ - column_count)
+         start_column > resident_genotypes_.columns - column_count)
         throw std::invalid_argument(
           "Step 1 resident Cholesky ridge prediction received incompatible dimensions");
       if((ridge_parameters.array() < 0).any())
@@ -2543,7 +2583,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         penalty_multipliers, coefficients, timings);
 
       const int size = checked_int(
-        resident_rows_, "resident Cholesky ridge system size");
+        resident_genotypes_.rows, "resident Cholesky ridge system size");
       const int sample_count = checked_int(
         column_count, "resident Cholesky ridge sample count");
       const int combination_count = checked_int(
@@ -2558,7 +2598,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       ensure_capacity(d_inverse_, predictions.size(),
         "cudaMalloc(resident Cholesky ridge predictions)");
       const double* device_prediction_matrix = d_resident_genotypes_ +
-        start_column * resident_rows_;
+        start_column * resident_genotypes_.rows;
       const double alpha = 1.0;
       const double beta = 0.0;
       std::unique_ptr<CudaEventPair> prediction_events;
@@ -2600,7 +2640,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(!level0_cholesky_enabled_ || !level0_fold_batch_enabled_ ||
          system_count < 2)
         return false;
-      if(!resident_valid_ || right_hand_sides.size() != system_count ||
+      if(!resident_genotypes_.valid || right_hand_sides.size() != system_count ||
          start_columns.size() != static_cast<Eigen::Index>(system_count) ||
          column_counts.size() != static_cast<Eigen::Index>(system_count))
         throw std::invalid_argument(
@@ -2610,7 +2650,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "Step 1 resident batched Cholesky ridge parameters must be non-negative");
       if((ridge_parameters.array() == 0).any()) return false;
 
-      const Eigen::Index size_index = resident_rows_;
+      const Eigen::Index size_index = resident_genotypes_.rows;
       const Eigen::Index right_hand_side_count_index =
         right_hand_sides.empty() ? 0 : right_hand_sides.front().cols();
       for(size_t system = 0; system < system_count; ++system) {
@@ -2621,7 +2661,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
            start_columns(static_cast<Eigen::Index>(system)) < 0 ||
            column_counts(static_cast<Eigen::Index>(system)) < 0 ||
            start_columns(static_cast<Eigen::Index>(system)) >
-             resident_columns_ -
+             resident_genotypes_.columns -
                column_counts(static_cast<Eigen::Index>(system)))
           throw std::invalid_argument(
             "Step 1 resident batched Cholesky ridge prediction received incompatible dimensions");
@@ -2766,7 +2806,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           const double* prediction_matrix = d_resident_genotypes_ +
             static_cast<Eigen::Index>(
               start_columns(static_cast<Eigen::Index>(system))) *
-              resident_rows_;
+              resident_genotypes_.rows;
           check_cublas(cublasDgemm(lane.blas, CUBLAS_OP_T, CUBLAS_OP_N,
             sample_count, combination_count, size, &alpha,
             prediction_matrix, size, lane.coefficients, size, &beta,
@@ -2845,7 +2885,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(!resident_fold_systems_.valid ||
          resident_fold_systems_.uses_design() ||
          resident_fold_systems_.rhs_count <= 0 ||
-         effective_sample_count != resident_columns_)
+         effective_sample_count != resident_genotypes_.columns)
         return false;
       if(cache_level1_design &&
          (resident_fold_systems_.rhs_count != 1 || !d_level1_design_ ||
@@ -2860,7 +2900,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(start_columns(fold) != covered_rows) return false;
         covered_rows += column_counts(fold);
       }
-      if(covered_rows != resident_columns_) return false;
+      if(covered_rows != resident_genotypes_.columns) return false;
 
       std::vector<Eigen::MatrixXd> unused_predictions;
       std::vector<Eigen::MatrixXd> unused_coefficients;
@@ -2871,7 +2911,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_columns_, "normalized Level 0 prediction row count");
+        resident_genotypes_.columns, "normalized Level 0 prediction row count");
       const int parameter_count = checked_int(ridge_parameters.size(),
         "normalized Level 0 prediction parameter count");
       const int outcome_count = checked_int(resident_fold_systems_.rhs_count,
@@ -3046,7 +3086,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_fold_systems_.system_count);
       const bool design_orientation =
         resident_fold_systems_.uses_design();
-      if((design_orientation ? !resident_design_valid_ : !resident_valid_) ||
+      if((design_orientation ? !resident_design_valid_ : !resident_genotypes_.valid) ||
          system_count < 2 ||
          start_columns.size() != resident_fold_systems_.system_count ||
          column_counts.size() != resident_fold_systems_.system_count)
@@ -3059,13 +3099,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(start_columns(fold) < 0 || column_counts(fold) < 0 ||
            start_columns(fold) >
              (design_orientation ? resident_design_rows_ :
-               resident_columns_) - column_counts(fold))
+               resident_genotypes_.columns) - column_counts(fold))
           throw std::invalid_argument(
             "Step 1 cached fold ridge prediction received invalid dimensions");
       }
 
       const Eigen::Index size_index = design_orientation ?
-        resident_design_columns_ : resident_rows_;
+        resident_design_columns_ : resident_genotypes_.rows;
       const Eigen::Index right_hand_side_count_index =
         resident_fold_systems_.rhs_count;
       const int size = checked_int(
@@ -3248,7 +3288,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             }
           } else {
             const double* prediction_matrix = d_resident_genotypes_ +
-              start * resident_rows_;
+              start * resident_genotypes_.rows;
             check_cublas(cublasDgemm(lane.blas,
               CUBLAS_OP_T, CUBLAS_OP_N,
               sample_count, combination_count, size, &alpha,
@@ -5739,10 +5779,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
     void invalidate_resident_genotypes() {
-      resident_host_data_ = nullptr;
-      resident_rows_ = 0;
-      resident_columns_ = 0;
-      resident_valid_ = false;
+      resident_genotypes_.invalidate();
       invalidate_resident_fold_systems();
     }
 
@@ -5775,30 +5812,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     const double* resident_genotype_columns(
       const Eigen::Ref<const Eigen::MatrixXd>& matrix,
       Eigen::Index start_column, Eigen::Index column_count) const {
-
-      if(!resident_valid_ || !resident_host_data_ ||
-         matrix.rows() != resident_rows_ || matrix.innerStride() != 1 ||
-         matrix.outerStride() != resident_rows_ || start_column < 0 ||
-         column_count < 0 || start_column > matrix.cols() - column_count)
-        return nullptr;
-
-      const std::uintptr_t resident_address =
-        reinterpret_cast<std::uintptr_t>(resident_host_data_);
-      const std::uintptr_t matrix_address =
-        reinterpret_cast<std::uintptr_t>(matrix.data());
-      if(matrix_address < resident_address) return nullptr;
-      const std::uintptr_t byte_offset = matrix_address - resident_address;
-      if(byte_offset % sizeof(double) != 0) return nullptr;
-      const Eigen::Index element_offset =
-        static_cast<Eigen::Index>(byte_offset / sizeof(double));
-      if(resident_rows_ <= 0 || element_offset % resident_rows_ != 0)
-        return nullptr;
-      const Eigen::Index first_column = element_offset / resident_rows_;
-      if(first_column < 0 ||
-         first_column > resident_columns_ - matrix.cols())
-        return nullptr;
-      return d_resident_genotypes_ +
-        (first_column + start_column) * resident_rows_;
+      return resident_genotypes_.device_columns(
+        d_resident_genotypes_, matrix, start_column, column_count);
     }
 
     static Eigen::MatrixXd contiguous_copy_if_needed(
@@ -5961,10 +5976,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaDeviceBuffer<unsigned char> d_packed_hardcalls_;
     CudaDeviceBuffer<unsigned char> d_transposed_hardcalls_;
     CudaDeviceBuffer<unsigned int> d_packed_row_counts_;
-    const double* resident_host_data_;
-    Eigen::Index resident_rows_;
-    Eigen::Index resident_columns_;
-    bool resident_valid_;
+    CudaResidentGenotypes resident_genotypes_;
     Eigen::Index resident_design_rows_;
     Eigen::Index resident_design_columns_;
     bool resident_design_valid_;
