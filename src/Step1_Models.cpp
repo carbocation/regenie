@@ -230,6 +230,16 @@ class Level1DesignCacheScope {
     return active_;
   }
 
+  bool cache_partitions(
+    const std::vector<Eigen::MatrixXd>& partitions,
+    Step1ComputeTimings* timings) {
+
+    if(active_)
+      throw std::logic_error("Step 1 Level 1 design cache is already active");
+    active_ = compute_backend_->cache_design_partitions(partitions, timings);
+    return active_;
+  }
+
   void release() {
     if(!active_) return;
     // Disarm before the explicit release so its exception behavior matches a
@@ -2286,10 +2296,11 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         l1->test_mat[ph_eff][fold].rows();
     const Eigen::Index total_rows = fold_offsets.back();
 
+    Level1DesignCacheScope design_cache(compute_backend);
     bool resident_design = false;
     if(!params->within_sample_l0) {
       const auto cache_start = std::chrono::high_resolution_clock::now();
-      resident_design = compute_backend->cache_design_partitions(
+      resident_design = design_cache.cache_partitions(
         l1->test_mat[ph_eff], profile_timings);
       profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - cache_start).count();
@@ -2703,7 +2714,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         profile.prediction_cache_bytes);
       profile.prediction_cache_phenotypes++;
     }
-    if(resident_design) compute_backend->release_cached_design();
+    if(resident_design) design_cache.release();
 
     sout << "done";
     auto ts2 = std::chrono::high_resolution_clock::now();
