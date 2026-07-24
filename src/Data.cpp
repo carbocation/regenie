@@ -33,6 +33,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -312,6 +313,272 @@ void accumulate_step1_pipelined_block_profile(
   profile.preprocess_host_orchestration_ms += std::max(
     0.0, result.preprocess_wall_ms - timings.preprocess_ms -
       timings.upload_ms - timings.download_ms);
+}
+
+class Step1Level0PipelineSession {
+  public:
+    explicit Step1Level0PipelineSession(
+      Step1ComputeBackend& level0_backend)
+      : level0_static_input_scope_(level0_backend, 1) {}
+
+    void reserve_prefetch_buffer(size_t packed_capacity) {
+      prefetch_buffer_.packed_hardcalls.reserve(packed_capacity);
+    }
+
+    void register_prefetch_buffer(
+      Step1ComputeBackend& backend,
+      size_t packed_capacity) {
+      backend.register_packed_hardcall_buffer(
+        prefetch_buffer_.packed_hardcalls.data(), packed_capacity);
+    }
+
+    void initialize_pipeline_backend(int gpu_device) {
+      pipeline_backend_ = make_step1_compute_backend("cuda", gpu_device);
+      pipeline_static_input_scope_.reset(
+        new Step1Level0StaticInputScope(*pipeline_backend_, 1));
+    }
+
+    bool has_prefetched_block() const {
+      return prefetch_pending_;
+    }
+
+    bool has_pipelined_block() const {
+      return pipeline_pending_;
+    }
+
+    Step1PgenPrefetchResult take_prefetched_block(double& wait_ms) {
+      const ProfileClock::time_point wait_start = ProfileClock::now();
+      Step1PgenPrefetchResult result = prefetch_future_.get();
+      wait_ms = elapsed_ms(wait_start);
+      prefetch_pending_ = false;
+      return result;
+    }
+
+    Step1Level0PipelineResult take_pipelined_block(double& wait_ms) {
+      const ProfileClock::time_point wait_start = ProfileClock::now();
+      Step1Level0PipelineResult result = pipeline_future_.get();
+      wait_ms = elapsed_ms(wait_start);
+      pipeline_pending_ = false;
+      return result;
+    }
+
+    template <typename Work>
+    void launch_prefetch(Work work) {
+      prefetch_future_ = std::async(
+        std::launch::async, std::move(work));
+      prefetch_pending_ = true;
+    }
+
+    void launch_pipelined_preprocess(
+      int next_block_size,
+      int sample_count,
+      const Eigen::MatrixXd& covariates,
+      const Eigen::VectorXd& sample_weights,
+      double degrees_of_freedom,
+      double minimum_scale,
+      bool profile_step1) {
+
+      prefetch_pending_ = false;
+      pipeline_pending_ = true;
+      pipeline_future_ = std::async(std::launch::async,
+        [this, next_block_size, sample_count, &covariates, &sample_weights,
+         degrees_of_freedom, minimum_scale, profile_step1]() {
+          Step1Level0PipelineResult result;
+          const ProfileClock::time_point service_start =
+            ProfileClock::now();
+          const ProfileClock::time_point prefetch_wait_start =
+            ProfileClock::now();
+          result.prefetch = prefetch_future_.get();
+          result.prefetch_wait_ms = elapsed_ms(prefetch_wait_start);
+
+          const ProfileClock::time_point preprocess_start =
+            ProfileClock::now();
+          const ProfileClock::time_point data_setup_start =
+            ProfileClock::now();
+          result.data_setup_ms = elapsed_ms(data_setup_start);
+          result.processed =
+            pipeline_backend_->preprocess_packed_hardcalls(
+              prefetch_buffer_.packed_hardcalls.data(),
+              prefetch_buffer_.packed_hardcalls.size(),
+              prefetch_buffer_.packed_stride_bytes,
+              next_block_size, sample_count, covariates, sample_weights,
+              degrees_of_freedom, minimum_scale, result.row_scales,
+              profile_step1 ? &result.preprocess : nullptr);
+          result.preprocess_wall_ms = elapsed_ms(preprocess_start);
+          result.service_ms = elapsed_ms(service_start);
+          return result;
+        });
+    }
+
+    void swap_pipeline_backend(
+      std::unique_ptr<Step1ComputeBackend>& level0_backend) {
+      level0_backend.swap(pipeline_backend_);
+    }
+
+    Step1PgenPrefetchBuffer& prefetch_buffer() {
+      return prefetch_buffer_;
+    }
+
+    void release_packed_hardcall_buffers(
+      Step1ComputeBackend& level0_backend) {
+      level0_backend.release_packed_hardcall_buffers();
+      if(pipeline_backend_)
+        pipeline_backend_->release_packed_hardcall_buffers();
+    }
+
+  private:
+    // The pipeline future precedes its generation scope on destruction, the
+    // prefetch future precedes its buffer, and both scopes precede the
+    // swappable backend that either may still reference after a swap.
+    std::unique_ptr<Step1ComputeBackend> pipeline_backend_;
+    Step1Level0StaticInputScope level0_static_input_scope_;
+    Step1PgenPrefetchBuffer prefetch_buffer_;
+    std::future<Step1PgenPrefetchResult> prefetch_future_;
+    bool prefetch_pending_ = false;
+    std::unique_ptr<Step1Level0StaticInputScope>
+      pipeline_static_input_scope_;
+    std::future<Step1Level0PipelineResult> pipeline_future_;
+    bool pipeline_pending_ = false;
+};
+
+template <
+  typename VariantInfo,
+  typename Parameters,
+  typename PgenReader,
+  typename Filters,
+  typename WorkerTiles>
+void launch_step1_pgen_prefetch(
+  Step1Level0PipelineSession& session,
+  int next_block_size,
+  uint32_t next_snp_count,
+  bool packed_hardcalls,
+  VariantInfo& variant_info,
+  Parameters& parameters,
+  PgenReader& pgen_reader,
+  Filters& filters,
+  WorkerTiles& worker_tiles) {
+
+  Step1PgenPrefetchBuffer& buffer = session.prefetch_buffer();
+  session.launch_prefetch(
+    [next_block_size, next_snp_count, packed_hardcalls, &variant_info,
+     &parameters, &pgen_reader, &filters, &worker_tiles, &buffer]() {
+      Step1PgenPrefetchResult result;
+      const ProfileClock::time_point service_start = ProfileClock::now();
+      Step1PgenReadProfile* local_profile = parameters.profile_step1 ?
+        &result.profile : nullptr;
+      const ProcessIoCounters io_before = local_profile ?
+        read_process_io_counters() : ProcessIoCounters();
+      if(packed_hardcalls) {
+        readChunkFromPGENFileToPackedHardcalls(
+          next_block_size, next_snp_count, variant_info, &parameters,
+          pgen_reader, buffer.packed_hardcalls,
+          buffer.packed_stride_bytes, local_profile);
+      } else {
+        buffer.genotypes.resize(next_block_size, parameters.n_samples);
+        if(parameters.alpha_prior != -1)
+          buffer.allele_frequencies.resize(next_block_size, 1);
+        readChunkFromPGENFileToG(
+          next_block_size, next_snp_count, variant_info, &parameters,
+          buffer.genotypes, buffer.allele_frequencies, pgen_reader,
+          &filters, &worker_tiles, local_profile);
+      }
+      if(local_profile)
+        accumulate_process_io_delta(
+          io_before, read_process_io_counters(), local_profile);
+      result.service_ms = elapsed_ms(service_start);
+      return result;
+    });
+}
+
+template <typename GenoBlock, typename ScaleVector, typename VariantInfo,
+          typename OutputStream>
+void install_step1_pipelined_block(
+  Step1Level0PipelineSession& session,
+  std::unique_ptr<Step1ComputeBackend>& level0_backend,
+  GenoBlock& genotype_block,
+  ScaleVector& genotype_scales,
+  Step1Level0PipelineResult& result,
+  int block_size,
+  int block_number,
+  uint32_t first_variant,
+  const VariantInfo& variant_info,
+  double minimum_scale,
+  Step1PgenReadProfile* pgen_profile,
+  bool profile_step1,
+  Step1Profile& profile,
+  bool& block_preprocessed_by_pipeline,
+  OutputStream& output,
+  double wait_ms) {
+
+  session.swap_pipeline_backend(level0_backend);
+  genotype_block.Gmat.resize(block_size, 0);
+  genotype_block.step1_pgen_packed_hardcalls.clear();
+  genotype_block.step1_pgen_packed_stride_bytes = 0;
+  genotype_block.step1_pgen_packed_block = true;
+  genotype_scales.swap(result.row_scales);
+  session.prefetch_buffer().packed_hardcalls.clear();
+  session.prefetch_buffer().packed_stride_bytes = 0;
+  block_preprocessed_by_pipeline = true;
+
+  MatrixXd::Index min_index;
+  if(genotype_scales.array().minCoeff(&min_index) < minimum_scale)
+    throw "!! Uh-oh, SNP " +
+      variant_info[first_variant + min_index].ID +
+      " has low variance (= " + to_string(genotype_scales(min_index, 0)) +
+      ").";
+
+  if(pgen_profile)
+    accumulate_step1_pgen_profile(*pgen_profile, result.prefetch.profile);
+  if(profile_step1)
+    accumulate_step1_pipelined_block_profile(profile, result, wait_ms);
+  output << " block [" << block_number + 1 << "] : " << block_size <<
+    " snps (" << static_cast<long long>(
+      result.prefetch.service_ms) << "ms prefetched; " <<
+    static_cast<long long>(wait_ms) << "ms pipeline wait)" << endl;
+}
+
+template <typename GenoBlock, typename OutputStream>
+void install_step1_prefetched_block(
+  Step1Level0PipelineSession& session,
+  GenoBlock& genotype_block,
+  const Step1PgenPrefetchResult& result,
+  int block_size,
+  int block_number,
+  bool packed_hardcalls,
+  double alpha_prior,
+  Step1PgenReadProfile* pgen_profile,
+  bool profile_step1,
+  Step1Profile& profile,
+  const ProfileClock::time_point& stage_start,
+  OutputStream& output,
+  double wait_ms) {
+
+  Step1PgenPrefetchBuffer& buffer = session.prefetch_buffer();
+  if(packed_hardcalls) {
+    genotype_block.Gmat.resize(block_size, 0);
+    genotype_block.step1_pgen_packed_hardcalls.swap(
+      buffer.packed_hardcalls);
+    genotype_block.step1_pgen_packed_stride_bytes =
+      buffer.packed_stride_bytes;
+    buffer.packed_stride_bytes = 0;
+    genotype_block.step1_pgen_packed_block = true;
+  } else {
+    genotype_block.Gmat.swap(buffer.genotypes);
+    if(alpha_prior != -1)
+      genotype_block.snp_afs.swap(buffer.allele_frequencies);
+  }
+  if(pgen_profile)
+    accumulate_step1_pgen_profile(*pgen_profile, result.profile);
+  if(profile_step1) {
+    profile.pgen_prefetched_blocks++;
+    profile.pgen_prefetch_service_ms += result.service_ms;
+    profile.pgen_prefetch_wait_ms += wait_ms;
+    profile.decode_ms += elapsed_ms(stage_start);
+  }
+  output << " block [" << block_number + 1 << "] : " << block_size <<
+    " snps (" << static_cast<long long>(result.service_ms) <<
+    "ms prefetched; " << static_cast<long long>(wait_ms) <<
+    "ms wait)" << endl;
 }
 
 struct Step1NextBlock {
@@ -1504,25 +1771,16 @@ void Data::level_0_calculations() {
     pgen_packed_hardcalls && pgen_prefetch_enabled;
   step1_sample_weights =
     in_filters.ind_in_analysis.matrix().cast<double>();
-  std::unique_ptr<Step1ComputeBackend> level0_pipeline_backend;
-  Step1Level0StaticInputScope level0_static_input_scope(
-    *step1_compute_backend, 1);
-  Step1PgenPrefetchBuffer pgen_prefetch_buffer;
-  std::future<Step1PgenPrefetchResult> pgen_prefetch_future;
-  bool pgen_prefetch_pending = false;
-  std::unique_ptr<Step1Level0StaticInputScope>
-    level0_pipeline_static_input_scope;
-  std::future<Step1Level0PipelineResult> level0_pipeline_future;
-  bool level0_pipeline_pending = false;
+  Step1Level0PipelineSession level0_pipeline(*step1_compute_backend);
   if(pgen_packed_hardcalls && pgen_block_bytes > 0 &&
      pgen_block_bytes <= std::numeric_limits<size_t>::max()) {
     const size_t packed_capacity = static_cast<size_t>(pgen_block_bytes);
     Gblock.step1_pgen_packed_hardcalls.reserve(packed_capacity);
-    pgen_prefetch_buffer.packed_hardcalls.reserve(packed_capacity);
+    level0_pipeline.reserve_prefetch_buffer(packed_capacity);
     step1_compute_backend->register_packed_hardcall_buffer(
       Gblock.step1_pgen_packed_hardcalls.data(), packed_capacity);
-    step1_compute_backend->register_packed_hardcall_buffer(
-      pgen_prefetch_buffer.packed_hardcalls.data(), packed_capacity);
+    level0_pipeline.register_prefetch_buffer(
+      *step1_compute_backend, packed_capacity);
   }
   const Eigen::Index level1_design_columns =
     static_cast<Eigen::Index>(params.total_n_block) * params.n_ridge_l0;
@@ -1532,12 +1790,8 @@ void Data::level_0_calculations() {
     !level0_pipeline_enabled &&
     step1_compute_backend->initialize_level1_design_cache(
       params.n_samples, level1_design_columns);
-  if(level0_pipeline_enabled) {
-    level0_pipeline_backend = make_step1_compute_backend(
-      "cuda", params.gpu_device);
-    level0_pipeline_static_input_scope.reset(
-      new Step1Level0StaticInputScope(*level0_pipeline_backend, 1));
-  }
+  if(level0_pipeline_enabled)
+    level0_pipeline.initialize_pipeline_backend(params.gpu_device);
   if(pgen_cuda_backend) {
     sout << " - Step 1 PGEN block prefetch : [" <<
       (pgen_prefetch_enabled ? "enabled" : "disabled") << "]";
@@ -1589,72 +1843,26 @@ void Data::level_0_calculations() {
       if(params.profile_step1) stage_start = ProfileClock::now();
       Gblock.step1_pgen_packed_block = false;
       bool block_preprocessed_by_pipeline = false;
-      if(level0_pipeline_pending) {
-        const ProfileClock::time_point wait_start = ProfileClock::now();
-        Step1Level0PipelineResult result = level0_pipeline_future.get();
-        const double wait_ms = elapsed_ms(wait_start);
-        level0_pipeline_pending = false;
+      if(level0_pipeline.has_pipelined_block()) {
+        double wait_ms = 0;
+        Step1Level0PipelineResult result =
+          level0_pipeline.take_pipelined_block(wait_ms);
         if(!result.processed)
           throw std::runtime_error(
             "Step 1 pipelined packed PGEN block could not be preprocessed by the selected backend");
-
-        step1_compute_backend.swap(level0_pipeline_backend);
-        Gblock.Gmat.resize(bs, 0);
-        Gblock.step1_pgen_packed_hardcalls.clear();
-        Gblock.step1_pgen_packed_stride_bytes = 0;
-        Gblock.step1_pgen_packed_block = true;
-        scale_G.swap(result.row_scales);
-        pgen_prefetch_buffer.packed_hardcalls.clear();
-        pgen_prefetch_buffer.packed_stride_bytes = 0;
-        block_preprocessed_by_pipeline = true;
-
-        MatrixXd::Index min_index;
-        if(scale_G.array().minCoeff(&min_index) < params.numtol)
-          throw "!! Uh-oh, SNP " +
-            snpinfo[in_filters.step1_snp_count + min_index].ID +
-            " has low variance (= " + to_string(scale_G(min_index, 0)) +
-            ").";
-
-        if(pgen_profile)
-          accumulate_step1_pgen_profile(
-            *pgen_profile, result.prefetch.profile);
-        if(params.profile_step1)
-          accumulate_step1_pipelined_block_profile(
-            step1_profile, result, wait_ms);
-        sout << " block [" << block + 1 << "] : " << bs <<
-          " snps (" << static_cast<long long>(
-            result.prefetch.service_ms) << "ms prefetched; " <<
-          static_cast<long long>(wait_ms) << "ms pipeline wait)" << endl;
-      } else if(pgen_prefetch_pending) {
-        const ProfileClock::time_point wait_start = ProfileClock::now();
-        Step1PgenPrefetchResult result = pgen_prefetch_future.get();
-        const double wait_ms = elapsed_ms(wait_start);
-        pgen_prefetch_pending = false;
-        if(pgen_packed_hardcalls) {
-          Gblock.Gmat.resize(bs, 0);
-          Gblock.step1_pgen_packed_hardcalls.swap(
-            pgen_prefetch_buffer.packed_hardcalls);
-          Gblock.step1_pgen_packed_stride_bytes =
-            pgen_prefetch_buffer.packed_stride_bytes;
-          pgen_prefetch_buffer.packed_stride_bytes = 0;
-          Gblock.step1_pgen_packed_block = true;
-        } else {
-          Gblock.Gmat.swap(pgen_prefetch_buffer.genotypes);
-          if(params.alpha_prior != -1)
-            Gblock.snp_afs.swap(pgen_prefetch_buffer.allele_frequencies);
-        }
-        if(pgen_profile)
-          accumulate_step1_pgen_profile(*pgen_profile, result.profile);
-        if(params.profile_step1) {
-          step1_profile.pgen_prefetched_blocks++;
-          step1_profile.pgen_prefetch_service_ms += result.service_ms;
-          step1_profile.pgen_prefetch_wait_ms += wait_ms;
-          step1_profile.decode_ms += elapsed_ms(stage_start);
-        }
-        sout << " block [" << block + 1 << "] : " << bs <<
-          " snps (" << static_cast<long long>(result.service_ms) <<
-          "ms prefetched; " << static_cast<long long>(wait_ms) <<
-          "ms wait)" << endl;
+        install_step1_pipelined_block(
+          level0_pipeline, step1_compute_backend, Gblock, scale_G, result,
+          bs, block, in_filters.step1_snp_count, snpinfo, params.numtol,
+          pgen_profile, params.profile_step1, step1_profile,
+          block_preprocessed_by_pipeline, sout, wait_ms);
+      } else if(level0_pipeline.has_prefetched_block()) {
+        double wait_ms = 0;
+        Step1PgenPrefetchResult result =
+          level0_pipeline.take_prefetched_block(wait_ms);
+        install_step1_prefetched_block(
+          level0_pipeline, Gblock, result, bs, block,
+          pgen_packed_hardcalls, params.alpha_prior, pgen_profile,
+          params.profile_step1, step1_profile, stage_start, sout, wait_ms);
       } else {
         if(pgen_packed_hardcalls) {
           Gblock.Gmat.resize(bs, 0);
@@ -1704,39 +1912,10 @@ void Data::level_0_calculations() {
           next_bs);
       if(pgen_prefetch_enabled && next_block.available) {
         const uint32_t next_snpcount = in_filters.step1_snp_count + bs;
-        pgen_prefetch_future = std::async(std::launch::async,
-          [this, next_bs, next_snpcount, pgen_packed_hardcalls,
-           &pgen_prefetch_buffer]() {
-            Step1PgenPrefetchResult result;
-            const ProfileClock::time_point service_start =
-              ProfileClock::now();
-            Step1PgenReadProfile* local_profile = params.profile_step1 ?
-              &result.profile : nullptr;
-            const ProcessIoCounters io_before = local_profile ?
-              read_process_io_counters() : ProcessIoCounters();
-            if(pgen_packed_hardcalls) {
-              readChunkFromPGENFileToPackedHardcalls(
-                next_bs, next_snpcount, snpinfo, &params, Gblock.pgr,
-                pgen_prefetch_buffer.packed_hardcalls,
-                pgen_prefetch_buffer.packed_stride_bytes, local_profile);
-            } else {
-              pgen_prefetch_buffer.genotypes.resize(
-                next_bs, params.n_samples);
-              if(params.alpha_prior != -1)
-                pgen_prefetch_buffer.allele_frequencies.resize(next_bs, 1);
-              readChunkFromPGENFileToG(next_bs, next_snpcount, snpinfo,
-                &params, pgen_prefetch_buffer.genotypes,
-                pgen_prefetch_buffer.allele_frequencies, Gblock.pgr,
-                &in_filters, &Gblock.step1_pgen_worker_tiles,
-                local_profile);
-            }
-            if(local_profile)
-              accumulate_process_io_delta(io_before,
-                read_process_io_counters(), local_profile);
-            result.service_ms = elapsed_ms(service_start);
-            return result;
-          });
-        pgen_prefetch_pending = true;
+        launch_step1_pgen_prefetch(
+          level0_pipeline, next_bs, next_snpcount, pgen_packed_hardcalls,
+          snpinfo, params, Gblock.pgr, in_filters,
+          Gblock.step1_pgen_worker_tiles);
       }
 
       // residualize and scale genotypes
@@ -1755,39 +1934,12 @@ void Data::level_0_calculations() {
       if(params.profile_step1)
         accumulate_step1_cv_profile(step1_profile, cv_profile_before);
 
-      if(level0_pipeline_enabled && pgen_prefetch_pending) {
-        pgen_prefetch_pending = false;
-        level0_pipeline_pending = true;
-        level0_pipeline_future = std::async(std::launch::async,
-          [this, next_bs, &pgen_prefetch_buffer,
-           &pgen_prefetch_future, &level0_pipeline_backend]() {
-            Step1Level0PipelineResult result;
-            const ProfileClock::time_point service_start =
-              ProfileClock::now();
-            const ProfileClock::time_point prefetch_wait_start =
-              ProfileClock::now();
-            result.prefetch = pgen_prefetch_future.get();
-            result.prefetch_wait_ms = elapsed_ms(prefetch_wait_start);
-
-            const ProfileClock::time_point preprocess_start =
-              ProfileClock::now();
-            const ProfileClock::time_point data_setup_start =
-              ProfileClock::now();
-            result.data_setup_ms = elapsed_ms(data_setup_start);
-            result.processed =
-              level0_pipeline_backend->preprocess_packed_hardcalls(
-                pgen_prefetch_buffer.packed_hardcalls.data(),
-                pgen_prefetch_buffer.packed_hardcalls.size(),
-                pgen_prefetch_buffer.packed_stride_bytes,
-                next_bs, params.n_samples, pheno_data.new_cov,
-                step1_sample_weights, params.n_analyzed - params.ncov,
-                params.numtol, result.row_scales,
-                params.profile_step1 ? &result.preprocess : nullptr);
-            result.preprocess_wall_ms = elapsed_ms(preprocess_start);
-            result.service_ms = elapsed_ms(service_start);
-            return result;
-          });
-      }
+      if(level0_pipeline_enabled &&
+         level0_pipeline.has_prefetched_block())
+        level0_pipeline.launch_pipelined_preprocess(
+          next_bs, params.n_samples, pheno_data.new_cov,
+          step1_sample_weights, params.n_analyzed - params.ncov,
+          params.numtol, params.profile_step1);
 
       // test association for block
       if(params.test_l0) {
@@ -1816,9 +1968,8 @@ void Data::level_0_calculations() {
     }
   }
 
-  step1_compute_backend->release_packed_hardcall_buffers();
-  if(level0_pipeline_backend)
-    level0_pipeline_backend->release_packed_hardcall_buffers();
+  level0_pipeline.release_packed_hardcall_buffers(
+    *step1_compute_backend);
   finish_l0_write(&l1_ests);
 
   // close streams
