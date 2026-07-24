@@ -7,16 +7,20 @@ Status: passed.
 ## Scope
 
 This gate covers the Stage 1 maintainability cleanup through revision
-`99f1152dcd24087747a86a900e3d5210d37697c1`. Stage 2 was deliberately left
-unchanged.
+`29ba9641cefc2c0b2d4562e6c6771562b82b7745`. Stage 2 was deliberately left
+unchanged. The final source revision is
+`46fc29d000b7d3c0d04e13d1c89a972e224e90a7`; the tip adds its regression
+test.
 
 The final tree:
 
 - makes CUDA Level 0 static-input cache identity and lifetime explicit;
 - isolates fork-added Level 0 asynchronous pipeline and profiling state;
 - encapsulates fork-added logistic and Cox Level 1 profiling;
-- makes the fork-added Level 1 design-cache lifetime exception-safe; and
-- isolates the fork-added resident logistic iteration.
+- makes the fork-added Level 1 design-cache lifetime exception-safe;
+- isolates the fork-added resident logistic iteration; and
+- makes fork-added Level 0 asynchronous cleanup safe during exception
+  unwinding.
 
 The pre-carbocation constraint was applied during the cleanup. An extraction
 of upstream-origin Level 0 setup/finalization code was reverted, and the
@@ -35,6 +39,13 @@ also passed the complete A100 `scripts/test_step1_cuda.sh` gate:
 - quantitative, count, binary, and survival end-to-end cases passed; and
 - compute-sanitizer reported `ERROR SUMMARY: 0 errors`.
 
+The A100 gate now also contains a deterministic packed-PGEN Level 0
+unwinding regression. It forces a low-memory write failure after block 2 has
+been installed by the two-backend CUDA pipeline and the next asynchronous
+preprocessing operation has been launched. The process exited normally with
+the expected error, and the repeated compute-sanitizer run reported zero
+errors.
+
 ## Production-scale performance
 
 The final benchmark used the same recent production-sized fixture and retained
@@ -45,18 +56,23 @@ controls as the ownership-refactor gate:
 - `--bsize 1000`, 12 threads, and SSD-backed Level 0 intermediates; and
 - the same PGEN, covariates, phenotypes, options, and seeds.
 
-The candidate was a clean CMake `Release` build with oneMKL and CUDA
-architecture 80. Its binary SHA-256 was
-`a54e4e4b48c209df87c16c24c7a399be69511970f9a5bcba044345f9185f7bea`.
+The final quantitative candidate was a clean CMake `Release` build with
+oneMKL and CUDA architecture 80 at source revision `46fc29d`. Its binary
+SHA-256 was
+`a2c6c135195616c3cfa2aca0ab8b54b118835feaaba2046da40c8bd7cd20da0b`.
 The matched control is revision `340677f3`, whose cross-model gate is recorded
 in
 [`2026-07-24-step1-cuda-refactor-gate.md`](2026-07-24-step1-cuda-refactor-gate.md).
+Binary and survival figures below remain the immediately preceding
+`99f1152` measurements: the final source change adds an exception-unwinding
+teardown fallback without changing the successful compute path, while the
+updated complete A100 gate revalidated their successful paths.
 
 ### End-to-end timing
 
 | Model | Control internal | Final internal | Change | Control process wall | Final process wall | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Quantitative | 298.234 s | 295.436 s | -0.938% | 300.51 s | 297.60 s | -0.968% |
+| Quantitative | 298.234 s | 296.667 s | -0.526% | 300.51 s | 298.83 s | -0.559% |
 | Binary logistic | 546.969 s | 547.634 s | +0.121% | 549.55 s | 550.19 s | +0.116% |
 | Survival Cox | 489.463 s | 490.308 s | +0.173% | 491.72 s | 492.55 s | +0.169% |
 
@@ -64,9 +80,9 @@ in
 
 | Model and stage | Control | Final | Change |
 | --- | ---: | ---: | ---: |
-| Quantitative Level 0 | 159.092 s | 157.028 s | -1.298% |
-| Quantitative Level 1 | 126.178 s | 125.181 s | -0.790% |
-| Quantitative output | 9.863 s | 9.829 s | -0.344% |
+| Quantitative Level 0 | 159.092 s | 158.013 s | -0.678% |
+| Quantitative Level 1 | 126.178 s | 125.553 s | -0.495% |
+| Quantitative output | 9.863 s | 9.751 s | -1.132% |
 | Binary Level 0 | 233.453 s | 233.373 s | -0.034% |
 | Binary Level 1 logistic | 292.172 s | 293.242 s | +0.366% |
 | Binary output | 15.634 s | 15.155 s | -3.064% |
@@ -78,7 +94,7 @@ The backend counters stayed flat:
 
 | Model | Control backend work | Final backend work | Change |
 | --- | ---: | ---: | ---: |
-| Quantitative Level 1 | 29.183 s | 29.214 s | +0.109% |
+| Quantitative Level 1 | 29.183 s | 29.080 s | -0.352% |
 | Binary logistic Level 1 | 260.922 s | 260.921 s | -0.000% |
 | Survival Cox Level 1 | 176.556 s | 176.762 s | +0.116% |
 
@@ -109,6 +125,7 @@ Their SHA-256 values are unchanged from
 
 Complete final telemetry and raw logs are retained on the A100 at:
 
+- `/home/james/build/regenie-final-unwind-release-46fc29d-qt`;
 - `/home/james/build/regenie-final-refactor-release-99f1152-qt/step1-n500k-m700k-p8-qt-final-release-20260724T080644Z`;
 - `/home/james/build/regenie-final-refactor-release-99f1152-binary/step1-n500k-m700k-p8-binary-final-release-20260724T081201Z`; and
 - `/home/james/build/regenie-final-refactor-release-99f1152-survival/step1-n500k-m700k-p8-survival-final-release-20260724T082133Z`.
@@ -116,6 +133,7 @@ Complete final telemetry and raw logs are retained on the A100 at:
 ## Conclusion
 
 The Stage 1 maintainability refactor passes the final correctness and
-performance gate. The largest end-to-end increase was 0.173%, affected backend
-work changed by at most 0.116%, all cache/call counters were preserved, and all
-24 production outputs remained byte-identical.
+performance gate. The final quantitative rerun was 0.526% faster than its
+control and all eight outputs were byte-identical. Across the three production
+models, the largest end-to-end increase was 0.173%, all cache/call counters
+were preserved, and all 24 production outputs remained byte-identical.
