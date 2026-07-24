@@ -267,6 +267,117 @@ struct Step1Level0PipelineResult {
   bool processed = false;
 };
 
+struct Step1NextBlock {
+  bool available = false;
+  int chromosome_variant_count = 0;
+  int block_index = 0;
+};
+
+Step1NextBlock find_next_step1_block(
+  const std::vector<int>& chromosomes,
+  const std::map<int, std::vector<int>>& chromosome_map,
+  size_t chromosome_index,
+  int block_index,
+  int chromosome_variant_count,
+  int chromosome_block_count) {
+
+  Step1NextBlock next;
+  if(block_index + 1 < chromosome_block_count) {
+    next.available = true;
+    next.chromosome_variant_count = chromosome_variant_count;
+    next.block_index = block_index + 1;
+    return next;
+  }
+
+  for(size_t next_index = chromosome_index + 1;
+      next_index < chromosomes.size(); ++next_index) {
+    const std::map<int, std::vector<int>>::const_iterator entry =
+      chromosome_map.find(chromosomes[next_index]);
+    if(entry == chromosome_map.end() || entry->second[1] == 0) continue;
+    next.available = true;
+    next.chromosome_variant_count = entry->second[0];
+    return next;
+  }
+  return next;
+}
+
+struct Step1RidgeProfileSnapshot {
+  ProfileClock::time_point wall_start;
+  double eigensolve_ms = 0;
+  double upload_ms = 0;
+  double download_ms = 0;
+  double backend_ridge_ms = 0;
+  uint64_t pinned_download_count = 0;
+  uint64_t pinned_download_bytes = 0;
+  uint64_t cholesky_folds = 0;
+  uint64_t batched_cholesky_blocks = 0;
+  uint64_t eigendecomposition_folds = 0;
+};
+
+Step1RidgeProfileSnapshot snapshot_step1_ridge_profile(
+  const ridgel0& ridge) {
+
+  Step1RidgeProfileSnapshot snapshot;
+  snapshot.wall_start = ProfileClock::now();
+  snapshot.eigensolve_ms = ridge.profile_eigensolve_ms;
+  snapshot.upload_ms = ridge.profile_backend_upload_ms;
+  snapshot.download_ms = ridge.profile_backend_download_ms;
+  snapshot.backend_ridge_ms = ridge.profile_backend_ridge_compute_ms;
+  snapshot.pinned_download_count = ridge.profile_pinned_download_count;
+  snapshot.pinned_download_bytes = ridge.profile_pinned_download_bytes;
+  snapshot.cholesky_folds = ridge.profile_cholesky_ridge_folds;
+  snapshot.batched_cholesky_blocks =
+    ridge.profile_batched_cholesky_ridge_blocks;
+  snapshot.eigendecomposition_folds =
+    ridge.profile_eigendecomposition_ridge_folds;
+  return snapshot;
+}
+
+void accumulate_step1_ridge_profile(
+  Step1Profile& profile,
+  const ridgel0& ridge,
+  const Step1RidgeProfileSnapshot& before,
+  const ProfileClock::time_point& block_start,
+  int block_variant_count) {
+
+  const double ridge_total_ms = elapsed_ms(before.wall_start);
+  const double eigensolve_ms =
+    ridge.profile_eigensolve_ms - before.eigensolve_ms;
+  const double upload_ms = ridge.profile_backend_upload_ms - before.upload_ms;
+  const double download_ms =
+    ridge.profile_backend_download_ms - before.download_ms;
+  const double backend_ridge_ms =
+    ridge.profile_backend_ridge_compute_ms - before.backend_ridge_ms;
+  profile.eigensolve_ms += eigensolve_ms;
+  profile.backend_upload_ms += upload_ms;
+  profile.backend_download_ms += download_ms;
+  profile.backend_ridge_compute_ms += backend_ridge_ms;
+  profile.ridge_ms += std::max(0.0,
+    ridge_total_ms - eigensolve_ms - upload_ms - download_ms);
+  profile.ridge_wall_ms += ridge_total_ms;
+  profile.ridge_eigensolve_ms += eigensolve_ms;
+  profile.ridge_transfer_ms += upload_ms + download_ms;
+  profile.ridge_backend_compute_ms += backend_ridge_ms;
+  profile.ridge_pinned_download_count +=
+    ridge.profile_pinned_download_count - before.pinned_download_count;
+  profile.ridge_pinned_download_bytes +=
+    ridge.profile_pinned_download_bytes - before.pinned_download_bytes;
+  profile.ridge_cholesky_folds +=
+    ridge.profile_cholesky_ridge_folds - before.cholesky_folds;
+  profile.ridge_batched_cholesky_blocks +=
+    ridge.profile_batched_cholesky_ridge_blocks -
+      before.batched_cholesky_blocks;
+  profile.ridge_eigendecomposition_folds +=
+    ridge.profile_eigendecomposition_ridge_folds -
+      before.eigendecomposition_folds;
+  profile.ridge_host_orchestration_ms += std::max(0.0,
+    ridge_total_ms - eigensolve_ms - upload_ms - download_ms -
+      backend_ridge_ms);
+  profile.total_ms += elapsed_ms(block_start);
+  profile.blocks++;
+  profile.variants += block_variant_count;
+}
+
 void build_step1_prediction_groups(
   const std::vector<int>& chromosomes,
   const std::map<int, std::vector<int>>& chromosome_map,
@@ -1530,26 +1641,14 @@ void Data::level_0_calculations() {
             io_before, read_process_io_counters(), pgen_profile);
       }
 
+      const Step1NextBlock next_block = find_next_step1_block(
+        files.chr_read, chr_map, itr, bb, chrom_nsnps, chrom_nb);
       int next_bs = 0;
-      bool has_next_block = false;
-      if(bb + 1 < chrom_nb) {
-        get_block_size(params.block_size, chrom_nsnps, bb + 1, next_bs);
-        has_next_block = true;
-      } else {
-        for(size_t next_itr = itr + 1;
-            next_itr < files.chr_read.size(); ++next_itr) {
-          const int next_chromosome = files.chr_read[next_itr];
-          const std::map<int, std::vector<int>>::const_iterator next_entry =
-            chr_map.find(next_chromosome);
-          if(next_entry == chr_map.end() || next_entry->second[1] == 0)
-            continue;
-          get_block_size(params.block_size, next_entry->second[0], 0,
-            next_bs);
-          has_next_block = true;
-          break;
-        }
-      }
-      if(pgen_prefetch_enabled && has_next_block) {
+      if(next_block.available)
+        get_block_size(params.block_size,
+          next_block.chromosome_variant_count, next_block.block_index,
+          next_bs);
+      if(pgen_prefetch_enabled && next_block.available) {
         const uint32_t next_snpcount = in_filters.step1_snp_count + bs;
         pgen_prefetch_future = std::async(std::launch::async,
           [this, next_bs, next_snpcount, pgen_packed_hardcalls,
@@ -1671,62 +1770,16 @@ void Data::level_0_calculations() {
       }
 
       // calc level 0 ridge regressions
-      if(params.profile_step1) stage_start = ProfileClock::now();
-      const double eigensolve_before_ms = params.profile_step1 ? l0.profile_eigensolve_ms : 0;
-      const double upload_before_ms = params.profile_step1 ? l0.profile_backend_upload_ms : 0;
-      const double download_before_ms = params.profile_step1 ? l0.profile_backend_download_ms : 0;
-      const double backend_ridge_before_ms = params.profile_step1 ?
-        l0.profile_backend_ridge_compute_ms : 0;
-      const uint64_t pinned_download_count_before = params.profile_step1 ?
-        l0.profile_pinned_download_count : 0;
-      const uint64_t pinned_download_bytes_before = params.profile_step1 ?
-        l0.profile_pinned_download_bytes : 0;
-      const uint64_t cholesky_folds_before = params.profile_step1 ?
-        l0.profile_cholesky_ridge_folds : 0;
-      const uint64_t batched_cholesky_blocks_before = params.profile_step1 ?
-        l0.profile_batched_cholesky_ridge_blocks : 0;
-      const uint64_t eigendecomposition_folds_before = params.profile_step1 ?
-        l0.profile_eigendecomposition_ridge_folds : 0;
+      Step1RidgeProfileSnapshot ridge_profile_before;
+      if(params.profile_step1)
+        ridge_profile_before = snapshot_step1_ridge_profile(l0);
       if(params.use_loocv)
         ridge_level_0_loocv(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, step1_compute_backend.get(), sout);
       else
         ridge_level_0(block, &files, &params, &in_filters, &m_ests, &Gblock, &pheno_data, snpinfo, &l0, &l1_ests, masked_in_folds, step1_compute_backend.get(), cache_level1_design, sout);
-      if(params.profile_step1) {
-        const double ridge_total_ms = elapsed_ms(stage_start);
-        const double eigensolve_ms = l0.profile_eigensolve_ms - eigensolve_before_ms;
-        const double upload_ms = l0.profile_backend_upload_ms - upload_before_ms;
-        const double download_ms = l0.profile_backend_download_ms - download_before_ms;
-        const double backend_ridge_ms =
-          l0.profile_backend_ridge_compute_ms - backend_ridge_before_ms;
-        step1_profile.eigensolve_ms += eigensolve_ms;
-        step1_profile.backend_upload_ms += upload_ms;
-        step1_profile.backend_download_ms += download_ms;
-        step1_profile.backend_ridge_compute_ms += backend_ridge_ms;
-        step1_profile.ridge_ms += std::max(0.0,
-          ridge_total_ms - eigensolve_ms - upload_ms - download_ms);
-        step1_profile.ridge_wall_ms += ridge_total_ms;
-        step1_profile.ridge_eigensolve_ms += eigensolve_ms;
-        step1_profile.ridge_transfer_ms += upload_ms + download_ms;
-        step1_profile.ridge_backend_compute_ms += backend_ridge_ms;
-        step1_profile.ridge_pinned_download_count +=
-          l0.profile_pinned_download_count - pinned_download_count_before;
-        step1_profile.ridge_pinned_download_bytes +=
-          l0.profile_pinned_download_bytes - pinned_download_bytes_before;
-        step1_profile.ridge_cholesky_folds +=
-          l0.profile_cholesky_ridge_folds - cholesky_folds_before;
-        step1_profile.ridge_batched_cholesky_blocks +=
-          l0.profile_batched_cholesky_ridge_blocks -
-            batched_cholesky_blocks_before;
-        step1_profile.ridge_eigendecomposition_folds +=
-          l0.profile_eigendecomposition_ridge_folds -
-            eigendecomposition_folds_before;
-        step1_profile.ridge_host_orchestration_ms += std::max(0.0,
-          ridge_total_ms - eigensolve_ms - upload_ms - download_ms -
-            backend_ridge_ms);
-        step1_profile.total_ms += elapsed_ms(block_start);
-        step1_profile.blocks++;
-        step1_profile.variants += bs;
-      }
+      if(params.profile_step1)
+        accumulate_step1_ridge_profile(
+          step1_profile, l0, ridge_profile_before, block_start, bs);
 
       if(params.print_block_betas && params.use_loocv) // keep on raw scale
         l1_ests.beta_snp_step1.middleRows(in_filters.step1_snp_count, bs).array().colwise() /= scale_G.array() / pheno_data.scale_Y(0);
