@@ -204,6 +204,45 @@ class Level1L0ReadPipeline {
   std::future<double> pending_read_;
 };
 
+class Level1DesignCacheScope {
+ public:
+  explicit Level1DesignCacheScope(Step1ComputeBackend* compute_backend)
+    : compute_backend_(compute_backend) {}
+
+  ~Level1DesignCacheScope() noexcept {
+    if(!active_) return;
+    try {
+      compute_backend_->release_cached_design();
+    } catch(...) {
+    }
+  }
+
+  Level1DesignCacheScope(const Level1DesignCacheScope&) = delete;
+  Level1DesignCacheScope& operator=(const Level1DesignCacheScope&) = delete;
+
+  bool cache_matrix(
+    const Eigen::Ref<const Eigen::MatrixXd>& design,
+    Step1ComputeTimings* timings) {
+
+    if(active_)
+      throw std::logic_error("Step 1 Level 1 design cache is already active");
+    active_ = compute_backend_->cache_design_matrix(design, timings);
+    return active_;
+  }
+
+  void release() {
+    if(!active_) return;
+    // Disarm before the explicit release so its exception behavior matches a
+    // direct backend call; the destructor is fallback for other exits only.
+    active_ = false;
+    compute_backend_->release_cached_design();
+  }
+
+ private:
+  Step1ComputeBackend* compute_backend_;
+  bool active_ = false;
+};
+
 template<typename Derived>
 ArrayXd compute_step1_design_score(
   Step1ComputeBackend* compute_backend,
@@ -3944,10 +3983,11 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
           active_traits[trait_position + 1].l0_index : -1,
         trait_position, profile.read_l0_ms, profile.read_l0_wait_ms);
 
+    Level1DesignCacheScope design_cache(compute_backend);
     bool resident_design = false;
     if(!params->select_l0) {
       const auto cache_start = std::chrono::high_resolution_clock::now();
-      resident_design = compute_backend->cache_design_matrix(
+      resident_design = design_cache.cache_matrix(
         l1->test_mat_conc[ph_eff], profile_timings);
       profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - cache_start).count();
@@ -3985,7 +4025,7 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
 
     if(!resident_design) {
       const auto cache_start = std::chrono::high_resolution_clock::now();
-      resident_design = compute_backend->cache_design_matrix(
+      resident_design = design_cache.cache_matrix(
         l1->test_mat_conc[ph_eff], profile_timings);
       profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - cache_start).count();
@@ -4049,7 +4089,7 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
         profile.prediction_cache_write_ms, profile.prediction_cache_bytes);
       profile.prediction_cache_phenotypes++;
     }
-    if(resident_design) compute_backend->release_cached_design();
+    if(resident_design) design_cache.release();
     sout << "done";
     auto ts2 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(ts2 - ts1);
