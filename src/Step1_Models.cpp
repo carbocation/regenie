@@ -702,6 +702,193 @@ struct CoxLevel1Profile {
   }
 };
 
+struct ResidentLogisticLevel1Problem {
+  const struct param& params;
+  const struct ridgel1& l1;
+  const std::vector<MatrixXb>& fold_masks;
+  const std::vector<Eigen::Index>& fold_offsets;
+  int phenotype;
+  Step1ComputeBackend& compute_backend;
+  Step1ComputeTimings* profile_timings;
+};
+
+struct ResidentLogisticLevel1Workspace {
+  VectorXd& predictions;
+  VectorXd& weights;
+  MatrixXd& working_outcome;
+  MatrixXd& score_outcome;
+  ArrayXd& linear_predictor;
+  ArrayXd& probabilities;
+  ArrayXd& variances;
+  ArrayXd& working_response;
+  MatrixXd& gram;
+  MatrixXd& right_hand_side;
+  MatrixXd& solver_coefficients;
+  VectorXd& current_penalty;
+  ArrayXd& coefficients;
+  ArrayXd& score;
+};
+
+struct ResidentLogisticLevel1IterationResult {
+  int line_search_iterations = 0;
+  uint64_t prediction_calls = 0;
+  uint64_t weighted_product_calls = 0;
+  uint64_t solve_calls = 0;
+  uint64_t score_calls = 0;
+  bool invalid_variance = false;
+};
+
+ResidentLogisticLevel1IterationResult
+run_resident_logistic_level1_iteration(
+  const ResidentLogisticLevel1Problem& problem,
+  ResidentLogisticLevel1Workspace& workspace,
+  int held_out_fold, int ridge_parameter,
+  const ArrayXd& previous_coefficients) {
+
+  ResidentLogisticLevel1IterationResult result;
+  const auto predict = [&] (const ArrayXd& coefficients) {
+    const VectorXd coefficient_vector = coefficients.matrix();
+    problem.compute_backend.predict_cached_design(
+      coefficient_vector, workspace.predictions,
+      problem.profile_timings);
+    ++result.prediction_calls;
+  };
+
+  workspace.weights.setZero();
+  workspace.working_outcome.setZero();
+  predict(previous_coefficients);
+  for(int fold = 0; fold < problem.params.cv_folds; ++fold) {
+    if(fold == held_out_fold) continue;
+    const Eigen::Index start = problem.fold_offsets[fold];
+    const Eigen::Index count =
+      problem.fold_offsets[fold + 1] - start;
+    workspace.linear_predictor =
+      problem.l1.test_offset[problem.phenotype][fold].array() +
+        workspace.predictions.segment(start, count).array();
+    get_pvec(
+      workspace.probabilities, workspace.linear_predictor,
+      problem.params.numtol_eps);
+    if(get_wvec(
+         workspace.probabilities, workspace.variances,
+         problem.fold_masks[fold].col(problem.phenotype).array(),
+         problem.params.l1_ridge_eps)) {
+      result.invalid_variance = true;
+      return result;
+    }
+    workspace.working_response =
+      problem.fold_masks[fold].col(problem.phenotype).array().select(
+        (workspace.linear_predictor -
+          problem.l1.test_offset[problem.phenotype][fold].array()) +
+          (problem.l1.test_pheno_raw[problem.phenotype][fold].array() -
+            workspace.probabilities) / workspace.variances,
+        0);
+    workspace.weights.segment(start, count) =
+      problem.fold_masks[fold].col(problem.phenotype).array().select(
+        workspace.variances, 0).matrix();
+    workspace.working_outcome.col(0).segment(start, count) =
+      workspace.working_response.matrix();
+  }
+
+  workspace.current_penalty(0) =
+    problem.params.tau[problem.phenotype](ridge_parameter);
+  if(!problem.compute_backend.solve_cached_weighted_design(
+       workspace.weights, workspace.working_outcome,
+       workspace.current_penalty,
+       problem.l1.ridge_param_mult.matrix(),
+       workspace.solver_coefficients, problem.profile_timings)) {
+    problem.compute_backend.compute_cached_weighted_design_products(
+      workspace.weights, workspace.working_outcome, workspace.gram,
+      workspace.right_hand_side, problem.profile_timings);
+    problem.compute_backend.diagonal_penalty_solve(
+      workspace.gram, workspace.right_hand_side,
+      workspace.current_penalty,
+      problem.l1.ridge_param_mult.matrix(),
+      workspace.solver_coefficients, problem.profile_timings);
+  }
+  ++result.weighted_product_calls;
+  ++result.solve_calls;
+  workspace.coefficients =
+    workspace.solver_coefficients.col(0).array();
+
+  bool invalid_variance = false;
+  bool score_outcome_ready = false;
+  for(int search = 1;
+      search <= problem.params.niter_max_line_search_ridge; ++search) {
+    result.line_search_iterations = search;
+    predict(workspace.coefficients);
+    workspace.score_outcome.setZero();
+    invalid_variance = false;
+    for(int fold = 0; fold < problem.params.cv_folds; ++fold) {
+      if(fold == held_out_fold) continue;
+      const Eigen::Index start = problem.fold_offsets[fold];
+      const Eigen::Index count =
+        problem.fold_offsets[fold + 1] - start;
+      workspace.linear_predictor =
+        problem.l1.test_offset[problem.phenotype][fold].array() +
+          workspace.predictions.segment(start, count).array();
+      get_pvec(
+        workspace.probabilities, workspace.linear_predictor,
+        problem.params.numtol_eps);
+      invalid_variance = get_wvec(
+        workspace.probabilities, workspace.variances,
+        problem.fold_masks[fold].col(problem.phenotype).array(),
+        problem.params.l1_ridge_eps);
+      if(invalid_variance) break;
+      workspace.score_outcome.col(0).segment(start, count) =
+        problem.fold_masks[fold].col(problem.phenotype).array().select(
+          problem.l1.test_pheno_raw[problem.phenotype][fold].array() -
+            workspace.probabilities,
+          0).matrix();
+    }
+    if(!invalid_variance) {
+      score_outcome_ready = true;
+      break;
+    }
+    workspace.coefficients =
+      (previous_coefficients + workspace.coefficients) / 2;
+  }
+
+  // The legacy loop halves once more on its final failed search, then
+  // recomputes the score at that new coefficient vector.
+  if(!score_outcome_ready) {
+    predict(workspace.coefficients);
+    workspace.score_outcome.setZero();
+    for(int fold = 0; fold < problem.params.cv_folds; ++fold) {
+      if(fold == held_out_fold) continue;
+      const Eigen::Index start = problem.fold_offsets[fold];
+      const Eigen::Index count =
+        problem.fold_offsets[fold + 1] - start;
+      workspace.linear_predictor =
+        problem.l1.test_offset[problem.phenotype][fold].array() +
+          workspace.predictions.segment(start, count).array();
+      get_pvec(
+        workspace.probabilities, workspace.linear_predictor,
+        problem.params.numtol_eps);
+      if(get_wvec(
+           workspace.probabilities, workspace.variances,
+           problem.fold_masks[fold].col(problem.phenotype).array(),
+           problem.params.l1_ridge_eps)) {
+        result.invalid_variance = true;
+        return result;
+      }
+      workspace.score_outcome.col(0).segment(start, count) =
+        problem.fold_masks[fold].col(problem.phenotype).array().select(
+          problem.l1.test_pheno_raw[problem.phenotype][fold].array() -
+            workspace.probabilities,
+          0).matrix();
+    }
+  }
+
+  MatrixXd cached_score;
+  problem.compute_backend.compute_cached_design_crossproduct(
+    workspace.score_outcome, cached_score, problem.profile_timings);
+  ++result.score_calls;
+  workspace.score = cached_score.col(0).array() -
+    problem.params.tau[problem.phenotype](ridge_parameter) *
+      problem.l1.ridge_param_mult * workspace.coefficients;
+  return result;
+}
+
 struct Level1PathNewtonResult {
   ArrayXd accepted_coefficients;
   ArrayXd score;
@@ -2328,6 +2515,13 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         coefficient_vector, cached_predictions, profile_timings);
       profile.prediction_calls++;
     };
+    const ResidentLogisticLevel1Problem resident_problem{
+      *params, *l1, masked_in_folds, fold_offsets, ph,
+      *compute_backend, profile_timings};
+    ResidentLogisticLevel1Workspace resident_workspace{
+      cached_predictions, cached_weights, cached_working_outcome,
+      cached_score_outcome, etavec, pivec, wvec, zvec, XtWX, XtWZ,
+      solver_coefficients, current_tau, betanew, score};
 
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( l1->pheno_l1_not_converged(ph) ) break;
@@ -2423,117 +2617,23 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
           } else if(resident_design) {
 
-            cached_weights.setZero();
-            cached_working_outcome.setZero();
-            predict_resident(betaold);
-            for(int k = 0; k < params->cv_folds; ++k ) {
-              if(k == i) continue;
-              const Eigen::Index start = fold_offsets[k];
-              const Eigen::Index count = fold_offsets[k + 1] - start;
-              etavec = l1->test_offset[ph][k].array() +
-                cached_predictions.segment(start, count).array();
-              get_pvec(pivec, etavec, params->numtol_eps);
-              if(get_wvec(pivec, wvec,
-                   masked_in_folds[k].col(ph).array(),
-                   params->l1_ridge_eps)) {
-                sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
-                l1->pheno_l1_not_converged(ph) = true;
-                break;
-              }
-              zvec = masked_in_folds[k].col(ph).array().select(
-                (etavec - l1->test_offset[ph][k].array()) +
-                  (l1->test_pheno_raw[ph][k].array() - pivec) / wvec,
-                0);
-              cached_weights.segment(start, count) =
-                masked_in_folds[k].col(ph).array().select(wvec, 0).matrix();
-              cached_working_outcome.col(0).segment(start, count) =
-                zvec.matrix();
-            }
-            if(l1->pheno_l1_not_converged(ph)) break;
-
-            current_tau(0) = params->tau[ph](j);
-            if(!compute_backend->solve_cached_weighted_design(
-                 cached_weights, cached_working_outcome, current_tau,
-                 l1->ridge_param_mult.matrix(), solver_coefficients,
-                 profile_timings)) {
-              compute_backend->compute_cached_weighted_design_products(
-                cached_weights, cached_working_outcome, XtWX, XtWZ,
-                profile_timings);
-              compute_backend->diagonal_penalty_solve(
-                XtWX, XtWZ, current_tau, l1->ridge_param_mult.matrix(),
-                solver_coefficients, profile_timings);
-            }
-            profile.weighted_product_calls++;
-            profile.solve_calls++;
-            betanew = solver_coefficients.col(0).array();
-
-            bool invalid_wvec = false;
-            bool score_outcome_ready = false;
-            for(int niter_search = 1;
-                niter_search <= params->niter_max_line_search_ridge;
-                ++niter_search) {
-              current_line_search_iterations = niter_search;
-              predict_resident(betanew);
-              cached_score_outcome.setZero();
-              invalid_wvec = false;
-              for(int k = 0; k < params->cv_folds; ++k ) {
-                if(k == i) continue;
-                const Eigen::Index start = fold_offsets[k];
-                const Eigen::Index count = fold_offsets[k + 1] - start;
-                etavec = l1->test_offset[ph][k].array() +
-                  cached_predictions.segment(start, count).array();
-                get_pvec(pivec, etavec, params->numtol_eps);
-                invalid_wvec = get_wvec(pivec, wvec,
-                  masked_in_folds[k].col(ph).array(),
-                  params->l1_ridge_eps);
-                if(invalid_wvec) break;
-                cached_score_outcome.col(0).segment(start, count) =
-                  masked_in_folds[k].col(ph).array().select(
-                    l1->test_pheno_raw[ph][k].array() - pivec,
-                    0).matrix();
-              }
-              if(!invalid_wvec) {
-                score_outcome_ready = true;
-                break;
-              }
-              betanew = (betaold + betanew) / 2;
-            }
+            const ResidentLogisticLevel1IterationResult result =
+              run_resident_logistic_level1_iteration(
+                resident_problem, resident_workspace, i, j, betaold);
+            current_line_search_iterations =
+              result.line_search_iterations;
+            profile.prediction_calls += result.prediction_calls;
+            profile.weighted_product_calls +=
+              result.weighted_product_calls;
+            profile.solve_calls += result.solve_calls;
+            profile.score_calls += result.score_calls;
             profile.line_search_iterations +=
-              current_line_search_iterations;
-
-            // The legacy loop halves once more on its final failed search,
-            // then recomputes the score at that new coefficient vector.
-            if(!score_outcome_ready) {
-              predict_resident(betanew);
-              cached_score_outcome.setZero();
-              for(int k = 0; k < params->cv_folds; ++k ) {
-                if(k == i) continue;
-                const Eigen::Index start = fold_offsets[k];
-                const Eigen::Index count = fold_offsets[k + 1] - start;
-                etavec = l1->test_offset[ph][k].array() +
-                  cached_predictions.segment(start, count).array();
-                get_pvec(pivec, etavec, params->numtol_eps);
-                if(get_wvec(pivec, wvec,
-                     masked_in_folds[k].col(ph).array(),
-                     params->l1_ridge_eps)) {
-                  sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
-                  l1->pheno_l1_not_converged(ph) = true;
-                  break;
-                }
-                cached_score_outcome.col(0).segment(start, count) =
-                  masked_in_folds[k].col(ph).array().select(
-                    l1->test_pheno_raw[ph][k].array() - pivec,
-                    0).matrix();
-              }
+              result.line_search_iterations;
+            if(result.invalid_variance) {
+              sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
+              l1->pheno_l1_not_converged(ph) = true;
+              break;
             }
-            if(l1->pheno_l1_not_converged(ph)) break;
-
-            MatrixXd cached_score;
-            compute_backend->compute_cached_design_crossproduct(
-              cached_score_outcome, cached_score, profile_timings);
-            profile.score_calls++;
-            score = cached_score.col(0).array() -
-              params->tau[ph](j) * l1->ridge_param_mult * betanew;
 
           } else {
 
