@@ -515,6 +515,69 @@ struct CudaLevel0CholeskyLane {
   size_t info_capacity = 0;
 };
 
+enum class CudaFoldSystemOrientation {
+  genotype,
+  design
+};
+
+struct CudaResidentFoldSystems {
+  Eigen::Index system_count = 0;
+  Eigen::Index rhs_count = 0;
+  std::vector<int> output_indices;
+  bool valid = false;
+  CudaFoldSystemOrientation orientation =
+    CudaFoldSystemOrientation::genotype;
+
+  void activate(Eigen::Index new_system_count, Eigen::Index new_rhs_count,
+    CudaFoldSystemOrientation new_orientation) {
+    system_count = new_system_count;
+    rhs_count = new_rhs_count;
+    orientation = new_orientation;
+    valid = true;
+  }
+
+  bool uses_design() const {
+    return orientation == CudaFoldSystemOrientation::design;
+  }
+
+  void invalidate() {
+    system_count = 0;
+    rhs_count = 0;
+    output_indices.clear();
+    valid = false;
+    orientation = CudaFoldSystemOrientation::genotype;
+  }
+};
+
+struct CudaPackedStaticInputs {
+  bool valid = false;
+  const double* covariates = nullptr;
+  const double* weights = nullptr;
+  Eigen::Index samples = 0;
+  Eigen::Index covariate_count = 0;
+
+  bool matches(const double* candidate_covariates,
+    const double* candidate_weights, Eigen::Index candidate_samples,
+    Eigen::Index candidate_covariate_count) const {
+    return valid && covariates == candidate_covariates &&
+      weights == candidate_weights && samples == candidate_samples &&
+      covariate_count == candidate_covariate_count;
+  }
+
+  void update(const double* new_covariates, const double* new_weights,
+    Eigen::Index new_samples, Eigen::Index new_covariate_count) {
+    covariates = new_covariates;
+    weights = new_weights;
+    samples = new_samples;
+    covariate_count = new_covariate_count;
+    valid = true;
+  }
+
+  void invalidate() {
+    valid = false;
+  }
+};
+
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
@@ -553,15 +616,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_design_uses_level1_cache_(false),
         level1_design_rows_(0), level1_design_columns_(0),
         level1_design_cached_columns_(0),
-        resident_fold_system_count_(0),
-        resident_fold_rhs_count_(0),
-        resident_fold_systems_valid_(false),
-        resident_fold_systems_design_orientation_(false),
-        packed_static_inputs_valid_(false),
-        packed_static_covariates_(nullptr),
-        packed_static_weights_(nullptr),
-        packed_static_samples_(0),
-        packed_static_covariate_count_(0),
         level0_phenotypes_host_(nullptr),
         level0_phenotype_rows_(0), level0_phenotype_columns_(0),
         phenotypes_capacity_(0), gram_capacity_(0),
@@ -702,11 +756,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ComputeClock::now();
       const ComputeClock::time_point validation_start =
         ComputeClock::now();
-      const bool static_inputs_cached = packed_static_inputs_valid_ &&
-        packed_static_covariates_ == covariates.data() &&
-        packed_static_weights_ == sample_weights.data() &&
-        packed_static_samples_ == samples &&
-        packed_static_covariate_count_ == covariates.cols();
+      const bool static_inputs_cached = packed_static_inputs_.matches(
+        covariates.data(), sample_weights.data(), samples, covariates.cols());
       if(static_inputs_cached) {
         if(variants < 0 || samples < 0 || covariates.rows() != samples ||
            sample_weights.size() != samples)
@@ -837,11 +888,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           check_cuda(cudaMemcpy(d_preprocess_covariates_, covariate_data,
             covariates.size() * sizeof(double), cudaMemcpyHostToDevice),
             "copy packed hardcall covariates to CUDA device");
-        packed_static_covariates_ = covariates.data();
-        packed_static_weights_ = sample_weights.data();
-        packed_static_samples_ = samples;
-        packed_static_covariate_count_ = covariates.cols();
-        packed_static_inputs_valid_ = true;
+        packed_static_inputs_.update(covariates.data(), sample_weights.data(),
+          samples, covariates.cols());
       }
       if(timings) {
         timings->upload_ms += elapsed_ms(transfer_start);
@@ -963,7 +1011,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings) override {
 
-      packed_static_inputs_valid_ = false;
+      packed_static_inputs_.invalidate();
       Step1ComputeBackend::preprocess_genotypes(genotypes, covariates,
         sample_weights, degrees_of_freedom, minimum_scale,
         row_multipliers, copy_to_host, row_scales, timings);
@@ -2114,16 +2162,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->gram_ms += elapsed_ms(phase_start);
         timings->resident_reuse_count += system_count;
       }
-      resident_fold_system_count_ = system_count_index;
-      resident_fold_rhs_count_ = phenotypes.cols();
       // Keep every RHS in cuBLAS/cuSOLVER so active outcomes retain the
       // validated arithmetic; only their device-to-host results are compacted.
       if(active_phenotype_indices.size() ==
            static_cast<size_t>(phenotypes.cols()))
         active_phenotype_indices.clear();
-      resident_fold_output_indices_.swap(active_phenotype_indices);
-      resident_fold_systems_valid_ = true;
-      resident_fold_systems_design_orientation_ = false;
+      resident_fold_systems_.output_indices.swap(active_phenotype_indices);
+      resident_fold_systems_.activate(
+        system_count_index, phenotypes.cols(),
+        CudaFoldSystemOrientation::genotype);
       return true;
     }
 
@@ -2327,10 +2374,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->gram_ms += elapsed_ms(phase_start);
         timings->resident_design_reuse_count += system_count;
       }
-      resident_fold_system_count_ = system_count_index;
-      resident_fold_rhs_count_ = outcomes.cols();
-      resident_fold_systems_valid_ = true;
-      resident_fold_systems_design_orientation_ = true;
+      resident_fold_systems_.activate(
+        system_count_index, outcomes.cols(),
+        CudaFoldSystemOrientation::design);
       return true;
     }
 
@@ -2805,13 +2851,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeTimings* timings) override {
 
       const bool cache_level1_design = level1_start_column >= 0;
-      if(!resident_fold_systems_valid_ ||
-         resident_fold_systems_design_orientation_ ||
-         resident_fold_rhs_count_ <= 0 ||
+      if(!resident_fold_systems_.valid ||
+         resident_fold_systems_.uses_design() ||
+         resident_fold_systems_.rhs_count <= 0 ||
          effective_sample_count != resident_columns_)
         return false;
       if(cache_level1_design &&
-         (resident_fold_rhs_count_ != 1 || !d_level1_design_ ||
+         (resident_fold_systems_.rhs_count != 1 || !d_level1_design_ ||
           level1_design_rows_ <= 0 ||
           level1_start_column != level1_design_cached_columns_ ||
           ridge_parameters.size() >
@@ -2837,14 +2883,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_columns_, "normalized Level 0 prediction row count");
       const int parameter_count = checked_int(ridge_parameters.size(),
         "normalized Level 0 prediction parameter count");
-      const int outcome_count = checked_int(resident_fold_rhs_count_,
+      const int outcome_count = checked_int(resident_fold_systems_.rhs_count,
         "normalized Level 0 prediction outcome count");
       const int output_outcome_count =
-        resident_fold_output_indices_.empty() ? outcome_count : checked_int(
-          resident_fold_output_indices_.size(),
-          "normalized Level 0 prediction output count");
+        resident_fold_systems_.output_indices.empty() ? outcome_count :
+          checked_int(resident_fold_systems_.output_indices.size(),
+            "normalized Level 0 prediction output count");
       const int columns = checked_int(
-        ridge_parameters.size() * resident_fold_rhs_count_,
+        ridge_parameters.size() * resident_fold_systems_.rhs_count,
         "normalized Level 0 prediction column count");
       const int output_columns = checked_int(
         static_cast<Eigen::Index>(parameter_count) * output_outcome_count,
@@ -2968,7 +3014,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       } else {
         cudaGetLastError();
       }
-      if(resident_fold_output_indices_.empty()) {
+      if(resident_fold_systems_.output_indices.empty()) {
         check_cuda(cudaMemcpy(normalized_predictions.data(),
           normalized_destination, normalized_bytes,
           cudaMemcpyDeviceToHost),
@@ -2977,7 +3023,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const size_t outcome_bytes = static_cast<size_t>(rows) *
           parameter_count * sizeof(double);
         for(int output = 0; output < output_outcome_count; ++output) {
-          const int source_outcome = resident_fold_output_indices_[output];
+          const int source_outcome = resident_fold_systems_.output_indices[output];
           check_cuda(cudaMemcpy(
             normalized_predictions.data() +
               static_cast<Eigen::Index>(output) * parameter_count * rows,
@@ -3006,15 +3052,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       bool copy_results_to_host,
       Step1ComputeTimings* timings) {
 
-      if(!resident_fold_systems_valid_) return false;
+      if(!resident_fold_systems_.valid) return false;
       const size_t system_count = static_cast<size_t>(
-        resident_fold_system_count_);
+        resident_fold_systems_.system_count);
       const bool design_orientation =
-        resident_fold_systems_design_orientation_;
+        resident_fold_systems_.uses_design();
       if((design_orientation ? !resident_design_valid_ : !resident_valid_) ||
          system_count < 2 ||
-         start_columns.size() != resident_fold_system_count_ ||
-         column_counts.size() != resident_fold_system_count_)
+         start_columns.size() != resident_fold_systems_.system_count ||
+         column_counts.size() != resident_fold_systems_.system_count)
         throw std::invalid_argument(
           "Step 1 cached fold ridge prediction received incompatible systems");
       if((ridge_parameters.array() < 0).any()) return false;
@@ -3032,7 +3078,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Index size_index = design_orientation ?
         resident_design_columns_ : resident_rows_;
       const Eigen::Index right_hand_side_count_index =
-        resident_fold_rhs_count_;
+        resident_fold_systems_.rhs_count;
       const int size = checked_int(
         size_index, "cached fold Cholesky ridge system size");
       const int right_hand_side_count = checked_int(
@@ -3042,8 +3088,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ridge_parameters.size(),
         "cached fold Cholesky ridge parameter count");
       const int output_right_hand_side_count =
-        resident_fold_output_indices_.empty() ? right_hand_side_count :
-          checked_int(resident_fold_output_indices_.size(),
+        resident_fold_systems_.output_indices.empty() ? right_hand_side_count :
+          checked_int(resident_fold_systems_.output_indices.size(),
             "cached fold Cholesky output count");
       const long long combination_count_long =
         static_cast<long long>(right_hand_side_count) * parameter_count;
@@ -3284,7 +3330,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         }
         for(size_t system = 0; system < system_count; ++system) {
           CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
-          if(resident_fold_output_indices_.empty()) {
+          if(resident_fold_systems_.output_indices.empty()) {
             check_cuda(cudaMemcpyAsync(coefficients[system].data(),
               lane.coefficients,
               coefficients[system].size() * sizeof(double),
@@ -3304,7 +3350,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             for(int output = 0;
                 output < output_right_hand_side_count; ++output) {
               const int source_outcome =
-                resident_fold_output_indices_[output];
+                resident_fold_systems_.output_indices[output];
               const Eigen::Index source_column =
                 parameter * right_hand_side_count + source_outcome;
               const Eigen::Index destination_column =
@@ -5712,11 +5758,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
     void invalidate_resident_fold_systems() {
-      resident_fold_system_count_ = 0;
-      resident_fold_rhs_count_ = 0;
-      resident_fold_output_indices_.clear();
-      resident_fold_systems_valid_ = false;
-      resident_fold_systems_design_orientation_ = false;
+      resident_fold_systems_.invalidate();
     }
 
     void release_packed_hardcall_buffers_noexcept() {
@@ -5732,7 +5774,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       resident_design_valid_ = false;
       cached_weighted_gram_valid_ = false;
       resident_design_uses_level1_cache_ = false;
-      if(resident_fold_systems_design_orientation_)
+      if(resident_fold_systems_.uses_design())
         invalidate_resident_fold_systems();
     }
 
@@ -5961,16 +6003,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     Eigen::Index level1_design_rows_;
     Eigen::Index level1_design_columns_;
     Eigen::Index level1_design_cached_columns_;
-    Eigen::Index resident_fold_system_count_;
-    Eigen::Index resident_fold_rhs_count_;
-    std::vector<int> resident_fold_output_indices_;
-    bool resident_fold_systems_valid_;
-    bool resident_fold_systems_design_orientation_;
-    bool packed_static_inputs_valid_;
-    const double* packed_static_covariates_;
-    const double* packed_static_weights_;
-    Eigen::Index packed_static_samples_;
-    Eigen::Index packed_static_covariate_count_;
+    CudaResidentFoldSystems resident_fold_systems_;
+    CudaPackedStaticInputs packed_static_inputs_;
     const double* level0_phenotypes_host_;
     Eigen::Index level0_phenotype_rows_;
     Eigen::Index level0_phenotype_columns_;
