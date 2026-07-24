@@ -31,7 +31,7 @@
 #include <limits>
 #include <stdexcept>
 
-#ifdef WITH_CUDA
+#ifdef WITH_STEP2_CUDA
 std::unique_ptr<Step2ComputeBackend> make_cuda_step2_compute_backend(
   int device, bool automatic);
 bool cuda_step2_compute_backend_available(int device, std::string& reason);
@@ -619,7 +619,7 @@ std::unique_ptr<Step2ComputeBackend> make_step2_compute_backend(
     throw std::runtime_error("unknown Step 2 compute backend '" +
       requested_backend + "' (expected cpu, cuda, or auto)");
 
-#ifdef WITH_CUDA
+#ifdef WITH_STEP2_CUDA
   std::string reason;
   if(cuda_step2_compute_backend_available(device, reason))
     return make_cuda_step2_compute_backend(device,
@@ -630,7 +630,8 @@ std::unique_ptr<Step2ComputeBackend> make_step2_compute_backend(
   (void)device;
   if(requested_backend == "cuda")
     throw std::runtime_error(
-      "CUDA Step 2 backend was requested, but this binary was built without REGENIE_WITH_CUDA");
+      "CUDA Step 2 backend was requested, but this binary was built without "
+      "Stage 2 CUDA support");
 #endif
 
   return std::unique_ptr<Step2ComputeBackend>(new CpuStep2ComputeBackend());

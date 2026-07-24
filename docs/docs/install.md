@@ -84,6 +84,10 @@ BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
 cmake --build build-cuda -j
 ```
 
+Stage 2 CUDA support is included by default in a CUDA build. Add
+`-DREGENIE_WITH_STEP2_CUDA=OFF` to build the Stage 1 CUDA backend without
+compiling or linking the Stage 2 CUDA implementation.
+
 The existing `STATIC=1` mode remains available for CUDA-enabled builds. It
 retains its usual behavior for oneMKL and the supported host dependencies,
 while the CUDA libraries remain dynamically linked:

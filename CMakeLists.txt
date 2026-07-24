@@ -23,10 +23,14 @@ project(regenie
   )
 
 include(CMakePackageConfigHelpers)
+include(CMakeDependentOption)
 include(GNUInstallDirs)
 include(CTest)
 
 option(REGENIE_WITH_CUDA "Build the experimental CUDA compute backends" OFF)
+cmake_dependent_option(REGENIE_WITH_STEP2_CUDA
+  "Build the experimental Stage 2 CUDA compute backend" ON
+  "REGENIE_WITH_CUDA" OFF)
 set(REGENIE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
   "CUDA architectures to compile for when REGENIE_WITH_CUDA=ON")
 set(REGENIE_LIBDEFLATE "AUTO" CACHE STRING
@@ -156,8 +160,16 @@ function(configure_cuda_target target_name)
   endif()
 endfunction()
 
+function(configure_step2_cuda_target target_name)
+  if(REGENIE_WITH_STEP2_CUDA)
+    configure_cuda_target(${target_name} ${ARGN})
+    target_compile_definitions(${target_name} PRIVATE WITH_STEP2_CUDA)
+  endif()
+endfunction()
+
 configure_cuda_target(regenie
-  ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu
+  ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
+configure_step2_cuda_target(regenie
   ${CMAKE_SOURCE_DIR}/src/Step2_Compute_CUDA.cu)
 
 set(CMAKE_CXX_FLAGS "-O3 -Wall -pedantic -ffast-math -Wno-unused-local-typedefs -Wno-deprecated-declarations -Wno-long-long -Wno-c11-extensions -fPIC")
@@ -378,9 +390,12 @@ if(BUILD_TESTING)
     target_link_libraries(step2_compute_test PRIVATE
       ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
   endif()
-  configure_cuda_target(step2_compute_test
+  configure_step2_cuda_target(step2_compute_test
     ${CMAKE_SOURCE_DIR}/src/Step2_Compute_CUDA.cu)
-  add_test(NAME step2_compute_cpu COMMAND step2_compute_test)
+  add_test(NAME step2_compute_cpu
+    COMMAND step2_compute_test --backend cpu)
+  add_test(NAME step2_compute_auto
+    COMMAND step2_compute_test --backend auto)
 
   add_executable(cox_firth_test
     ${CMAKE_SOURCE_DIR}/test/test_cox_firth.cpp
