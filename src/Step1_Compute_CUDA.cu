@@ -680,6 +680,47 @@ struct CudaResidentGenotypes {
   }
 };
 
+enum class CudaResidentDesignStorage {
+  reusable_buffer,
+  level1_cache
+};
+
+struct CudaResidentDesign {
+  Eigen::Index rows = 0;
+  Eigen::Index columns = 0;
+  bool valid = false;
+  bool weighted_gram_valid = false;
+  CudaResidentDesignStorage storage =
+    CudaResidentDesignStorage::reusable_buffer;
+
+  void activate(Eigen::Index new_rows, Eigen::Index new_columns,
+    CudaResidentDesignStorage new_storage =
+      CudaResidentDesignStorage::reusable_buffer) {
+    rows = new_rows;
+    columns = new_columns;
+    valid = true;
+    weighted_gram_valid = false;
+    storage = new_storage;
+  }
+
+  void invalidate() {
+    rows = 0;
+    columns = 0;
+    valid = false;
+    weighted_gram_valid = false;
+    storage = CudaResidentDesignStorage::reusable_buffer;
+  }
+
+  bool uses_level1_cache() const {
+    return storage == CudaResidentDesignStorage::level1_cache;
+  }
+
+  const double* data(const double* reusable_buffer,
+    const double* level1_cache) const {
+    return uses_level1_cache() ? level1_cache : reusable_buffer;
+  }
+};
+
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
   public:
     explicit CudaStep1ComputeBackend(int device)
@@ -694,10 +735,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
-        resident_design_rows_(0),
-        resident_design_columns_(0), resident_design_valid_(false),
-        cached_weighted_gram_valid_(false),
-        resident_design_uses_level1_cache_(false),
         level1_design_rows_(0), level1_design_columns_(0),
         level1_design_cached_columns_(0),
         level0_phenotypes_host_(nullptr),
@@ -1304,9 +1341,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->resident_design_upload_bytes +=
           static_cast<uint64_t>(required_elements) * sizeof(double);
       }
-      resident_design_rows_ = rows;
-      resident_design_columns_ = columns;
-      resident_design_valid_ = true;
+      resident_design_.activate(rows, columns);
       return true;
     }
 
@@ -1368,9 +1403,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->resident_design_upload_bytes +=
           static_cast<uint64_t>(required_elements) * sizeof(double);
       }
-      resident_design_rows_ = rows;
-      resident_design_columns_ = columns;
-      resident_design_valid_ = true;
+      resident_design_.activate(rows, columns);
       return true;
     }
 
@@ -1447,15 +1480,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return false;
       invalidate_resident_design();
       invalidate_resident_genotypes();
-      resident_design_rows_ = rows;
-      resident_design_columns_ = columns;
-      resident_design_valid_ = true;
-      resident_design_uses_level1_cache_ = true;
+      resident_design_.activate(
+        rows, columns, CudaResidentDesignStorage::level1_cache);
       return true;
     }
 
     void release_level1_design_cache() override {
-      if(resident_design_uses_level1_cache_)
+      if(resident_design_.uses_level1_cache())
         invalidate_resident_design();
       if(d_level1_design_) {
         check_cuda(cudaSetDevice(device_), "cudaSetDevice");
@@ -1472,21 +1503,21 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::VectorXd& predictions,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ ||
-         coefficients.size() != resident_design_columns_)
+      if(!resident_design_.valid ||
+         coefficients.size() != resident_design_.columns)
         throw std::invalid_argument(
           "Step 1 cached design prediction received incompatible dimensions");
       if(!coefficients.allFinite())
         throw std::invalid_argument(
           "Step 1 cached design prediction requires finite coefficients");
-      predictions.resize(resident_design_rows_);
-      if(resident_design_rows_ == 0) return;
+      predictions.resize(resident_design_.rows);
+      if(resident_design_.rows == 0) return;
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached design prediction row count");
+        resident_design_.rows, "cached design prediction row count");
       const int columns = checked_int(
-        resident_design_columns_, "cached design prediction column count");
+        resident_design_.columns, "cached design prediction column count");
       ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(cached design coefficients)");
       ensure_capacity(d_predictions_, predictions.size(),
@@ -1542,8 +1573,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& predictions,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_) return false;
-      if(coefficients.rows() != resident_design_columns_ ||
+      if(!resident_design_.valid) return false;
+      if(coefficients.rows() != resident_design_.columns ||
          coefficients.cols() != row_offsets.size() ||
          row_offsets.size() != row_counts.size() ||
          group_offsets.size() != group_sizes.size())
@@ -1556,28 +1587,28 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           partition < row_offsets.size(); ++partition)
         if(row_offsets(partition) < 0 || row_counts(partition) < 0 ||
            row_offsets(partition) >
-             resident_design_rows_ - row_counts(partition))
+             resident_design_.rows - row_counts(partition))
           throw std::invalid_argument(
             "Step 1 cached grouped prediction received an invalid row partition");
       for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
         if(group_offsets(group) < 0 || group_sizes(group) < 0 ||
            group_offsets(group) >
-             resident_design_columns_ - group_sizes(group))
+             resident_design_.columns - group_sizes(group))
           throw std::invalid_argument(
             "Step 1 cached grouped prediction received an invalid feature group");
 
-      predictions.resize(resident_design_rows_, group_offsets.size());
+      predictions.resize(resident_design_.rows, group_offsets.size());
       predictions.setZero();
-      if(resident_design_rows_ == 0 || group_offsets.size() == 0)
+      if(resident_design_.rows == 0 || group_offsets.size() == 0)
         return true;
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int group_count = checked_int(
         group_offsets.size(), "cached grouped prediction group count");
       const int design_rows = checked_int(
-        resident_design_rows_, "cached grouped prediction design rows");
+        resident_design_.rows, "cached grouped prediction design rows");
       const int design_columns = checked_int(
-        resident_design_columns_,
+        resident_design_.columns,
         "cached grouped prediction design columns");
       Eigen::Index maximum_rows = 0;
       for(Eigen::Index partition = 0;
@@ -1660,8 +1691,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& crossproduct,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ || weights.size() != resident_design_rows_ ||
-         outcomes.rows() != resident_design_rows_)
+      if(!resident_design_.valid || weights.size() != resident_design_.rows ||
+         outcomes.rows() != resident_design_.rows)
         throw std::invalid_argument(
           "Step 1 cached weighted design products received incompatible dimensions");
       if(!weights.allFinite() || (weights.array() < 0).any() ||
@@ -1671,9 +1702,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached weighted design row count");
+        resident_design_.rows, "cached weighted design row count");
       const int features = checked_int(
-        resident_design_columns_, "cached weighted design feature count");
+        resident_design_.columns, "cached weighted design feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "cached weighted design outcome count");
       gram.resize(features, features);
@@ -1710,9 +1741,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& solutions,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ || weights.size() != resident_design_rows_ ||
-         outcomes.rows() != resident_design_rows_ ||
-         penalty_multipliers.size() != resident_design_columns_)
+      if(!resident_design_.valid || weights.size() != resident_design_.rows ||
+         outcomes.rows() != resident_design_.rows ||
+         penalty_multipliers.size() != resident_design_.columns)
         throw std::invalid_argument(
           "Step 1 cached weighted solve received incompatible dimensions");
       if(!weights.allFinite() || (weights.array() < 0).any() ||
@@ -1725,9 +1756,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached weighted solve row count");
+        resident_design_.rows, "cached weighted solve row count");
       const int features = checked_int(
-        resident_design_columns_, "cached weighted solve feature count");
+        resident_design_.columns, "cached weighted solve feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "cached weighted solve outcome count");
       const int parameter_count = checked_int(
@@ -1759,9 +1790,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& solutions,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ || !cached_weighted_gram_valid_ ||
-         right_hand_sides.rows() != resident_design_columns_ ||
-         penalty_multipliers.size() != resident_design_columns_)
+      if(!resident_design_.valid || !resident_design_.weighted_gram_valid ||
+         right_hand_sides.rows() != resident_design_.columns ||
+         penalty_multipliers.size() != resident_design_.columns)
         return false;
       if(!right_hand_sides.allFinite() ||
          !ridge_parameters.allFinite() ||
@@ -1773,7 +1804,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int features = checked_int(
-        resident_design_columns_, "cached weighted Gram feature count");
+        resident_design_.columns, "cached weighted Gram feature count");
       const int right_hand_side_count = checked_int(
         right_hand_sides.cols(), "cached weighted Gram outcome count");
       const int parameter_count = checked_int(
@@ -1820,8 +1851,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& crossproduct,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ ||
-         outcomes.rows() != resident_design_rows_)
+      if(!resident_design_.valid ||
+         outcomes.rows() != resident_design_.rows)
         throw std::invalid_argument(
           "Step 1 cached design crossproduct received incompatible dimensions");
       if(!outcomes.allFinite())
@@ -1830,9 +1861,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached crossproduct row count");
+        resident_design_.rows, "cached crossproduct row count");
       const int features = checked_int(
-        resident_design_columns_, "cached crossproduct feature count");
+        resident_design_.columns, "cached crossproduct feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "cached crossproduct outcome count");
       crossproduct.resize(features, outcome_count);
@@ -2216,14 +2247,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(!level0_cholesky_enabled_ || !level0_fold_batch_enabled_ ||
          system_count_index < 2)
         return false;
-      if(!resident_design_valid_ ||
+      if(!resident_design_.valid ||
          row_counts.size() != system_count_index ||
-         outcomes.rows() != resident_design_rows_)
+         outcomes.rows() != resident_design_.rows)
         throw std::invalid_argument(
           "Step 1 resident design fold products received incompatible dimensions");
       for(Eigen::Index system = 0; system < system_count_index; ++system) {
         if(start_rows(system) < 0 || row_counts(system) < 0 ||
-           start_rows(system) > resident_design_rows_ - row_counts(system))
+           start_rows(system) > resident_design_.rows - row_counts(system))
           throw std::invalid_argument(
             "Step 1 resident design fold products received an invalid fold");
       }
@@ -2231,17 +2262,17 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const size_t system_count = static_cast<size_t>(system_count_index);
       const int features = checked_int(
-        resident_design_columns_, "resident design fold feature count");
+        resident_design_.columns, "resident design fold feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "resident design fold outcome count");
       if(features == 0) return false;
       const Eigen::Index gram_elements =
-        resident_design_columns_ * resident_design_columns_;
+        resident_design_.columns * resident_design_.columns;
       const Eigen::Index rhs_elements =
-        resident_design_columns_ * outcomes.cols();
+        resident_design_.columns * outcomes.cols();
       const Eigen::Index resident_design_elements =
-        resident_design_rows_ * resident_design_columns_;
-      if(!resident_design_uses_level1_cache_ && d_projected_.capacity() <
+        resident_design_.rows * resident_design_.columns;
+      if(!resident_design_.uses_level1_cache() && d_projected_.capacity() <
            static_cast<size_t>(resident_design_elements))
         throw std::runtime_error(
           "Step 1 resident design fold staging workspace is unavailable");
@@ -2304,7 +2335,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           continue;
         }
         const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
-          fold_rows, resident_design_columns_);
+          fold_rows, resident_design_.columns);
         for(Eigen::Index start = 0; start < fold_rows;
             start += chunk_rows) {
           const Eigen::Index count_index = std::min(
@@ -2314,18 +2345,18 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           const double beta = start == 0 ? 0.0 : 1.0;
           const double* design_chunk = nullptr;
           int design_leading_dimension = 0;
-          if(resident_design_uses_level1_cache_) {
+          if(resident_design_.uses_level1_cache()) {
             design_chunk = d_level1_design_ + start_rows(fold) + start;
             design_leading_dimension = checked_int(
-              resident_design_rows_,
+              resident_design_.rows,
               "persistent Level 1 design leading dimension");
           } else {
             double* staged_design_chunk = d_projected_ +
-              start_rows(fold) * resident_design_columns_;
+              start_rows(fold) * resident_design_.columns;
             check_cuda(cudaMemcpy2DAsync(staged_design_chunk,
               static_cast<size_t>(count) * sizeof(double),
               d_resident_genotypes_ + start_rows(fold) + start,
-              static_cast<size_t>(resident_design_rows_) * sizeof(double),
+              static_cast<size_t>(resident_design_.rows) * sizeof(double),
               static_cast<size_t>(count) * sizeof(double),
               static_cast<size_t>(features), cudaMemcpyDeviceToDevice,
               lane.stream),
@@ -3086,7 +3117,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_fold_systems_.system_count);
       const bool design_orientation =
         resident_fold_systems_.uses_design();
-      if((design_orientation ? !resident_design_valid_ : !resident_genotypes_.valid) ||
+      if((design_orientation ? !resident_design_.valid : !resident_genotypes_.valid) ||
          system_count < 2 ||
          start_columns.size() != resident_fold_systems_.system_count ||
          column_counts.size() != resident_fold_systems_.system_count)
@@ -3098,14 +3129,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const Eigen::Index fold = static_cast<Eigen::Index>(system);
         if(start_columns(fold) < 0 || column_counts(fold) < 0 ||
            start_columns(fold) >
-             (design_orientation ? resident_design_rows_ :
+             (design_orientation ? resident_design_.rows :
                resident_genotypes_.columns) - column_counts(fold))
           throw std::invalid_argument(
             "Step 1 cached fold ridge prediction received invalid dimensions");
       }
 
       const Eigen::Index size_index = design_orientation ?
-        resident_design_columns_ : resident_genotypes_.rows;
+        resident_design_.columns : resident_genotypes_.rows;
       const Eigen::Index right_hand_side_count_index =
         resident_fold_systems_.rhs_count;
       const int size = checked_int(
@@ -3247,12 +3278,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           if(design_orientation) {
             const Eigen::Index sample_count_index =
               column_counts(static_cast<Eigen::Index>(system));
-            if(resident_design_uses_level1_cache_) {
+            if(resident_design_.uses_level1_cache()) {
               check_cublas(cublasDgemm(lane.blas,
                 CUBLAS_OP_N, CUBLAS_OP_N,
                 sample_count, combination_count, size, &alpha,
                 d_level1_design_ + start,
-                checked_int(resident_design_rows_,
+                checked_int(resident_design_.rows,
                   "persistent Level 1 design leading dimension"),
                 lane.coefficients, size, &beta,
                 lane.predictions, sample_count),
@@ -3261,7 +3292,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
               const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
                 sample_count_index, size_index);
               double* prediction_chunk = d_projected_ +
-                start * resident_design_columns_;
+                start * resident_design_.columns;
               for(Eigen::Index chunk_start = 0;
                   chunk_start < sample_count_index;
                   chunk_start += chunk_rows) {
@@ -3272,7 +3303,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
                 check_cuda(cudaMemcpy2DAsync(prediction_chunk,
                   static_cast<size_t>(count) * sizeof(double),
                   d_resident_genotypes_ + start + chunk_start,
-                  static_cast<size_t>(resident_design_rows_) * sizeof(double),
+                  static_cast<size_t>(resident_design_.rows) * sizeof(double),
                   static_cast<size_t>(count) * sizeof(double),
                   static_cast<size_t>(size), cudaMemcpyDeviceToDevice,
                   lane.stream),
@@ -5442,11 +5473,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Step1ComputeTimings* timings) {
 
-      cached_weighted_gram_valid_ = false;
+      resident_design_.weighted_gram_valid = false;
       const int rows = checked_int(
-        resident_design_rows_, "cached weighted design row count");
+        resident_design_.rows, "cached weighted design row count");
       const int features = checked_int(
-        resident_design_columns_, "cached weighted design feature count");
+        resident_design_.columns, "cached weighted design feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "cached weighted design outcome count");
       const int design_count = checked_element_count(
@@ -5542,7 +5573,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
         timings->resident_design_reuse_count++;
       }
-      cached_weighted_gram_valid_ = true;
+      resident_design_.weighted_gram_valid = true;
     }
 
     void diagonal_penalty_solve_device(
@@ -5795,18 +5826,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
     void invalidate_resident_design() {
-      resident_design_rows_ = 0;
-      resident_design_columns_ = 0;
-      resident_design_valid_ = false;
-      cached_weighted_gram_valid_ = false;
-      resident_design_uses_level1_cache_ = false;
+      resident_design_.invalidate();
       if(resident_fold_systems_.uses_design())
         invalidate_resident_fold_systems();
     }
 
     const double* resident_design_data() const {
-      return resident_design_uses_level1_cache_ ?
-        d_level1_design_ : d_resident_genotypes_;
+      return resident_design_.data(
+        d_resident_genotypes_, d_level1_design_);
     }
 
     const double* resident_genotype_columns(
@@ -5977,11 +6004,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaDeviceBuffer<unsigned char> d_transposed_hardcalls_;
     CudaDeviceBuffer<unsigned int> d_packed_row_counts_;
     CudaResidentGenotypes resident_genotypes_;
-    Eigen::Index resident_design_rows_;
-    Eigen::Index resident_design_columns_;
-    bool resident_design_valid_;
-    bool cached_weighted_gram_valid_;
-    bool resident_design_uses_level1_cache_;
+    CudaResidentDesign resident_design_;
     Eigen::Index level1_design_rows_;
     Eigen::Index level1_design_columns_;
     Eigen::Index level1_design_cached_columns_;
