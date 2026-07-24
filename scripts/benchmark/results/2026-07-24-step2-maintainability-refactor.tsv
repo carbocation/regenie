@@ -1,0 +1,7 @@
+model	revision	role	samples	phenotypes	stage2_tested_variants	scope	missingness	system	linear_algebra	cache_state	bsize	threads	repetitions	mean_wall_s	mean_step2_profile_ms	change_vs_baseline	result_file_pairs	byte_identical	failed_tests	notes
+quantitative	5063906	baseline	500000	8	57821	chromosome_1	first_8_traits_0_to_2.258pct	n2-standard-16-8physical-cores	oneMKL-2026.1	cold	1000	8	2	40.830	40700.770	baseline	NA	NA	0	immediate_pre_refactor
+quantitative	1f2352d	final	500000	8	57821	chromosome_1	first_8_traits_0_to_2.258pct	n2-standard-16-8physical-cores	oneMKL-2026.1	cold	1000	8	2	40.095	39986.684	-1.800pct	16	16	0	exact_output_no_regression
+binary	5063906	baseline	500000	8	57821	chromosome_1	first_8_traits_0_to_2.258pct	n2-standard-16-8physical-cores	oneMKL-2026.1	cold	1000	8	2	38.160	38051.976	baseline	NA	NA	0	immediate_pre_refactor
+binary	1f2352d	final	500000	8	57821	chromosome_1	first_8_traits_0_to_2.258pct	n2-standard-16-8physical-cores	oneMKL-2026.1	cold	1000	8	2	38.140	38029.810	-0.052pct	16	16	0	exact_output_no_regression
+survival	5063906	baseline	500000	8	57821	chromosome_1	first_8_traits_0_to_2.258pct	n2-standard-16-8physical-cores	oneMKL-2026.1	cold	1000	8	2	43.265	42939.154	baseline	NA	NA	0	immediate_pre_refactor
+survival	1f2352d	final	500000	8	57821	chromosome_1	first_8_traits_0_to_2.258pct	n2-standard-16-8physical-cores	oneMKL-2026.1	cold	1000	8	2	43.225	42891.739	-0.092pct	16	16	0	exact_output_no_regression
