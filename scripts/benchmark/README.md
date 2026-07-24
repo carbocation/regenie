@@ -6,7 +6,7 @@ REGENIE v4.1.2. Start with the report for the stage you plan to run:
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000; 700,000 model-fitting variants; quantitative, binary, and survival traits with 0-10% missingness | Latest byte-exact default on A100 versus upstream v4.1.2 on an eight-core N2, plus a clearly separated opt-in path-Newton sensitivity |
-| [CUDA Step 1 refactor gate](results/2026-07-24-step1-cuda-refactor-gate.md) | A100; N=500,000; 700,000 model-fitting variants; P=8 quantitative traits with 0-10% missingness | Refactor revision `340677f3` remained within 1.12% of the matched total runtime, with flat backend compute timings and 8/8 byte-identical LOCO files |
+| [CUDA Step 1 refactor cross-model gate](results/2026-07-24-step1-cuda-refactor-gate.md) | A100; N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Refactor revision `340677f3` had no regression across all three models, flat backend compute timings, zero fallbacks, and 24/24 byte-identical LOCO files |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `3ab5fbb` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=32 with 0-10% missingness, current processes 848.2 quantitative, 792.7 binary, and 524.9 survival variants/s; CPU chromosome fan-out remains the recommended production placement |
 
 Every headline table states the sample count, trait count, model, hardware,
