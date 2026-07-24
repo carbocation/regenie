@@ -497,6 +497,113 @@ void cache_concatenated_level1_predictions(
     std::chrono::high_resolution_clock::now() - wall_start).count();
 }
 
+struct Level1PathNewtonResult {
+  ArrayXd accepted_coefficients;
+  ArrayXd score;
+  bool converged = false;
+  uint64_t solve_calls = 0;
+  uint64_t prediction_calls = 0;
+  uint64_t score_calls = 0;
+};
+
+constexpr int kLevel1PathNewtonMaximumCorrections = 4;
+
+Level1PathNewtonResult run_level1_path_newton_corrections(
+  Step1ComputeBackend* compute_backend,
+  Step1ComputeTimings* profile_timings,
+  int held_out_fold,
+  int phenotype,
+  int fold_count,
+  double previous_penalty,
+  double penalty,
+  double score_tolerance,
+  double probability_tolerance,
+  const ArrayXd& penalty_multipliers,
+  const ArrayXd& previous_coefficients,
+  const ArrayXd& previous_score,
+  const std::vector<Eigen::Index>& fold_offsets,
+  const std::vector<MatrixXd>& fold_offset_values,
+  const std::vector<MatrixXd>& fold_outcomes,
+  const std::vector<MatrixXb>& fold_masks,
+  VectorXd& cached_predictions,
+  MatrixXd& cached_score_outcome,
+  ArrayXd& linear_predictor,
+  ArrayXd& probabilities) {
+
+  Level1PathNewtonResult result;
+  result.accepted_coefficients = previous_coefficients;
+  result.score = previous_score;
+
+  // At the previous ridge solution, changing only lambda changes the
+  // penalized score by exactly -(lambda_new-lambda_old) D beta. Reuse the
+  // previous IRLS Hessian for a few monotone chord-Newton corrections;
+  // ordinary IRLS resumes from the best accepted point.
+  ArrayXd path_score = previous_score -
+    (penalty - previous_penalty) *
+      penalty_multipliers * previous_coefficients;
+  VectorXd current_penalty(1);
+  current_penalty(0) = penalty;
+  double path_score_max = path_score.abs().maxCoeff();
+
+  for(int correction = 0;
+      correction < kLevel1PathNewtonMaximumCorrections; ++correction) {
+    const MatrixXd path_right_hand_side = path_score.matrix();
+    MatrixXd path_step;
+    if(!compute_backend->solve_cached_weighted_gram(
+         path_right_hand_side, current_penalty,
+         penalty_multipliers.matrix(), path_step, profile_timings) ||
+       path_step.cols() != 1 || !path_step.allFinite())
+      break;
+
+    const ArrayXd path_candidate =
+      result.accepted_coefficients + path_step.col(0).array();
+    ++result.solve_calls;
+
+    const VectorXd coefficient_vector = path_candidate.matrix();
+    compute_backend->predict_cached_design(
+      coefficient_vector, cached_predictions, profile_timings);
+    ++result.prediction_calls;
+
+    cached_score_outcome.setZero();
+    for(int fold = 0; fold < fold_count; ++fold) {
+      if(fold == held_out_fold) continue;
+      const Eigen::Index start = fold_offsets[fold];
+      const Eigen::Index count =
+        fold_offsets[fold + 1] - start;
+      linear_predictor = fold_offset_values[fold].array() +
+        cached_predictions.segment(start, count).array();
+      get_pvec(probabilities, linear_predictor, probability_tolerance);
+      cached_score_outcome.col(0).segment(start, count) =
+        fold_masks[fold].col(phenotype).array().select(
+          fold_outcomes[fold].array() - probabilities, 0).matrix();
+    }
+
+    MatrixXd path_crossproduct;
+    compute_backend->compute_cached_design_crossproduct(
+      cached_score_outcome, path_crossproduct, profile_timings);
+    ++result.score_calls;
+    const ArrayXd candidate_score =
+      path_crossproduct.col(0).array() -
+        penalty * penalty_multipliers * path_candidate;
+    const double candidate_score_max =
+      candidate_score.abs().maxCoeff();
+    if(!std::isfinite(candidate_score_max) ||
+       candidate_score_max >= path_score_max)
+      break;
+
+    result.accepted_coefficients = path_candidate;
+    result.score = candidate_score;
+    path_score = candidate_score;
+    path_score_max = candidate_score_max;
+    if(path_score_max < score_tolerance) {
+      result.converged = true;
+      break;
+    }
+  }
+
+  return result;
+}
+
 }
 
 std::string level1_prediction_cache_path(
@@ -2060,67 +2167,26 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         if(use_path_newton && resident_design && j > 0) {
           const auto path_start =
             std::chrono::high_resolution_clock::now();
-          // At the previous ridge solution, changing only lambda changes the
-          // penalized score by exactly -(lambda_new-lambda_old) D beta. Reuse
-          // the previous IRLS Hessian for a few monotone chord-Newton
-          // corrections; ordinary IRLS resumes from the best accepted point.
-          ArrayXd path_score = score -
-            (params->tau[ph](j) - params->tau[ph](j - 1)) *
-              l1->ridge_param_mult * betanew;
-          current_tau(0) = params->tau[ph](j);
-          double path_score_max = path_score.abs().maxCoeff();
-          for(int correction = 0; correction < 4; ++correction) {
-            const MatrixXd path_right_hand_side = path_score.matrix();
-            MatrixXd path_step;
-            if(!compute_backend->solve_cached_weighted_gram(
-                 path_right_hand_side, current_tau,
-                 l1->ridge_param_mult.matrix(), path_step,
-                 profile_timings) ||
-               path_step.cols() != 1 || !path_step.allFinite())
-              break;
-
-            const ArrayXd path_candidate =
-              betaold + path_step.col(0).array();
-            ++path_newton_solves;
-            ++solve_calls;
-
-            predict_resident(path_candidate);
-            cached_score_outcome.setZero();
-            for(int k = 0; k < params->cv_folds; ++k ) {
-              if(k == i) continue;
-              const Eigen::Index start = fold_offsets[k];
-              const Eigen::Index count = fold_offsets[k + 1] - start;
-              etavec = l1->test_offset[ph][k].array() +
-                cached_predictions.segment(start, count).array();
-              get_pvec(pivec, etavec, params->numtol_eps);
-              cached_score_outcome.col(0).segment(start, count) =
-                masked_in_folds[k].col(ph).array().select(
-                  l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix();
-            }
-            MatrixXd path_crossproduct;
-            compute_backend->compute_cached_design_crossproduct(
-              cached_score_outcome, path_crossproduct, profile_timings);
-            ++path_newton_score_calls;
-            ++score_calls;
-            const ArrayXd candidate_score =
-              path_crossproduct.col(0).array() -
-                params->tau[ph](j) * l1->ridge_param_mult * path_candidate;
-            const double candidate_score_max =
-              candidate_score.abs().maxCoeff();
-            if(!std::isfinite(candidate_score_max) ||
-               candidate_score_max >= path_score_max)
-              break;
-
-            betaold = path_candidate;
-            score = candidate_score;
-            path_score = candidate_score;
-            path_score_max = candidate_score_max;
-            if(path_score_max < params->l1_ridge_tol) {
-              betanew = betaold;
-              path_newton_converged = true;
-              ++path_newton_converged_models;
-              break;
-            }
+          const Level1PathNewtonResult path_result =
+            run_level1_path_newton_corrections(
+              compute_backend, profile_timings, i, ph, params->cv_folds,
+              params->tau[ph](j - 1), params->tau[ph](j),
+              params->l1_ridge_tol, params->numtol_eps,
+              l1->ridge_param_mult, betaold, score, fold_offsets,
+              l1->test_offset[ph], l1->test_pheno_raw[ph],
+              masked_in_folds, cached_predictions, cached_score_outcome,
+              etavec, pivec);
+          betaold = path_result.accepted_coefficients;
+          score = path_result.score;
+          path_newton_converged = path_result.converged;
+          path_newton_solves += path_result.solve_calls;
+          solve_calls += path_result.solve_calls;
+          prediction_calls += path_result.prediction_calls;
+          path_newton_score_calls += path_result.score_calls;
+          score_calls += path_result.score_calls;
+          if(path_newton_converged) {
+            betanew = betaold;
+            ++path_newton_converged_models;
           }
           path_newton_wall_ms +=
             std::chrono::duration<double, std::milli>(
