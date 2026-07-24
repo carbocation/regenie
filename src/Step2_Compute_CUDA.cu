@@ -26,6 +26,7 @@
 
 #define EIGEN_NO_CUDA
 #include "Step2_Compute.hpp"
+#include "Cuda_Resources.hpp"
 
 #include <cuda_runtime.h>
 
@@ -720,13 +721,9 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       static_cast<size_t>(variants) * phenotypes_;
     ensure_dynamic(packed_host_.size(), variants, output_count,
       return_trait_counts);
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    check_cuda(cudaEventCreate(&start), "create Step 2 CUDA start event");
-    check_cuda(cudaEventCreate(&stop), "create Step 2 CUDA stop event");
-    float measured_ms = 0;
+    regenie::cuda::EventPair events;
 
-    check_cuda(cudaEventRecord(start), "record Step 2 packed upload start");
+    events.record_start();
     check_cuda(cudaMemcpyAsync(d_packed_, packed_host_.data(),
       packed_host_.size(), cudaMemcpyHostToDevice),
       "upload Step 2 packed hardcalls");
@@ -737,11 +734,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       cudaMemcpyHostToDevice), "upload Step 2 flip flags");
     check_cuda(cudaMemcpyAsync(d_sparse_, sparse.data(), variants,
       cudaMemcpyHostToDevice), "upload Step 2 sparse flags");
-    check_cuda(cudaEventRecord(stop), "record Step 2 packed upload stop");
-    check_cuda(cudaEventSynchronize(stop), "synchronize Step 2 packed upload");
-    check_cuda(cudaEventElapsedTime(&measured_ms, start, stop),
-      "measure Step 2 packed upload");
-    if(timings) timings->upload_ms += measured_ms;
+    const double upload_ms = events.record_stop_and_elapsed_ms();
+    if(timings) timings->upload_ms += upload_ms;
 
     const dim3 grid(variants, phenotypes_);
     const int threads = 256;
@@ -753,7 +747,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       term_count = 2 + 2 * covariates_;
     const size_t shared_bytes =
       static_cast<size_t>(term_count) * warp_count * sizeof(double);
-    check_cuda(cudaEventRecord(start), "record Step 2 score start");
+    events.record_start();
     if(mode_ == ScoreMode::quantitative && quantitative_complete_masks_) {
       quantitative_score_kernel<<<grid, threads, shared_bytes>>>(d_packed_,
         static_cast<int>(packed_stride), d_means_, d_flipped_, d_residuals_,
@@ -787,11 +781,8 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       check_cuda(cudaGetLastError(),
         "launch Step 2 observed trait counts kernel");
     }
-    check_cuda(cudaEventRecord(stop), "record Step 2 score stop");
-    check_cuda(cudaEventSynchronize(stop), "synchronize Step 2 score");
-    check_cuda(cudaEventElapsedTime(&measured_ms, start, stop),
-      "measure Step 2 score kernel");
-    if(timings) timings->kernel_ms += measured_ms;
+    const double kernel_ms = events.record_stop_and_elapsed_ms();
+    if(timings) timings->kernel_ms += kernel_ms;
 
     numerators.resize(phenotypes_, variants);
     denominators.resize(phenotypes_, variants);
@@ -802,7 +793,7 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
       observed_allele_sums.resize(0, 0);
       observed_nonmissing_counts.resize(0, 0);
     }
-    check_cuda(cudaEventRecord(start), "record Step 2 score download start");
+    events.record_start();
     check_cuda(cudaMemcpyAsync(numerators.data(), d_numerators_,
       static_cast<size_t>(variants) * phenotypes_ * sizeof(double),
       cudaMemcpyDeviceToHost), "download Step 2 score numerators");
@@ -819,20 +810,14 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
         cudaMemcpyDeviceToHost),
         "download Step 2 observed nonmissing counts");
     }
-    check_cuda(cudaEventRecord(stop), "record Step 2 score download stop");
-    check_cuda(cudaEventSynchronize(stop),
-      "synchronize Step 2 score download");
-    check_cuda(cudaEventElapsedTime(&measured_ms, start, stop),
-      "measure Step 2 score download");
+    const double download_ms = events.record_stop_and_elapsed_ms();
     if(timings) {
-      timings->download_ms += measured_ms;
+      timings->download_ms += download_ms;
       timings->scored_blocks++;
       timings->scored_variants += variants;
       timings->packed_upload_bytes += packed_host_.size();
       timings->wall_ms += elapsed_ms(wall_start);
     }
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
     return numerators.allFinite() && denominators.allFinite();
   }
 

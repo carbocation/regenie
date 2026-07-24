@@ -26,6 +26,7 @@
 
 #define EIGEN_NO_CUDA
 #include "Step1_Compute.hpp"
+#include "Cuda_Resources.hpp"
 
 #include <cublas_v2.h>
 #include <cusolverDn.h>
@@ -489,39 +490,8 @@ __global__ void apply_leave_one_out_correction(double* predictions,
   }
 }
 
-class CudaEventPair {
-  public:
-    CudaEventPair() : start_(nullptr), stop_(nullptr) {
-      check_cuda(cudaEventCreate(&start_), "cudaEventCreate(start)");
-      try {
-        check_cuda(cudaEventCreate(&stop_), "cudaEventCreate(stop)");
-      } catch(...) {
-        cudaEventDestroy(start_);
-        throw;
-      }
-    }
-
-    ~CudaEventPair() {
-      if(stop_) cudaEventDestroy(stop_);
-      if(start_) cudaEventDestroy(start_);
-    }
-
-    void record_start() {
-      check_cuda(cudaEventRecord(start_), "cudaEventRecord(start)");
-    }
-
-    double record_stop_and_elapsed_ms() {
-      check_cuda(cudaEventRecord(stop_), "cudaEventRecord(stop)");
-      check_cuda(cudaEventSynchronize(stop_), "cudaEventSynchronize(stop)");
-      float milliseconds = 0;
-      check_cuda(cudaEventElapsedTime(&milliseconds, start_, stop_), "cudaEventElapsedTime");
-      return milliseconds;
-    }
-
-  private:
-    cudaEvent_t start_;
-    cudaEvent_t stop_;
-};
+using CudaEventPair = regenie::cuda::EventPair;
+using CudaHostRegistration = regenie::cuda::HostRegistration;
 
 struct CudaLevel0CholeskyLane {
   cudaStream_t stream = nullptr;
@@ -3279,8 +3249,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       if(copy_results_to_host) {
         if(timings) phase_start = ComputeClock::now();
-        std::vector<bool> prediction_registered(system_count, false);
-        std::vector<bool> coefficient_registered(system_count, false);
+        std::vector<CudaHostRegistration> prediction_registrations(
+          system_count);
+        std::vector<CudaHostRegistration> coefficient_registrations(
+          system_count);
         // Pageable destinations can serialize these otherwise independent
         // fold-lane copies. Registration failure deliberately falls back to
         // the CUDA runtime's pageable-copy behavior.
@@ -3289,34 +3261,24 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             const size_t bytes =
               static_cast<size_t>(predictions[system].size()) *
                 sizeof(double);
-            const cudaError_t status = cudaHostRegister(
-              predictions[system].data(), bytes,
-              cudaHostRegisterPortable);
-            if(status == cudaSuccess) {
-              prediction_registered[system] = true;
+            if(prediction_registrations[system].try_register(
+                 predictions[system].data(), bytes)) {
               if(timings) {
                 timings->pinned_download_count++;
                 timings->pinned_download_bytes += bytes;
               }
-            } else {
-              cudaGetLastError();
             }
           }
           if(coefficients[system].size() > 0) {
             const size_t bytes =
               static_cast<size_t>(coefficients[system].size()) *
                 sizeof(double);
-            const cudaError_t status = cudaHostRegister(
-              coefficients[system].data(), bytes,
-              cudaHostRegisterPortable);
-            if(status == cudaSuccess) {
-              coefficient_registered[system] = true;
+            if(coefficient_registrations[system].try_register(
+                 coefficients[system].data(), bytes)) {
               if(timings) {
                 timings->pinned_download_count++;
                 timings->pinned_download_bytes += bytes;
               }
-            } else {
-              cudaGetLastError();
             }
           }
         }
@@ -3365,12 +3327,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         }
         synchronize_level0_cholesky_lanes(system_count);
         for(size_t system = 0; system < system_count; ++system) {
-          if(prediction_registered[system])
-            check_cuda(cudaHostUnregister(predictions[system].data()),
-              "cudaHostUnregister(cached fold predictions)");
-          if(coefficient_registered[system])
-            check_cuda(cudaHostUnregister(coefficients[system].data()),
-              "cudaHostUnregister(cached fold coefficients)");
+          check_cuda(
+            prediction_registrations[system].unregister_now(),
+            "cudaHostUnregister(cached fold predictions)");
+          check_cuda(
+            coefficient_registrations[system].unregister_now(),
+            "cudaHostUnregister(cached fold coefficients)");
         }
         if(timings) timings->download_ms += elapsed_ms(phase_start);
       }
