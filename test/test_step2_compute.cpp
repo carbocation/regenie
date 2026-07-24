@@ -1,4 +1,4 @@
-/* Deterministic conformance tests for blockwise Step 2 CPU scoring. */
+/* Deterministic conformance tests for blockwise Step 2 scoring. */
 
 #include "Step2_Compute.hpp"
 
@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -42,6 +43,122 @@ void require_close(const Eigen::MatrixXd& actual,
   if(relative_error(actual, expected) > 2e-12)
     throw std::runtime_error(std::string(label) +
       " conformance tolerance exceeded");
+}
+
+struct PackedHardcallBlock {
+  Eigen::MatrixXd genotypes;
+  std::vector<std::vector<unsigned char>> packed;
+  std::vector<double> missing_means;
+  std::vector<unsigned char> flipped;
+  std::vector<unsigned char> sparse;
+};
+
+PackedHardcallBlock deterministic_packed_hardcalls(
+    Eigen::Index samples, Eigen::Index variants) {
+  PackedHardcallBlock block;
+  block.genotypes.resize(samples, variants);
+  block.packed.assign(variants,
+    std::vector<unsigned char>((samples + 3) / 4, 0));
+  block.missing_means.resize(variants);
+  block.flipped.resize(variants);
+  block.sparse.assign(variants, 0);
+
+  for(Eigen::Index variant = 0; variant < variants; ++variant) {
+    double allele_sum = 0;
+    Eigen::Index observed = 0;
+    for(Eigen::Index sample = 0; sample < samples; ++sample) {
+      const unsigned char code = static_cast<unsigned char>(
+        (sample * 3 + variant * 5 + sample * variant) % 4);
+      block.packed[variant][sample >> 2] |=
+        static_cast<unsigned char>(code << (2 * (sample & 3)));
+      if(code != 3) {
+        allele_sum += code;
+        ++observed;
+      }
+    }
+    if(observed == 0)
+      throw std::runtime_error("packed hardcall fixture has no observations");
+    block.missing_means[variant] = allele_sum / observed;
+    block.flipped[variant] = static_cast<unsigned char>(variant % 2);
+    for(Eigen::Index sample = 0; sample < samples; ++sample) {
+      const unsigned char code =
+        (block.packed[variant][sample >> 2] >>
+          (2 * (sample & 3))) & 3;
+      const double unflipped = code == 3 ?
+        block.missing_means[variant] : static_cast<double>(code);
+      block.genotypes(sample, variant) =
+        block.flipped[variant] ? 2.0 - unflipped : unflipped;
+    }
+  }
+  return block;
+}
+
+void require_observed_counts(
+    const PackedHardcallBlock& block,
+    const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+      Eigen::Dynamic>>& observed,
+    const Eigen::MatrixXd& allele_sums,
+    const Eigen::MatrixXd& nonmissing_counts,
+    const char* label) {
+  Eigen::MatrixXd expected_sums =
+    Eigen::MatrixXd::Zero(observed.cols(), block.genotypes.cols());
+  Eigen::MatrixXd expected_counts =
+    Eigen::MatrixXd::Zero(observed.cols(), block.genotypes.cols());
+  for(Eigen::Index variant = 0; variant < block.genotypes.cols(); ++variant)
+    for(Eigen::Index phenotype = 0; phenotype < observed.cols();
+        ++phenotype)
+      for(Eigen::Index sample = 0; sample < observed.rows(); ++sample) {
+        if(!observed(sample, phenotype)) continue;
+        const unsigned char code =
+          (block.packed[variant][sample >> 2] >>
+            (2 * (sample & 3))) & 3;
+        if(code == 3) continue;
+        expected_sums(phenotype, variant) += code;
+        expected_counts(phenotype, variant) += 1;
+      }
+  require_close(allele_sums, expected_sums,
+    (std::string(label) + " observed allele sums").c_str());
+  require_close(nonmissing_counts, expected_counts,
+    (std::string(label) + " observed nonmissing counts").c_str());
+}
+
+void score_packed_and_compare(
+    Step2ComputeBackend& candidate,
+    Step2ComputeBackend& reference,
+    const PackedHardcallBlock& block,
+    const Eigen::Ref<const Eigen::Matrix<bool, Eigen::Dynamic,
+      Eigen::Dynamic>>& observed,
+    const Eigen::RowVectorXd* raw_squared_norms,
+    Step2ComputeTimings* timings,
+    const char* label) {
+  Eigen::MatrixXd actual_numerators, actual_denominators;
+  Eigen::MatrixXd observed_allele_sums, observed_nonmissing_counts;
+  if(!candidate.score_packed_block(block.packed, block.missing_means,
+       block.flipped, block.sparse, block.genotypes.rows(),
+       actual_numerators, actual_denominators, observed_allele_sums,
+       observed_nonmissing_counts, timings))
+    throw std::runtime_error(std::string(label) +
+      " packed scoring failed");
+
+  Eigen::MatrixXd expected_numerators, expected_denominators;
+  if(!reference.score_dense_block(block.genotypes, block.sparse,
+       raw_squared_norms, expected_numerators, expected_denominators,
+       nullptr))
+    throw std::runtime_error(std::string(label) +
+      " CPU reference scoring failed");
+  require_close(actual_numerators, expected_numerators,
+    (std::string(label) + " numerator").c_str());
+  require_close(actual_denominators, expected_denominators,
+    (std::string(label) + " denominator").c_str());
+
+  if(candidate.provides_observed_trait_counts()) {
+    require_observed_counts(block, observed, observed_allele_sums,
+      observed_nonmissing_counts, label);
+  } else if(observed_allele_sums.size() != 0 ||
+            observed_nonmissing_counts.size() != 0) {
+    throw std::runtime_error(std::string(label) +
+      " returned unexpected observed-trait counts");
+  }
 }
 
 void check_quantitative(Step2ComputeBackend& backend) {
@@ -325,16 +442,199 @@ void check_cox(Step2ComputeBackend& backend) {
     throw std::runtime_error("malformed factored Cox preparation accepted");
 }
 
+void check_packed_quantitative(Step2ComputeBackend& candidate,
+    Step2ComputeBackend& reference) {
+  const Eigen::Index samples = 17;
+  const Eigen::Index phenotypes = 16;
+  const Eigen::Index covariates = 3;
+  const Eigen::Index variants = 7;
+  const Eigen::MatrixXd residuals =
+    deterministic_matrix(samples, phenotypes, 0.13);
+  const Eigen::MatrixXd design =
+    deterministic_matrix(samples, covariates, -0.29);
+  const Eigen::MatrixXd products = residuals.transpose() * design;
+  Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> observed =
+    Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic>::Constant(
+      samples, phenotypes, true);
+  const PackedHardcallBlock block =
+    deterministic_packed_hardcalls(samples, variants);
+
+  Step2ComputeTimings timings;
+  if(!candidate.prepare_quantitative(residuals, design, products,
+       observed, true, &timings) ||
+     !reference.prepare_quantitative(residuals, design, products,
+       observed, true, nullptr))
+    throw std::runtime_error(
+      "complete packed quantitative preparation failed");
+  score_packed_and_compare(candidate, reference, block, observed,
+    nullptr, &timings, "complete packed quantitative");
+
+  for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype)
+    for(Eigen::Index sample = 0; sample < samples; ++sample)
+      observed(sample, phenotype) =
+        ((sample + 2 * phenotype) % 7) != 0;
+  if(!candidate.prepare_quantitative(residuals, design, products,
+       observed, false, &timings) ||
+     !reference.prepare_quantitative(residuals, design, products,
+       observed, false, nullptr))
+    throw std::runtime_error(
+      "missing packed quantitative preparation failed");
+  score_packed_and_compare(candidate, reference, block, observed,
+    nullptr, &timings, "missing packed quantitative");
+
+  const uint64_t packed_bytes = static_cast<uint64_t>(
+    variants * ((samples + 3) / 4));
+  if(timings.prepared_chromosomes != 2 || timings.scored_blocks != 2 ||
+     timings.scored_variants != 2 * static_cast<uint64_t>(variants) ||
+     timings.packed_upload_bytes != 2 * packed_bytes)
+    throw std::runtime_error(
+      "packed quantitative timing counters are invalid");
+}
+
+void check_packed_binary(Step2ComputeBackend& candidate,
+    Step2ComputeBackend& reference) {
+  const Eigen::Index samples = 17;
+  const Eigen::Index phenotypes = 4;
+  const Eigen::Index covariates = 3;
+  const Eigen::Index variants = 7;
+  const Eigen::MatrixXd residuals =
+    deterministic_matrix(samples, phenotypes, -0.41);
+  const Eigen::MatrixXd weights =
+    deterministic_matrix(samples, phenotypes, 0.22).array().abs() + 0.5;
+  std::vector<Eigen::MatrixXd> designs(phenotypes);
+  std::vector<Eigen::VectorXd> products(phenotypes);
+  for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype) {
+    designs[phenotype] = deterministic_matrix(samples, covariates,
+      0.07 * phenotype);
+    products[phenotype] = deterministic_matrix(covariates, 1,
+      -0.16 * phenotype);
+  }
+  Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> observed =
+    Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic>::Constant(
+      samples, phenotypes, true);
+  for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype)
+    for(Eigen::Index sample = 0; sample < samples; ++sample)
+      observed(sample, phenotype) =
+        ((2 * sample + phenotype) % 9) != 0;
+  const auto active =
+    Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(phenotypes, true);
+  const PackedHardcallBlock block =
+    deterministic_packed_hardcalls(samples, variants);
+
+  Step2ComputeTimings timings;
+  if(!candidate.prepare_binary(residuals, weights, designs, products,
+       observed, active, &timings) ||
+     !reference.prepare_binary(residuals, weights, designs, products,
+       observed, active, nullptr))
+    throw std::runtime_error("packed binary preparation failed");
+  score_packed_and_compare(candidate, reference, block, observed,
+    nullptr, &timings, "packed binary");
+  if(timings.prepared_chromosomes != 1 || timings.scored_blocks != 1 ||
+     timings.scored_variants != static_cast<uint64_t>(variants))
+    throw std::runtime_error("packed binary timing counters are invalid");
+}
+
+void check_packed_cox(Step2ComputeBackend& candidate,
+    Step2ComputeBackend& reference) {
+  const Eigen::Index samples = 17;
+  const Eigen::Index phenotypes = 4;
+  const Eigen::Index covariates = 2;
+  const Eigen::Index variants = 7;
+  std::vector<Eigen::VectorXd> score_residuals(phenotypes);
+  std::vector<Eigen::MatrixXd> weighted_designs(phenotypes);
+  std::vector<Eigen::MatrixXd> projections(phenotypes);
+  std::vector<Eigen::MatrixXd> projection_transforms(phenotypes);
+  std::vector<Eigen::VectorXd> projection_scores(phenotypes);
+  std::vector<Eigen::MatrixXd> projection_grams(phenotypes);
+  Eigen::VectorXd variances(phenotypes);
+  const Eigen::MatrixXd common_projection_design =
+    deterministic_matrix(samples, covariates, -0.71);
+  Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> observed =
+    Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic>::Constant(
+      samples, phenotypes, true);
+  Eigen::Array<bool, Eigen::Dynamic, 1> active =
+    Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(phenotypes, true);
+  active(phenotypes - 1) = false;
+  for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype) {
+    score_residuals[phenotype] =
+      deterministic_matrix(samples, 1, 0.11 * phenotype);
+    for(Eigen::Index sample = 0; sample < samples; ++sample) {
+      observed(sample, phenotype) =
+        ((sample + 3 * phenotype) % 11) != 0;
+      if(!observed(sample, phenotype))
+        score_residuals[phenotype](sample) = 0;
+    }
+    const Eigen::VectorXd weights =
+      deterministic_matrix(samples, 1,
+        0.19 * phenotype).array().abs() + 0.5;
+    weighted_designs[phenotype] =
+      common_projection_design.array().colwise() * weights.array();
+    projection_transforms[phenotype] =
+      (common_projection_design.transpose() *
+        weighted_designs[phenotype]).colPivHouseholderQr().inverse();
+    projections[phenotype] = common_projection_design *
+      projection_transforms[phenotype];
+    projection_scores[phenotype] = projections[phenotype].transpose() *
+      score_residuals[phenotype];
+    projection_grams[phenotype] =
+      projections[phenotype].transpose() * projections[phenotype];
+    variances(phenotype) = 0.8 + 0.1 * phenotype;
+  }
+  const PackedHardcallBlock block =
+    deterministic_packed_hardcalls(samples, variants);
+  const Eigen::RowVectorXd raw_squared_norms =
+    block.genotypes.colwise().squaredNorm();
+
+  Step2ComputeTimings timings;
+  if(!candidate.prepare_cox(score_residuals, weighted_designs,
+       projections, common_projection_design, projection_transforms,
+       projection_scores, projection_grams, variances, observed, active,
+       &timings) ||
+     !reference.prepare_cox(score_residuals, weighted_designs,
+       projections, common_projection_design, projection_transforms,
+       projection_scores, projection_grams, variances, observed, active,
+       nullptr))
+    throw std::runtime_error("packed Cox preparation failed");
+  score_packed_and_compare(candidate, reference, block, observed,
+    &raw_squared_norms, &timings, "packed Cox");
+  if(timings.prepared_chromosomes != 1 || timings.scored_blocks != 1 ||
+     timings.scored_variants != static_cast<uint64_t>(variants))
+    throw std::runtime_error("packed Cox timing counters are invalid");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    std::string requested_backend = "cpu";
+    int gpu_device = 0;
+    for(int argument = 1; argument < argc; ++argument) {
+      const std::string option = argv[argument];
+      if(option == "--backend" && argument + 1 < argc)
+        requested_backend = argv[++argument];
+      else if(option == "--gpu-device" && argument + 1 < argc)
+        gpu_device = std::atoi(argv[++argument]);
+      else
+        throw std::runtime_error(
+          "usage: step2_compute_test "
+          "[--backend cpu|auto|cuda] [--gpu-device N]");
+    }
+
     std::unique_ptr<Step2ComputeBackend> backend =
-      make_step2_compute_backend("cpu", 0);
-    check_quantitative(*backend);
-    check_binary(*backend);
-    check_cox(*backend);
-    std::cout << "Step 2 CPU block scoring conformance passed\n";
+      make_step2_compute_backend(requested_backend, gpu_device);
+    if(backend->uses_packed_hardcalls()) {
+      std::unique_ptr<Step2ComputeBackend> reference =
+        make_step2_compute_backend("cpu", 0);
+      check_packed_quantitative(*backend, *reference);
+      check_packed_binary(*backend, *reference);
+      check_packed_cox(*backend, *reference);
+    } else {
+      check_quantitative(*backend);
+      check_binary(*backend);
+      check_cox(*backend);
+    }
+    std::cout << "STEP2_BACKEND_TEST requested=" << requested_backend
+      << " active=" << backend->name() << " status=pass\n";
     return 0;
   } catch(const std::exception& error) {
     std::cerr << "ERROR: " << error.what() << '\n';
