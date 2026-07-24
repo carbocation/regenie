@@ -658,12 +658,10 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
   }
 
   if( run_full_test ){
-    if(gblock.step2_backend_scores_valid &&
-       isnp < gblock.step2_backend_score_numerators.cols() &&
-       gblock.step2_backend_score_numerators.rows() == params.n_pheno) {
-      num = gblock.step2_backend_score_numerators.col(isnp).array();
+    if(gblock.step2_backend_scores.has_variant(params.n_pheno, isnp)) {
+      num = gblock.step2_backend_scores.numerators().col(isnp).array();
       denum_arr =
-        gblock.step2_backend_score_denominators.col(isnp).array();
+        gblock.step2_backend_scores.denominators().col(isnp).array();
       dt_thr->stats = num / denum_arr.sqrt();
       if(params.htp_out) {
         dt_thr->scores = num;
@@ -894,13 +892,11 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
     MapArXb mask (pheno_data.masked_indivs.col(i).data(), params.n_samples, 1);
     MapcMatXd XWsqrt (m_ests.X_Gamma[i].data(), params.n_samples, m_ests.X_Gamma[i].cols());
     const bool use_backend_score =
-      gblock.step2_backend_scores_valid &&
-      isnp < gblock.step2_backend_score_numerators.cols() &&
-      i < gblock.step2_backend_score_numerators.rows();
+      gblock.step2_backend_scores.has_score(i, isnp);
 
     if(use_backend_score) {
       dt_thr->denum(i) =
-        gblock.step2_backend_score_denominators(i, isnp);
+        gblock.step2_backend_scores.denominators()(i, isnp);
     } else {
       // project out covariates from G
       if(dt_thr->is_sparse) {
@@ -929,7 +925,7 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
     // score test stat for BT
     if(use_backend_score)
       dt_thr->stats(i) =
-        gblock.step2_backend_score_numerators(i, isnp) / sqrt_denum;
+        gblock.step2_backend_scores.numerators()(i, isnp) / sqrt_denum;
     else if(dt_thr->is_sparse)
       dt_thr->stats(i) = GWs.dot(yres.col(i)) / sqrt_denum;
     else {
@@ -1099,14 +1095,13 @@ void compute_score_cox(int const& isnp, int const& snp_index, int const& chrom, 
     const MatrixXd& weighted_design = m_ests.cox_MLE_NULL[i].WX1;
     bool genotype_materialized = false;
     const bool use_backend_score =
-      gblock.step2_backend_scores_valid &&
-      isnp < gblock.step2_backend_score_numerators.cols() &&
-      i < gblock.step2_backend_score_numerators.rows();
+      !params.coxscore_exact &&
+      gblock.step2_backend_scores.has_score(i, isnp);
 
     if(use_backend_score) {
-      T = gblock.step2_backend_score_numerators(i, isnp);
+      T = gblock.step2_backend_scores.numerators()(i, isnp);
       dt_thr->denum(i) =
-        gblock.step2_backend_score_denominators(i, isnp);
+        gblock.step2_backend_scores.denominators()(i, isnp);
     } else if(params.coxscore_exact ||
        (i >= static_cast<int>(gblock.step2_cox_projection_gram.size()))) {
       if(dt_thr->is_sparse) {

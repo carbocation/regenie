@@ -4392,8 +4392,7 @@ void Data::test_snps_fast() {
         work->variants.resize(variant_count);
         allocate_mat(Gblock.Gmat, params.n_samples, variant_count);
 
-        Gblock.step2_backend_scores_valid = false;
-        Gblock.step2_backend_trait_counts_valid = false;
+        Gblock.step2_backend_scores.reset();
         const ProfileClock::time_point read_start = ProfileClock::now();
         readChunk(work->indices, chrom, work->encoded_variants,
           work->input_sizes, work->output_sizes, work->variants);
@@ -4444,27 +4443,24 @@ void Data::test_snps_fast() {
             params.total_n_block << "] : " << flush;
           if(params.profile_step2)
             accumulate_pipeline_timings(score.timings);
-          Gblock.step2_backend_scores_valid = score.valid;
-          Gblock.step2_backend_score_numerators.swap(score.numerators);
-          Gblock.step2_backend_score_denominators.swap(score.denominators);
-          Gblock.step2_backend_observed_allele_sums.swap(
+          Gblock.step2_backend_scores.begin_write();
+          Gblock.step2_backend_scores.numerator_output().swap(
+            score.numerators);
+          Gblock.step2_backend_scores.denominator_output().swap(
+            score.denominators);
+          Gblock.step2_backend_scores.observed_allele_sum_output().swap(
             score.observed_allele_sums);
-          Gblock.step2_backend_observed_nonmissing_counts.swap(
+          Gblock.step2_backend_scores.observed_nonmissing_count_output().swap(
             score.observed_nonmissing_counts);
-          Gblock.step2_backend_trait_counts_valid =
-            score.valid &&
-            Gblock.step2_backend_observed_allele_sums.rows() ==
-              params.n_pheno &&
-            Gblock.step2_backend_observed_allele_sums.cols() ==
-              work->variant_count &&
-            Gblock.step2_backend_observed_nonmissing_counts.rows() ==
-              params.n_pheno &&
-            Gblock.step2_backend_observed_nonmissing_counts.cols() ==
-              work->variant_count;
-          if(!score.valid)
+          if(!Gblock.step2_backend_scores.publish(score.valid,
+               params.n_pheno, work->variant_count))
             throw "Step 2 pipelined packed scoring failed";
 
-          if(Gblock.step2_backend_trait_counts_valid) {
+          if(Gblock.step2_backend_scores.trait_counts_valid()) {
+            const MatrixXd& observed_nonmissing_counts =
+              Gblock.step2_backend_scores.observed_nonmissing_counts();
+            const MatrixXd& observed_allele_sums =
+              Gblock.step2_backend_scores.observed_allele_sums();
             for(int variant = 0; variant < work->variant_count; ++variant) {
               variant_block& variant_info = work->variants[variant];
               const snp& marker = snpinfo[work->indices[variant]];
@@ -4473,11 +4469,9 @@ void Data::test_snps_fast() {
               for(int phenotype = 0; phenotype < params.n_pheno;
                   ++phenotype) {
                 const int nonmissing = static_cast<int>(
-                  Gblock.step2_backend_observed_nonmissing_counts(
-                    phenotype, variant));
+                  observed_nonmissing_counts(phenotype, variant));
                 const double allele_sum =
-                  Gblock.step2_backend_observed_allele_sums(
-                    phenotype, variant);
+                  observed_allele_sums(phenotype, variant);
                 variant_info.ns(phenotype) = nonmissing;
                 variant_info.af(phenotype) = nonmissing > 0 ?
                   allele_sum / (2.0 * nonmissing) : 0;
@@ -4593,8 +4587,7 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
   vector<uint64> indices(n_snps);
   std::iota(indices.begin(), indices.end(), start);
 
-  Gblock.step2_backend_scores_valid = false;
-  Gblock.step2_backend_trait_counts_valid = false;
+  Gblock.step2_backend_scores.reset();
   if(params.profile_step2) profile_stage_start = ProfileClock::now();
   readChunk(indices, chrom, snp_data_blocks, insize, outsize, all_snps_info);
   if(params.profile_step2) {
@@ -4612,6 +4605,8 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
     }
   }
   if(backend_block_eligible) {
+    Gblock.step2_backend_scores.begin_write();
+    bool scores_produced = false;
     vector<unsigned char> flipped(n_snps, 0);
     vector<unsigned char> sparse(n_snps, 0);
     for(int variant = 0; variant < n_snps; ++variant) {
@@ -4621,14 +4616,15 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
           params.n_samples * params.prop_zero_thr ? 1 : 0;
     }
     if(step2_compute_backend->uses_packed_hardcalls()) {
-      Gblock.step2_backend_scores_valid =
+      scores_produced =
         step2_compute_backend->score_packed_block(
           Gblock.step2_pgen_packed_hardcalls,
           Gblock.step2_pgen_packed_means, flipped, sparse,
-          params.n_samples, Gblock.step2_backend_score_numerators,
-          Gblock.step2_backend_score_denominators,
-          Gblock.step2_backend_observed_allele_sums,
-          Gblock.step2_backend_observed_nonmissing_counts,
+          params.n_samples,
+          Gblock.step2_backend_scores.numerator_output(),
+          Gblock.step2_backend_scores.denominator_output(),
+          Gblock.step2_backend_scores.observed_allele_sum_output(),
+          Gblock.step2_backend_scores.observed_nonmissing_count_output(),
           params.profile_step2 ? &step2_compute_timings : nullptr);
     } else {
       Eigen::RowVectorXd hardcall_squared_norms(n_snps);
@@ -4641,24 +4637,24 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
           std::isfinite(squared_norm) && squared_norm >= 0;
         hardcall_squared_norms(variant) = squared_norm;
       }
-      Gblock.step2_backend_scores_valid =
+      scores_produced =
         step2_compute_backend->score_dense_block(
           Gblock.Gmat.leftCols(n_snps), sparse,
           hardcall_squared_norms_valid ? &hardcall_squared_norms : nullptr,
-          Gblock.step2_backend_score_numerators,
-          Gblock.step2_backend_score_denominators,
+          Gblock.step2_backend_scores.numerator_output(),
+          Gblock.step2_backend_scores.denominator_output(),
           params.profile_step2 ? &step2_compute_timings : nullptr);
-      Gblock.step2_backend_observed_allele_sums.resize(0, 0);
-      Gblock.step2_backend_observed_nonmissing_counts.resize(0, 0);
+      Gblock.step2_backend_scores.observed_allele_sum_output().resize(0, 0);
+      Gblock.step2_backend_scores.observed_nonmissing_count_output().resize(
+        0, 0);
     }
-    Gblock.step2_backend_trait_counts_valid =
-      Gblock.step2_backend_scores_valid &&
-      Gblock.step2_backend_observed_allele_sums.rows() == params.n_pheno &&
-      Gblock.step2_backend_observed_allele_sums.cols() == n_snps &&
-      Gblock.step2_backend_observed_nonmissing_counts.rows() ==
-        params.n_pheno &&
-      Gblock.step2_backend_observed_nonmissing_counts.cols() == n_snps;
-    if(Gblock.step2_backend_trait_counts_valid) {
+    Gblock.step2_backend_scores.publish(scores_produced,
+      params.n_pheno, n_snps);
+    if(Gblock.step2_backend_scores.trait_counts_valid()) {
+      const MatrixXd& observed_nonmissing_counts =
+        Gblock.step2_backend_scores.observed_nonmissing_counts();
+      const MatrixXd& observed_allele_sums =
+        Gblock.step2_backend_scores.observed_allele_sums();
       for(int variant = 0; variant < n_snps; ++variant) {
         variant_block& variant_info = all_snps_info[variant];
         const snp& marker = snpinfo[indices[variant]];
@@ -4666,10 +4662,9 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
           params.forced_MAC : params.min_MAC;
         for(int phenotype = 0; phenotype < params.n_pheno; ++phenotype) {
           const int nonmissing = static_cast<int>(
-            Gblock.step2_backend_observed_nonmissing_counts(
-              phenotype, variant));
+            observed_nonmissing_counts(phenotype, variant));
           const double allele_sum =
-            Gblock.step2_backend_observed_allele_sums(phenotype, variant);
+            observed_allele_sums(phenotype, variant);
           variant_info.ns(phenotype) = nonmissing;
           variant_info.af(phenotype) = nonmissing > 0 ?
             allele_sum / (2.0 * nonmissing) : 0;
@@ -4681,7 +4676,7 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
         }
       }
     }
-    if(!Gblock.step2_backend_scores_valid &&
+    if(!Gblock.step2_backend_scores.valid() &&
        !Gblock.step2_pgen_direct_qt_enabled &&
        std::find(Gblock.step2_pgen_packed_unexpanded.begin(),
          Gblock.step2_pgen_packed_unexpanded.end(), 1) !=
@@ -4703,8 +4698,7 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
 
 void Data::prepare_step2_compute_backend() {
   step2_compute_backend->clear();
-  Gblock.step2_backend_scores_valid = false;
-  Gblock.step2_backend_trait_counts_valid = false;
+  Gblock.step2_backend_scores.reset();
 
   const bool packed_score_eligible =
     (params.file_type == "pgen") &&
@@ -5064,7 +5058,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   // sparse/dense per-variant implementation.
   const bool use_batched_dense_qt_score =
     batched_dense_qt_base_eligible &&
-    !Gblock.step2_backend_scores_valid &&
+    !Gblock.step2_backend_scores.valid() &&
     (dense_qt_score_candidates * 2 >= bs);
   if(use_batched_dense_qt_score) {
     const ProfileClock::time_point batch_start = ProfileClock::now();
@@ -5116,7 +5110,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         // otherwise dead work.  Correction tests still use the existing path
         // because SPA/Firth may need the materialized genotype.
         const bool backend_score_only =
-          Gblock.step2_backend_scores_valid &&
+          Gblock.step2_backend_scores.valid() &&
           !params.firth && !params.use_SPA;
         if (!params.w_interaction) {
           if(backend_score_only) {
@@ -5163,7 +5157,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         ScopedProfileTimer preprocess_timer(params.profile_step2 ?
           &preprocess_thread_ms[thread_num] : nullptr);
         // for QTs with non-sparse G: residualize and re-scale
-        if (!Gblock.step2_backend_scores_valid &&
+        if (!Gblock.step2_backend_scores.valid() &&
             !params.skip_cov_res && (params.trait_mode == 0) &&
             !Gblock.thread_data[thread_num].is_sparse &&
             !Gblock.thread_data[thread_num].qt_packed_direct) {

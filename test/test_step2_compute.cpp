@@ -45,6 +45,73 @@ void require_close(const Eigen::MatrixXd& actual,
       " conformance tolerance exceeded");
 }
 
+void check_capability_invariants(const Step2ComputeBackend& backend,
+    const char* label) {
+  if(backend.supports_packed_block_pipeline() &&
+     !backend.uses_packed_hardcalls())
+    throw std::runtime_error(std::string(label) +
+      " packed-pipeline capability is inconsistent");
+  if(!backend.uses_packed_hardcalls()) {
+    if(backend.supports_packed_block_pipeline())
+      throw std::runtime_error(std::string(label) +
+        " CPU backend unexpectedly supports the packed pipeline");
+    if(backend.prefers_loco_prediction_prefetch())
+      throw std::runtime_error(std::string(label) +
+        " CPU backend unexpectedly prefers LOCO prefetch");
+  }
+  if(backend.provides_observed_trait_counts() && !backend.ready())
+    throw std::runtime_error(std::string(label) +
+      " observed-count capability is inconsistent");
+}
+
+void check_score_batch_contract() {
+  const Eigen::Index phenotypes = 2;
+  const Eigen::Index variants = 3;
+  Step2ScoreBatch batch;
+  if(batch.valid() || batch.trait_counts_valid() ||
+     batch.has_variant(phenotypes, 0) || batch.has_score(0, 0))
+    throw std::runtime_error("new Step 2 score batch is unexpectedly valid");
+
+  batch.begin_write();
+  batch.numerator_output() =
+    Eigen::MatrixXd::Zero(phenotypes, variants);
+  batch.denominator_output() =
+    Eigen::MatrixXd::Zero(phenotypes, variants - 1);
+  batch.observed_allele_sum_output() =
+    Eigen::MatrixXd::Zero(phenotypes, variants);
+  batch.observed_nonmissing_count_output() =
+    Eigen::MatrixXd::Zero(phenotypes, variants);
+  if(batch.publish(true, phenotypes, variants) || batch.valid() ||
+     batch.trait_counts_valid())
+    throw std::runtime_error(
+      "Step 2 score batch accepted mismatched denominator dimensions");
+
+  batch.denominator_output() =
+    Eigen::MatrixXd::Zero(phenotypes, variants);
+  batch.observed_nonmissing_count_output() =
+    Eigen::MatrixXd::Zero(phenotypes - 1, variants);
+  if(!batch.publish(true, phenotypes, variants) || !batch.valid() ||
+     batch.trait_counts_valid())
+    throw std::runtime_error(
+      "Step 2 score batch did not reject mismatched trait-count dimensions");
+
+  batch.observed_nonmissing_count_output() =
+    Eigen::MatrixXd::Zero(phenotypes, variants);
+  if(!batch.publish(true, phenotypes, variants) ||
+     !batch.trait_counts_valid() ||
+     !batch.has_variant(phenotypes, variants - 1) ||
+     batch.has_variant(phenotypes, variants) ||
+     !batch.has_score(phenotypes - 1, variants - 1) ||
+     batch.has_score(phenotypes, 0))
+    throw std::runtime_error(
+      "Step 2 score batch publication contract is invalid");
+
+  batch.reset();
+  if(batch.valid() || batch.trait_counts_valid() ||
+     batch.has_variant(phenotypes, 0) || batch.has_score(0, 0))
+    throw std::runtime_error("Step 2 score batch reset retained valid state");
+}
+
 struct PackedHardcallBlock {
   Eigen::MatrixXd genotypes;
   std::vector<std::vector<unsigned char>> packed;
@@ -443,7 +510,7 @@ void check_cox(Step2ComputeBackend& backend) {
 }
 
 void check_packed_quantitative(Step2ComputeBackend& candidate,
-    Step2ComputeBackend& reference) {
+    Step2ComputeBackend& reference, bool allow_workflow_fallback) {
   const Eigen::Index samples = 17;
   const Eigen::Index phenotypes = 16;
   const Eigen::Index covariates = 3;
@@ -460,14 +527,46 @@ void check_packed_quantitative(Step2ComputeBackend& candidate,
     deterministic_packed_hardcalls(samples, variants);
 
   Step2ComputeTimings timings;
-  if(!candidate.prepare_quantitative(residuals, design, products,
-       observed, true, &timings) ||
-     !reference.prepare_quantitative(residuals, design, products,
+  const bool candidate_prepared = candidate.prepare_quantitative(
+    residuals, design, products, observed, true, &timings);
+  if(!reference.prepare_quantitative(residuals, design, products,
        observed, true, nullptr))
     throw std::runtime_error(
       "complete packed quantitative preparation failed");
+  if(!candidate_prepared) {
+    if(!allow_workflow_fallback || candidate.ready() ||
+       std::string(candidate.name()) != "cpu" ||
+       candidate.prefers_loco_prediction_prefetch())
+      throw std::runtime_error(
+        "automatic quantitative workflow fallback is invalid");
+    check_capability_invariants(candidate,
+      "automatic quantitative fallback backend");
+    check_quantitative(reference);
+    return;
+  }
+  check_capability_invariants(candidate,
+    "prepared packed quantitative backend");
+  if(!candidate.prefers_loco_prediction_prefetch())
+    throw std::runtime_error(
+      "prepared CUDA backend does not prefer LOCO prefetch");
   score_packed_and_compare(candidate, reference, block, observed,
     nullptr, &timings, "complete packed quantitative");
+
+  candidate.clear();
+  if(candidate.ready() || candidate.provides_observed_trait_counts())
+    throw std::runtime_error("cleared CUDA backend retained prepared state");
+  check_capability_invariants(candidate, "cleared CUDA backend");
+  const bool explicit_cuda = std::string(candidate.name()) == "cuda";
+  if(candidate.prefers_loco_prediction_prefetch() != explicit_cuda)
+    throw std::runtime_error(
+      "cleared CUDA LOCO-prefetch preference is invalid");
+  Eigen::MatrixXd rejected_numerators, rejected_denominators;
+  Eigen::MatrixXd rejected_allele_sums, rejected_nonmissing_counts;
+  if(candidate.score_packed_block(block.packed, block.missing_means,
+       block.flipped, block.sparse, samples, rejected_numerators,
+       rejected_denominators, rejected_allele_sums,
+       rejected_nonmissing_counts, nullptr))
+    throw std::runtime_error("cleared CUDA backend accepted packed scoring");
 
   for(Eigen::Index phenotype = 0; phenotype < phenotypes; ++phenotype)
     for(Eigen::Index sample = 0; sample < samples; ++sample)
@@ -479,6 +578,8 @@ void check_packed_quantitative(Step2ComputeBackend& candidate,
        observed, false, nullptr))
     throw std::runtime_error(
       "missing packed quantitative preparation failed");
+  check_capability_invariants(candidate,
+    "reprepared packed quantitative backend");
   score_packed_and_compare(candidate, reference, block, observed,
     nullptr, &timings, "missing packed quantitative");
 
@@ -606,6 +707,7 @@ void check_packed_cox(Step2ComputeBackend& candidate,
 
 int main(int argc, char** argv) {
   try {
+    check_score_batch_contract();
     std::string requested_backend = "cpu";
     int gpu_device = 0;
     for(int argument = 1; argument < argc; ++argument) {
@@ -622,10 +724,24 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<Step2ComputeBackend> backend =
       make_step2_compute_backend(requested_backend, gpu_device);
+    check_capability_invariants(*backend, "new Step 2 backend");
+    const std::string initial_backend = backend->name();
+    if(initial_backend == "cuda" || initial_backend == "auto") {
+      if(!backend->uses_packed_hardcalls() ||
+         !backend->supports_packed_block_pipeline())
+        throw std::runtime_error(
+          "CUDA backend omitted a required packed-path capability");
+      const bool expected_initial_prefetch = requested_backend == "cuda";
+      if(backend->prefers_loco_prediction_prefetch() !=
+         expected_initial_prefetch)
+        throw std::runtime_error(
+          "initial CUDA LOCO-prefetch preference is invalid");
+    }
     if(backend->uses_packed_hardcalls()) {
       std::unique_ptr<Step2ComputeBackend> reference =
         make_step2_compute_backend("cpu", 0);
-      check_packed_quantitative(*backend, *reference);
+      check_packed_quantitative(*backend, *reference,
+        requested_backend == "auto");
       check_packed_binary(*backend, *reference);
       check_packed_cox(*backend, *reference);
     } else {

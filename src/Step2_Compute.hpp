@@ -52,6 +52,96 @@ struct Step2ComputeTimings {
   double finalize_ms = 0;
 };
 
+class Step2ScoreBatch {
+ public:
+  void begin_write() {
+    scores_valid_ = false;
+    trait_counts_valid_ = false;
+  }
+
+  void reset() {
+    begin_write();
+  }
+
+  bool publish(bool scored, Eigen::Index phenotypes,
+      Eigen::Index variants) {
+    scores_valid_ = scored &&
+      numerators_.rows() == phenotypes &&
+      numerators_.cols() == variants &&
+      denominators_.rows() == phenotypes &&
+      denominators_.cols() == variants;
+    trait_counts_valid_ = scores_valid_ &&
+      observed_allele_sums_.rows() == phenotypes &&
+      observed_allele_sums_.cols() == variants &&
+      observed_nonmissing_counts_.rows() == phenotypes &&
+      observed_nonmissing_counts_.cols() == variants;
+    return scores_valid_;
+  }
+
+  bool valid() const {
+    return scores_valid_;
+  }
+
+  bool has_variant(Eigen::Index phenotypes, Eigen::Index variant) const {
+    return scores_valid_ &&
+      numerators_.rows() == phenotypes &&
+      denominators_.rows() == phenotypes &&
+      numerators_.cols() == denominators_.cols() &&
+      variant >= 0 &&
+      variant < numerators_.cols() &&
+      variant < denominators_.cols();
+  }
+
+  bool has_score(Eigen::Index phenotype, Eigen::Index variant) const {
+    return scores_valid_ &&
+      phenotype >= 0 && variant >= 0 &&
+      numerators_.rows() == denominators_.rows() &&
+      numerators_.cols() == denominators_.cols() &&
+      phenotype < numerators_.rows() &&
+      phenotype < denominators_.rows() &&
+      variant < numerators_.cols() &&
+      variant < denominators_.cols();
+  }
+
+  bool trait_counts_valid() const {
+    return trait_counts_valid_;
+  }
+
+  Eigen::MatrixXd& numerator_output() {
+    begin_write();
+    return numerators_;
+  }
+  Eigen::MatrixXd& denominator_output() {
+    begin_write();
+    return denominators_;
+  }
+  Eigen::MatrixXd& observed_allele_sum_output() {
+    begin_write();
+    return observed_allele_sums_;
+  }
+  Eigen::MatrixXd& observed_nonmissing_count_output() {
+    begin_write();
+    return observed_nonmissing_counts_;
+  }
+
+  const Eigen::MatrixXd& numerators() const { return numerators_; }
+  const Eigen::MatrixXd& denominators() const { return denominators_; }
+  const Eigen::MatrixXd& observed_allele_sums() const {
+    return observed_allele_sums_;
+  }
+  const Eigen::MatrixXd& observed_nonmissing_counts() const {
+    return observed_nonmissing_counts_;
+  }
+
+ private:
+  Eigen::MatrixXd numerators_;
+  Eigen::MatrixXd denominators_;
+  Eigen::MatrixXd observed_allele_sums_;
+  Eigen::MatrixXd observed_nonmissing_counts_;
+  bool scores_valid_ = false;
+  bool trait_counts_valid_ = false;
+};
+
 class Step2ComputeBackend {
  public:
   virtual ~Step2ComputeBackend() {}
