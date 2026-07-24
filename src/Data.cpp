@@ -112,6 +112,65 @@ struct Step2PipelineScoreResult {
   Step2ComputeTimings timings;
 };
 
+struct Step2PipelineCompletion {
+  std::shared_ptr<Step2PipelineBlock> work;
+  Step2PipelineScoreResult score;
+  ProfileClock::time_point compute_start;
+};
+
+class Step2PackedPipelineSession {
+ public:
+  Step2PackedPipelineSession(Step2ComputeBackend* backend,
+      Eigen::Index samples, bool profile) :
+      backend_(backend), samples_(samples), profile_(profile) {}
+
+  ~Step2PackedPipelineSession() {
+    if(pending_score_.valid()) pending_score_.wait();
+  }
+
+  bool has_pending() const {
+    return pending_score_.valid();
+  }
+
+  void submit(const std::shared_ptr<Step2PipelineBlock>& work) {
+    if(has_pending())
+      throw std::logic_error("Step 2 packed pipeline already has pending work");
+    pending_work_ = work;
+    Step2ComputeBackend* backend = backend_;
+    const Eigen::Index samples = samples_;
+    const bool profile = profile_;
+    pending_score_ = std::async(std::launch::async,
+      [backend, work, samples, profile]() {
+        Step2PipelineScoreResult result;
+        result.valid = backend->score_packed_block(
+          work->packed_hardcalls, work->missing_means,
+          work->flipped, work->sparse, samples,
+          result.numerators, result.denominators,
+          result.observed_allele_sums,
+          result.observed_nonmissing_counts,
+          profile ? &result.timings : nullptr);
+        return result;
+      });
+  }
+
+  Step2PipelineCompletion take() {
+    if(!has_pending())
+      throw std::logic_error("Step 2 packed pipeline has no pending work");
+    Step2PipelineCompletion completed;
+    completed.compute_start = ProfileClock::now();
+    completed.work = std::move(pending_work_);
+    completed.score = pending_score_.get();
+    return completed;
+  }
+
+ private:
+  Step2ComputeBackend* backend_;
+  Eigen::Index samples_;
+  bool profile_;
+  std::shared_ptr<Step2PipelineBlock> pending_work_;
+  std::future<Step2PipelineScoreResult> pending_score_;
+};
+
 struct Step2LocoPrefetchResult {
   Eigen::MatrixXd predictions;
   double service_ms = 0;
@@ -4357,25 +4416,6 @@ void Data::test_snps_fast() {
         return work;
       };
 
-      const auto submit_pipeline_score =
-        [&](const std::shared_ptr<Step2PipelineBlock>& work) {
-          Step2ComputeBackend* backend = step2_compute_backend.get();
-          const Eigen::Index samples = params.n_samples;
-          const bool profile = params.profile_step2;
-          return std::async(std::launch::async,
-            [backend, work, samples, profile]() {
-              Step2PipelineScoreResult result;
-              result.valid = backend->score_packed_block(
-                work->packed_hardcalls, work->missing_means,
-                work->flipped, work->sparse, samples,
-                result.numerators, result.denominators,
-                result.observed_allele_sums,
-                result.observed_nonmissing_counts,
-                profile ? &result.timings : nullptr);
-              return result;
-            });
-        };
-
       const auto accumulate_pipeline_timings =
         [&](const Step2ComputeTimings& timings) {
           step2_compute_timings.scored_blocks += timings.scored_blocks;
@@ -4460,9 +4500,8 @@ void Data::test_snps_fast() {
             elapsed_ms(work->wall_start)) << "ms) " << endl;
         };
 
-      std::shared_ptr<Step2PipelineBlock> pending_work;
-      std::future<Step2PipelineScoreResult> pending_score;
-      bool pipeline_pending = false;
+      Step2PackedPipelineSession pipeline(step2_compute_backend.get(),
+        params.n_samples, params.profile_step2);
       for(int bb = 0; bb < chrom_nb; ++bb) {
         get_block_size(params.block_size, chrom_nsnps, bb, bs);
 
@@ -4483,26 +4522,21 @@ void Data::test_snps_fast() {
         snp_tally.snp_count += bs;
         block++;
 
-        if(!pipeline_pending) {
-          pending_work = current_work;
-          pending_score = submit_pipeline_score(pending_work);
-          pipeline_pending = true;
+        if(!pipeline.has_pending()) {
+          pipeline.submit(current_work);
           continue;
         }
 
-        const ProfileClock::time_point compute_start = ProfileClock::now();
-        Step2PipelineScoreResult completed_score = pending_score.get();
-        std::future<Step2PipelineScoreResult> current_score =
-          submit_pipeline_score(current_work);
-        finish_pipeline_block(pending_work, completed_score, compute_start);
-        pending_work = current_work;
-        pending_score = std::move(current_score);
+        Step2PipelineCompletion completed = pipeline.take();
+        pipeline.submit(current_work);
+        finish_pipeline_block(completed.work, completed.score,
+          completed.compute_start);
       }
 
-      if(pipeline_pending) {
-        const ProfileClock::time_point compute_start = ProfileClock::now();
-        Step2PipelineScoreResult completed_score = pending_score.get();
-        finish_pipeline_block(pending_work, completed_score, compute_start);
+      if(pipeline.has_pending()) {
+        Step2PipelineCompletion completed = pipeline.take();
+        finish_pipeline_block(completed.work, completed.score,
+          completed.compute_start);
       }
 
     } else {
