@@ -282,9 +282,11 @@ user-facing algorithm choices. Boolean flags accept only `0` or `1`; invalid
 values throw.
 
 CUDA code is compiled only with `-DREGENIE_WITH_CUDA=ON`;
-`REGENIE_CUDA_ARCHITECTURES` selects the generated device targets. At runtime,
-`--gpu-device` selects a visible device, while `--step1-profile` and
-`--step2-profile` expose backend placement and phase timings.
+`REGENIE_CUDA_ARCHITECTURES` selects the generated device targets. Stage 2
+CUDA is included by default and can be omitted independently with
+`-DREGENIE_WITH_STEP2_CUDA=OFF`. At runtime, `--gpu-device` selects a visible
+device, while `--step1-profile` and `--step2-profile` expose backend placement
+and phase timings.
 
 ### CUDA and Step 1
 
