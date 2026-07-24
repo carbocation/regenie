@@ -89,6 +89,8 @@ class CpuStep2ComputeBackend : public Step2ComputeBackend {
   }
   bool ready() const override { return mode_ != CpuScoreMode::none; }
   bool uses_packed_hardcalls() const override { return false; }
+  bool prefers_loco_prediction_prefetch() const override { return false; }
+  bool supports_packed_block_pipeline() const override { return false; }
   bool provides_observed_trait_counts() const override { return false; }
   void clear() override {
     mode_ = CpuScoreMode::none;

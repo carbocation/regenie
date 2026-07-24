@@ -406,6 +406,10 @@ class CudaStep2ComputeBackend : public Step2ComputeBackend {
 
   bool ready() const override { return mode_ != ScoreMode::none; }
   bool uses_packed_hardcalls() const override { return true; }
+  bool prefers_loco_prediction_prefetch() const override {
+    return ready() || (!automatic_ && !attempted_);
+  }
+  bool supports_packed_block_pipeline() const override { return true; }
   bool provides_observed_trait_counts() const override {
     return ready() && trait_counts_required_;
   }

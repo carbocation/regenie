@@ -4241,7 +4241,7 @@ void Data::test_snps_fast() {
           !params.firth && !params.use_SPA && !params.w_interaction &&
           params.file_type == "pgen" && params.start_block <= 1 &&
           step2_compute_backend &&
-          std::string(step2_compute_backend->name()) == "cuda";
+          step2_compute_backend->prefers_loco_prediction_prefetch();
         if(can_prefetch_loco && !step2_loco_prefetch_pending) {
           int next_chromosome = 0;
           for(size_t next_index = chromosome_index + 1;
@@ -4299,7 +4299,7 @@ void Data::test_snps_fast() {
 
     bool use_step2_pipeline =
       step2_compute_backend->ready() &&
-      step2_compute_backend->uses_packed_hardcalls() &&
+      step2_compute_backend->supports_packed_block_pipeline() &&
       params.file_type == "pgen" &&
       !params.firth && !params.use_SPA;
     if(use_step2_pipeline && params.skip_dosage_comp) {
@@ -4315,7 +4315,7 @@ void Data::test_snps_fast() {
 
     if(use_step2_pipeline) {
       if(!step2_pipeline_notice_printed) {
-        sout << " * Step 2 CUDA two-block pipeline : [enabled]\n";
+        sout << " * Step 2 packed two-block pipeline : [enabled]\n";
         step2_pipeline_notice_printed = true;
       }
 

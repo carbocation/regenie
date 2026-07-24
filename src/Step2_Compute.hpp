@@ -60,6 +60,8 @@ class Step2ComputeBackend {
   virtual std::string description() const = 0;
   virtual bool ready() const = 0;
   virtual bool uses_packed_hardcalls() const = 0;
+  virtual bool prefers_loco_prediction_prefetch() const = 0;
+  virtual bool supports_packed_block_pipeline() const = 0;
   virtual bool provides_observed_trait_counts() const = 0;
   virtual void clear() = 0;
 
