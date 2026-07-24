@@ -2,6 +2,10 @@
 
 #include "Step1_Compute.hpp"
 
+#ifdef WITH_CUDA
+#include "Cuda_Resources.hpp"
+#endif
+
 #include <Eigen/Dense>
 
 #include <algorithm>
@@ -12,11 +16,97 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+#ifdef WITH_CUDA
+static_assert(
+  !std::is_copy_constructible<regenie::cuda::EventPair>::value,
+  "CUDA event ownership must not be copyable");
+static_assert(
+  !std::is_move_constructible<regenie::cuda::EventPair>::value,
+  "CUDA event ownership must not be movable");
+static_assert(
+  !std::is_copy_constructible<regenie::cuda::HostRegistration>::value,
+  "CUDA host-registration ownership must not be copyable");
+static_assert(
+  std::is_nothrow_move_constructible<
+    regenie::cuda::HostRegistration>::value,
+  "CUDA host-registration ownership must be nothrow movable");
+static_assert(
+  std::is_nothrow_move_assignable<
+    regenie::cuda::HostRegistration>::value,
+  "CUDA host-registration ownership must be nothrow move assignable");
+
+void check_cuda_resource_ownership() {
+  const size_t region_size = 64 * 1024;
+  const size_t region_stride = 1024 * 1024;
+  std::vector<unsigned char> storage(3 * region_stride);
+  void* first_pointer = storage.data();
+  void* second_pointer = storage.data() + region_stride;
+  void* scoped_pointer = storage.data() + 2 * region_stride;
+
+  regenie::cuda::HostRegistration source;
+  regenie::cuda::HostRegistration destination;
+  if(!source.try_register(first_pointer, region_size) ||
+     !destination.try_register(second_pointer, region_size)) {
+    source.unregister_now();
+    destination.unregister_now();
+    std::cout << "STEP1_BACKEND_TEST case=cuda_resource_ownership"
+              << " host_registration_supported=0 status=PASS\n";
+    return;
+  }
+
+  regenie::cuda::HostRegistration moved(std::move(source));
+  if(source.registered() || !moved.registered())
+    throw std::runtime_error(
+      "CUDA host-registration move construction lost ownership");
+
+  destination = std::move(moved);
+  if(moved.registered() || !destination.registered())
+    throw std::runtime_error(
+      "CUDA host-registration move assignment lost ownership");
+
+  regenie::cuda::HostRegistration released_destination;
+  if(!released_destination.try_register(second_pointer, region_size))
+    throw std::runtime_error(
+      "CUDA host-registration move assignment did not release prior state");
+  if(destination.unregister_now() != cudaSuccess ||
+     destination.registered() ||
+     destination.unregister_now() != cudaSuccess ||
+     released_destination.unregister_now() != cudaSuccess)
+    throw std::runtime_error(
+      "CUDA host-registration explicit release was not idempotent");
+
+  {
+    regenie::cuda::HostRegistration scoped;
+    if(!scoped.try_register(scoped_pointer, region_size))
+      throw std::runtime_error(
+        "CUDA scoped host registration was unavailable");
+  }
+  regenie::cuda::HostRegistration destructor_probe;
+  if(!destructor_probe.try_register(scoped_pointer, region_size) ||
+     destructor_probe.unregister_now() != cudaSuccess)
+    throw std::runtime_error(
+      "CUDA host-registration destructor did not release ownership");
+
+  regenie::cuda::EventPair events;
+  events.record_start();
+  const double event_ms = events.record_stop_and_elapsed_ms();
+  if(!std::isfinite(event_ms) || event_ms < 0)
+    throw std::runtime_error("CUDA event guard returned invalid elapsed time");
+
+  std::cout << "STEP1_BACKEND_TEST case=cuda_resource_ownership"
+            << " host_registration_supported=1"
+            << " event_ms=" << event_ms
+            << " status=PASS\n";
+}
+#endif
 
 struct Options {
   std::string backend = "cpu";
@@ -380,12 +470,13 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
   if(covariate_solver.info() != Eigen::Success)
     throw std::runtime_error(
       "packed hardcall covariate setup failed");
-  const Eigen::MatrixXd covariates = raw_covariates *
+  Eigen::MatrixXd covariates = raw_covariates *
     covariate_solver.eigenvectors() *
     covariate_solver.eigenvalues().array().sqrt().inverse().matrix().asDiagonal() *
     covariate_solver.eigenvectors().transpose();
   const double degrees_of_freedom =
     sample_weights.sum() - covariates.cols();
+  const Eigen::MatrixXd packed_reference_input = imputed;
   Eigen::VectorXd expected_scales;
   const Eigen::VectorXd no_multipliers;
   reference_preprocess_genotypes(imputed, covariates, sample_weights,
@@ -828,6 +919,11 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
          samples, ridge_parameters.size()))
       throw std::runtime_error(
         "normalized cached ridge conformance tolerance exceeded");
+    if(candidate.ridge_predict_cached_preprocessed_systems(
+         cached_fold_starts, cached_fold_counts, ridge_parameters,
+         cached_fold_predictions, cached_fold_coefficients))
+      throw std::runtime_error(
+        "genotype fold systems survived Level 1 design activation");
     candidate.release_level1_design_cache();
   }
   candidate.release_preprocessed_genotypes();
@@ -855,6 +951,52 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
   if(!rejected_negative_weight || !rejected_short_buffer)
     throw std::runtime_error(
       "packed hardcall preprocessing validation conformance failed");
+
+  Eigen::MatrixXd dense_probe = packed_reference_input.topRows(1);
+  Eigen::VectorXd dense_probe_scales;
+  candidate.preprocess_genotypes(
+    dense_probe, covariates, sample_weights, degrees_of_freedom, 1e-12,
+    no_multipliers, false, dense_probe_scales);
+  covariates.col(0).array() +=
+    0.02 * deterministic_matrix(samples, 1, 0.41).col(0).array();
+  Eigen::MatrixXd expected_after_static_invalidation =
+    packed_reference_input;
+  Eigen::VectorXd expected_scales_after_static_invalidation;
+  reference_preprocess_genotypes(
+    expected_after_static_invalidation, covariates, sample_weights,
+    degrees_of_freedom, no_multipliers,
+    expected_scales_after_static_invalidation);
+  const double static_invalidation_signal = relative_error(
+    expected_after_static_invalidation, imputed);
+  if(static_invalidation_signal <= 100 * preprocessing_tolerance)
+    throw std::runtime_error(
+      "packed static-input invalidation test perturbation was too small");
+  Eigen::VectorXd scales_after_static_invalidation;
+  if(!candidate.preprocess_packed_hardcalls(
+       packed.data(), packed.size(), stride, rows, samples,
+       covariates, sample_weights, degrees_of_freedom, 1e-12,
+       scales_after_static_invalidation))
+    throw std::runtime_error(
+      "packed hardcall preprocessing failed after static-input invalidation");
+  const double static_invalidation_scale_error =
+    (scales_after_static_invalidation -
+      expected_scales_after_static_invalidation).cwiseAbs().maxCoeff() /
+    std::max(1.0,
+      expected_scales_after_static_invalidation.cwiseAbs().maxCoeff());
+  candidate.compute_preprocessed_products(
+    0, samples, outcomes, actual_gram, actual_crossproduct,
+    Step1GramMode::full_product);
+  if(static_invalidation_scale_error > preprocessing_tolerance ||
+     relative_error(actual_gram,
+       expected_after_static_invalidation *
+         expected_after_static_invalidation.transpose()) >
+       gram_tolerance ||
+     relative_error(actual_crossproduct,
+       expected_after_static_invalidation * outcomes) >
+       preprocessing_tolerance)
+    throw std::runtime_error(
+      "packed static inputs were reused after dense preprocessing");
+  candidate.release_preprocessed_genotypes();
 
   std::cout << "STEP1_BACKEND_TEST case=packed_hardcall_preprocessing"
             << " supported=1"
@@ -884,6 +1026,10 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
               normalized_cached_prediction_error
             << " multi_normalized_cached_prediction_relative_error=" <<
               multi_normalized_cached_prediction_error
+            << " static_invalidation_scale_relative_error=" <<
+              static_invalidation_scale_error
+            << " static_invalidation_signal=" <<
+              static_invalidation_signal
             << " status=PASS\n";
 }
 
@@ -978,6 +1124,11 @@ void check_persistent_level1_design_cache(
       "persistent Level 1 design cache conformance tolerance exceeded");
 
   candidate.release_level1_design_cache();
+  if(candidate.ridge_predict_cached_preprocessed_systems(
+       fold_starts, fold_sizes, ridge_parameters,
+       fold_predictions, fold_coefficients))
+    throw std::runtime_error(
+      "design fold systems survived Level 1 cache release");
   bool rejected_released_design = false;
   try {
     candidate.predict_cached_design(prediction_coefficients, predictions);
@@ -2628,6 +2779,10 @@ int main(int argc, char** argv) {
       make_step1_compute_backend(options.backend, options.device);
     std::cout << "STEP1_BACKEND_TEST backend=" << backend->name()
               << " description=\"" << backend->description() << "\"\n";
+#ifdef WITH_CUDA
+    if(std::string(backend->name()) == "cuda")
+      check_cuda_resource_ownership();
+#endif
     run_conformance(*backend);
     if(options.benchmark) {
       run_benchmark(*backend, options);
