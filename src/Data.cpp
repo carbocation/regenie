@@ -176,6 +176,52 @@ struct Step2LocoPrefetchResult {
   double service_ms = 0;
 };
 
+class Step2LocoPrefetchSession {
+ public:
+  ~Step2LocoPrefetchSession() {
+    if(future_.valid()) future_.wait();
+  }
+
+  bool has_pending() const {
+    return future_.valid();
+  }
+
+  bool pending_for(int chromosome) const {
+    return has_pending() && chromosome_ == chromosome;
+  }
+
+  template<typename Task>
+  void start(int chromosome, Task&& task) {
+    if(has_pending())
+      throw std::logic_error("Step 2 LOCO prefetch already has pending work");
+    chromosome_ = chromosome;
+    try {
+      future_ = std::async(std::launch::async, std::forward<Task>(task));
+    } catch(...) {
+      chromosome_ = 0;
+      throw;
+    }
+  }
+
+  Step2LocoPrefetchResult take(int chromosome) {
+    if(!pending_for(chromosome))
+      throw std::logic_error(
+        "Step 2 LOCO prefetch chromosome does not match");
+    try {
+      Step2LocoPrefetchResult result = future_.get();
+      chromosome_ = 0;
+      return result;
+    } catch(...) {
+      chromosome_ = 0;
+      throw;
+    }
+  }
+
+ private:
+  int chromosome_ = 0;
+  std::future<Step2LocoPrefetchResult> future_;
+};
+
 class ScopedProfileTimer {
   public:
     explicit ScopedProfileTimer(double* elapsed_ms)
@@ -4236,9 +4282,7 @@ void Data::test_snps_fast() {
      params.trait_mode == 3);
   bool step2_invariant_null_ready = false;
   bool step2_invariant_null_notice_printed = false;
-  std::future<Step2LocoPrefetchResult> step2_loco_prefetch_future;
-  bool step2_loco_prefetch_pending = false;
-  int step2_loco_prefetch_chromosome = 0;
+  Step2LocoPrefetchSession step2_loco_prefetch;
   bool step2_loco_prefetch_notice_printed = false;
 
 
@@ -4271,15 +4315,13 @@ void Data::test_snps_fast() {
       // read polygenic effect predictions from step 1
       if(!reuse_invariant_null) {
         if(params.profile_step2) profile_stage_start = ProfileClock::now();
-        if(step2_loco_prefetch_pending &&
-           step2_loco_prefetch_chromosome == chrom) {
+        if(step2_loco_prefetch.pending_for(chrom)) {
           sout << "   -using prefetched loco predictions for the chromosome..." <<
             flush;
           const ProfileClock::time_point wait_start = ProfileClock::now();
           Step2LocoPrefetchResult prefetched =
-            step2_loco_prefetch_future.get();
+            step2_loco_prefetch.take(chrom);
           const double wait_ms = elapsed_ms(wait_start);
-          step2_loco_prefetch_pending = false;
           m_ests.blups.swap(prefetched.predictions);
           sout << "done (" << static_cast<long long>(
             prefetched.service_ms) << "ms service; " <<
@@ -4301,7 +4343,7 @@ void Data::test_snps_fast() {
           params.file_type == "pgen" && params.start_block <= 1 &&
           step2_compute_backend &&
           step2_compute_backend->prefers_loco_prediction_prefetch();
-        if(can_prefetch_loco && !step2_loco_prefetch_pending) {
+        if(can_prefetch_loco && !step2_loco_prefetch.has_pending()) {
           int next_chromosome = 0;
           for(size_t next_index = chromosome_index + 1;
               next_index < files.chr_read.size(); ++next_index) {
@@ -4317,9 +4359,8 @@ void Data::test_snps_fast() {
               sout << " * Step 2 LOCO prediction prefetch : [enabled]\n";
               step2_loco_prefetch_notice_printed = true;
             }
-            step2_loco_prefetch_chromosome = next_chromosome;
             const ArrayXb phenotypes_to_read = params.pheno_pass;
-            step2_loco_prefetch_future = std::async(std::launch::async,
+            step2_loco_prefetch.start(next_chromosome,
               [this, next_chromosome, phenotypes_to_read]() {
                 Step2LocoPrefetchResult result;
                 const ProfileClock::time_point service_start =
@@ -4331,7 +4372,6 @@ void Data::test_snps_fast() {
                 result.service_ms = elapsed_ms(service_start);
                 return result;
               });
-            step2_loco_prefetch_pending = true;
           }
         }
 
