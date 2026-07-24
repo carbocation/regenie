@@ -497,6 +497,162 @@ void cache_concatenated_level1_predictions(
     std::chrono::high_resolution_clock::now() - wall_start).count();
 }
 
+struct LogisticLevel1Profile {
+  Step1ComputeTimings backend;
+  double read_l0_ms = 0;
+  double read_l0_wait_ms = 0;
+  double check_l0_ms = 0;
+  double cache_wall_ms = 0;
+  double irls_wall_ms = 0;
+  double path_newton_wall_ms = 0;
+  double validation_ms = 0;
+  double prediction_cache_wall_ms = 0;
+  double prediction_cache_write_ms = 0;
+  uint64_t prediction_cache_bytes = 0;
+  uint64_t prediction_cache_phenotypes = 0;
+  uint64_t irls_iterations = 0;
+  uint64_t line_search_iterations = 0;
+  uint64_t prediction_calls = 0;
+  uint64_t weighted_product_calls = 0;
+  uint64_t score_calls = 0;
+  uint64_t solve_calls = 0;
+  uint64_t path_newton_solves = 0;
+  uint64_t path_newton_score_calls = 0;
+  uint64_t path_newton_converged_models = 0;
+  uint64_t resident_design_phenotypes = 0;
+
+  Step1ComputeTimings* backend_timings(bool enabled) {
+    return enabled ? &backend : nullptr;
+  }
+
+  void write(
+    const struct param* params, bool use_l0_prefetch,
+    const std::chrono::high_resolution_clock::time_point& wall_start,
+    mstream& sout) const {
+
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - wall_start).count();
+    const double backend_ms = backend.upload_ms +
+      backend.crossproduct_ms + backend.gram_ms +
+      backend.ridge_ms + backend.download_ms;
+    std::ostringstream profile;
+    profile << std::fixed << std::setprecision(3)
+      << "STEP1_PROFILE scope=level1_logistic"
+      << " wall_ms=" << wall_ms
+      << " read_l0_ms=" << read_l0_ms
+      << " read_l0_wait_ms=" << read_l0_wait_ms
+      << " read_l0_overlap_ms=" <<
+           std::max(0.0, read_l0_ms - read_l0_wait_ms)
+      << " l0_prefetch=" << use_l0_prefetch
+      << " l0_read_threads=" << step1_level1_l0_read_threads(params)
+      << " check_l0_ms=" << check_l0_ms
+      << " cache_wall_ms=" << cache_wall_ms
+      << " irls_wall_ms=" << irls_wall_ms
+      << " path_newton_wall_ms=" << path_newton_wall_ms
+      << " validation_ms=" << validation_ms
+      << " prediction_cache_wall_ms=" << prediction_cache_wall_ms
+      << " prediction_cache_write_ms=" << prediction_cache_write_ms
+      << " prediction_cache_phenotypes=" << prediction_cache_phenotypes
+      << " prediction_cache_bytes=" << prediction_cache_bytes
+      << " resident_design_phenotypes=" << resident_design_phenotypes
+      << " resident_design_uploads=" <<
+        backend.resident_design_upload_count
+      << " resident_design_upload_bytes=" <<
+        backend.resident_design_upload_bytes
+      << " resident_design_reuses=" <<
+        backend.resident_design_reuse_count
+      << " irls_iterations=" << irls_iterations
+      << " line_search_iterations=" << line_search_iterations
+      << " prediction_calls=" << prediction_calls
+      << " weighted_product_calls=" << weighted_product_calls
+      << " score_calls=" << score_calls
+      << " solve_calls=" << solve_calls
+      << " path_newton_solves=" << path_newton_solves
+      << " path_newton_score_calls=" << path_newton_score_calls
+      << " path_newton_converged_models=" <<
+           path_newton_converged_models
+      << " upload_ms=" << backend.upload_ms
+      << " gram_ms=" << backend.gram_ms
+      << " crossproduct_ms=" << backend.crossproduct_ms
+      << " ridge_ms=" << backend.ridge_ms
+      << " download_ms=" << backend.download_ms
+      << " host_orchestration_ms=" << std::max(0.0, wall_ms - backend_ms)
+      << "\n";
+    sout << profile.str();
+  }
+};
+
+struct CoxLevel1Profile {
+  Step1ComputeTimings backend;
+  double read_l0_ms = 0;
+  double read_l0_wait_ms = 0;
+  double check_l0_ms = 0;
+  double survival_setup_ms = 0;
+  double lambda_max_ms = 0;
+  double cache_wall_ms = 0;
+  double fold_setup_ms = 0;
+  double fit_ms = 0;
+  double validation_ms = 0;
+  double prediction_cache_wall_ms = 0;
+  double prediction_cache_write_ms = 0;
+  uint64_t prediction_cache_bytes = 0;
+  uint64_t prediction_cache_phenotypes = 0;
+  uint64_t resident_design_phenotypes = 0;
+
+  Step1ComputeTimings* backend_timings(bool enabled) {
+    return enabled ? &backend : nullptr;
+  }
+
+  void write(
+    const struct param* params, bool use_l0_prefetch,
+    const std::chrono::high_resolution_clock::time_point& wall_start,
+    mstream& sout) const {
+
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - wall_start).count();
+    const double backend_ms = backend.upload_ms +
+      backend.crossproduct_ms + backend.gram_ms +
+      backend.ridge_ms + backend.download_ms;
+    std::ostringstream profile;
+    profile << std::fixed << std::setprecision(3)
+      << "STEP1_PROFILE scope=level1_cox"
+      << " wall_ms=" << wall_ms
+      << " read_l0_ms=" << read_l0_ms
+      << " read_l0_wait_ms=" << read_l0_wait_ms
+      << " read_l0_overlap_ms=" <<
+           std::max(0.0, read_l0_ms - read_l0_wait_ms)
+      << " l0_prefetch=" << use_l0_prefetch
+      << " l0_read_threads=" << step1_level1_l0_read_threads(params)
+      << " check_l0_ms=" << check_l0_ms
+      << " survival_setup_ms=" << survival_setup_ms
+      << " lambda_max_ms=" << lambda_max_ms
+      << " cache_wall_ms=" << cache_wall_ms
+      << " fold_setup_ms=" << fold_setup_ms
+      << " fit_ms=" << fit_ms
+      << " validation_ms=" << validation_ms
+      << " prediction_cache_wall_ms=" << prediction_cache_wall_ms
+      << " prediction_cache_write_ms=" << prediction_cache_write_ms
+      << " prediction_cache_phenotypes=" << prediction_cache_phenotypes
+      << " prediction_cache_bytes=" << prediction_cache_bytes
+      << " resident_design_phenotypes=" << resident_design_phenotypes
+      << " resident_design_uploads=" <<
+           backend.resident_design_upload_count
+      << " resident_design_upload_bytes=" <<
+           backend.resident_design_upload_bytes
+      << " resident_design_reuses=" <<
+        backend.resident_design_reuse_count
+      << " upload_ms=" << backend.upload_ms
+      << " gram_ms=" << backend.gram_ms
+      << " crossproduct_ms=" << backend.crossproduct_ms
+      << " ridge_ms=" << backend.ridge_ms
+      << " download_ms=" << backend.download_ms
+      << " host_orchestration_ms=" <<
+           std::max(0.0, wall_ms - backend_ms)
+      << "\n";
+    sout << profile.str();
+  }
+};
+
 struct Level1PathNewtonResult {
   ArrayXd accepted_coefficients;
   ArrayXd score;
@@ -2032,30 +2188,9 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   sout << endl << " Level 1 ridge with logistic regression..." << endl << flush;
 
   const auto level1_wall_start = std::chrono::high_resolution_clock::now();
-  Step1ComputeTimings level1_timings;
+  LogisticLevel1Profile profile;
   Step1ComputeTimings* profile_timings =
-    params->profile_step1 ? &level1_timings : nullptr;
-  double read_l0_ms = 0;
-  double read_l0_wait_ms = 0;
-  double check_l0_ms = 0;
-  double cache_wall_ms = 0;
-  double irls_wall_ms = 0;
-  double path_newton_wall_ms = 0;
-  double validation_ms = 0;
-  double prediction_cache_wall_ms = 0;
-  double prediction_cache_write_ms = 0;
-  uint64_t prediction_cache_bytes = 0;
-  uint64_t prediction_cache_phenotypes = 0;
-  uint64_t irls_iterations = 0;
-  uint64_t line_search_iterations = 0;
-  uint64_t prediction_calls = 0;
-  uint64_t weighted_product_calls = 0;
-  uint64_t score_calls = 0;
-  uint64_t solve_calls = 0;
-  uint64_t path_newton_solves = 0;
-  uint64_t path_newton_score_calls = 0;
-  uint64_t path_newton_converged_models = 0;
-  uint64_t resident_design_phenotypes = 0;
+    profile.backend_timings(params->profile_step1);
   const bool use_path_newton = step1_level1_path_newton_enabled();
 
   int niter_cur;
@@ -2098,10 +2233,10 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         ph,
         phenotype_position + 1 < active_phenotypes.size() ?
           active_phenotypes[phenotype_position + 1] : -1,
-        phenotype_position, read_l0_ms, read_l0_wait_ms);
+        phenotype_position, profile.read_l0_ms, profile.read_l0_wait_ms);
     const auto check_l0_start = std::chrono::high_resolution_clock::now();
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
-    check_l0_ms += std::chrono::duration<double, std::milli>(
+    profile.check_l0_ms += std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() - check_l0_start).count();
     bs_l1 = kfold_level1_design_columns(
       l1, ph_eff, params->cv_folds);
@@ -2117,9 +2252,9 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
       const auto cache_start = std::chrono::high_resolution_clock::now();
       resident_design = compute_backend->cache_design_partitions(
         l1->test_mat[ph_eff], profile_timings);
-      cache_wall_ms += std::chrono::duration<double, std::milli>(
+      profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - cache_start).count();
-      if(resident_design) resident_design_phenotypes++;
+      if(resident_design) profile.resident_design_phenotypes++;
       if(params->profile_step1)
         sout << "\nSTEP1_LEVEL1_CACHE phenotype=" << ph + 1
              << " rows=" << total_rows
@@ -2141,7 +2276,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
       const VectorXd coefficient_vector = coefficients.matrix();
       compute_backend->predict_cached_design(
         coefficient_vector, cached_predictions, profile_timings);
-      prediction_calls++;
+      profile.prediction_calls++;
     };
 
     for(int i = 0; i < params->cv_folds; ++i ) {
@@ -2179,16 +2314,16 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
           betaold = path_result.accepted_coefficients;
           score = path_result.score;
           path_newton_converged = path_result.converged;
-          path_newton_solves += path_result.solve_calls;
-          solve_calls += path_result.solve_calls;
-          prediction_calls += path_result.prediction_calls;
-          path_newton_score_calls += path_result.score_calls;
-          score_calls += path_result.score_calls;
+          profile.path_newton_solves += path_result.solve_calls;
+          profile.solve_calls += path_result.solve_calls;
+          profile.prediction_calls += path_result.prediction_calls;
+          profile.path_newton_score_calls += path_result.score_calls;
+          profile.score_calls += path_result.score_calls;
           if(path_newton_converged) {
             betanew = betaold;
-            ++path_newton_converged_models;
+            ++profile.path_newton_converged_models;
           }
-          path_newton_wall_ms +=
+          profile.path_newton_wall_ms +=
             std::chrono::duration<double, std::milli>(
               std::chrono::high_resolution_clock::now() -
                 path_start).count();
@@ -2203,7 +2338,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
           if(params->within_sample_l0) {
             etavec = W1 + compute_step1_linear_prediction(
               compute_backend, X1, betaold.matrix(), profile_timings);
-            prediction_calls++;
+            profile.prediction_calls++;
             pivec = 1 - 1/(etavec.exp() + 1);
             wvec = pivec * (1 - pivec);
             // check none of the values are 0
@@ -2217,24 +2352,24 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             compute_backend->compute_weighted_design_products(
               X1, wvec.matrix(), working_outcome, weighted_gram,
               weighted_rhs, profile_timings);
-            weighted_product_calls++;
+            profile.weighted_product_calls++;
             current_tau(0) = params->tau[ph](j);
             compute_backend->diagonal_penalty_solve(
               weighted_gram, weighted_rhs, current_tau,
               l1->ridge_param_mult.matrix(), solver_coefficients,
               profile_timings);
-            solve_calls++;
+            profile.solve_calls++;
             betanew = solver_coefficients.col(0).array();
             // get the score
             etavec = W1 + compute_step1_linear_prediction(
               compute_backend, X1, betanew.matrix(), profile_timings);
-            prediction_calls++;
+            profile.prediction_calls++;
             pivec = 1 - 1/(etavec.exp() + 1);
             score = compute_step1_design_score(
               compute_backend, X1, (Y1 - pivec).matrix(),
               profile_timings) -
               params->tau[ph](j) * l1->ridge_param_mult * betanew;
-            score_calls++;
+            profile.score_calls++;
 
           } else if(resident_design) {
 
@@ -2278,8 +2413,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
                 XtWX, XtWZ, current_tau, l1->ridge_param_mult.matrix(),
                 solver_coefficients, profile_timings);
             }
-            weighted_product_calls++;
-            solve_calls++;
+            profile.weighted_product_calls++;
+            profile.solve_calls++;
             betanew = solver_coefficients.col(0).array();
 
             bool invalid_wvec = false;
@@ -2313,7 +2448,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               }
               betanew = (betaold + betanew) / 2;
             }
-            line_search_iterations += current_line_search_iterations;
+            profile.line_search_iterations +=
+              current_line_search_iterations;
 
             // The legacy loop halves once more on its final failed search,
             // then recomputes the score at that new coefficient vector.
@@ -2345,7 +2481,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             MatrixXd cached_score;
             compute_backend->compute_cached_design_crossproduct(
               cached_score_outcome, cached_score, profile_timings);
-            score_calls++;
+            profile.score_calls++;
             score = cached_score.col(0).array() -
               params->tau[ph](j) * l1->ridge_param_mult * betanew;
 
@@ -2375,7 +2511,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
                 compute_backend->compute_weighted_design_products(
                   l1->test_mat[ph_eff][k], active_weights, working_outcome,
                   weighted_gram, weighted_rhs, profile_timings);
-                weighted_product_calls++;
+                profile.weighted_product_calls++;
                 XtWX += weighted_gram;
                 XtWZ += weighted_rhs;
               }
@@ -2386,7 +2522,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             compute_backend->diagonal_penalty_solve(
               XtWX, XtWZ, current_tau, l1->ridge_param_mult.matrix(),
               solver_coefficients, profile_timings);
-            solve_calls++;
+            profile.solve_calls++;
             betanew = solver_coefficients.col(0).array();
 
             // start step-halving
@@ -2412,7 +2548,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               betanew = (betaold + betanew) / 2;
 
             }
-            line_search_iterations += current_line_search_iterations;
+            profile.line_search_iterations +=
+              current_line_search_iterations;
 
             // compute score
             score = ArrayXd::Zero(bs_l1);
@@ -2432,7 +2569,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
                   masked_in_folds[k].col(ph).array().select(
                     l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix(),
                   profile_timings);
-                score_calls++;
+                profile.score_calls++;
               }
             }
             score -= params->tau[ph](j) * l1->ridge_param_mult * betanew;
@@ -2440,13 +2577,13 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
           }
 
-          irls_iterations++;
+          profile.irls_iterations++;
           if(params->profile_step1) {
             const double iteration_ms =
               std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() -
                   iteration_start).count();
-            irls_wall_ms += iteration_ms;
+            profile.irls_wall_ms += iteration_ms;
             sout << "\nSTEP1_LEVEL1_PROGRESS phenotype=" << ph + 1
                  << " fold=" << i + 1
                  << " ridge_parameter=" << j + 1
@@ -2489,7 +2626,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             compute_step1_linear_prediction(compute_backend,
               l1->test_mat[ph_eff][i], betanew.matrix(),
               profile_timings);
-          prediction_calls++;
+          profile.prediction_calls++;
         }
         p1 = (1 - 1/(etatest.exp() + 1));
 
@@ -2511,7 +2648,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
           l1->cumsum_values[4](ph,j) += p1(l) * l1->test_pheno_raw[ph][i](l,0); // Sxy
           l1->cumsum_values[5](ph,j) += compute_log_lik_bern(l1->test_pheno_raw[ph][i](l,0), p1(l)); // -LL
         }
-        validation_ms += std::chrono::duration<double, std::milli>(
+        profile.validation_ms += std::chrono::duration<double, std::milli>(
           std::chrono::high_resolution_clock::now() -
             validation_start).count();
 
@@ -2522,9 +2659,10 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
        should_cache_level1_predictions(params)) {
       cache_kfold_level1_predictions(
         ph, ph_eff, files, params, l1, compute_backend, profile_timings,
-        prediction_cache_wall_ms, prediction_cache_write_ms,
-        prediction_cache_bytes);
-      prediction_cache_phenotypes++;
+        profile.prediction_cache_wall_ms,
+        profile.prediction_cache_write_ms,
+        profile.prediction_cache_bytes);
+      profile.prediction_cache_phenotypes++;
     }
     if(resident_design) compute_backend->release_cached_design();
 
@@ -2536,58 +2674,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
   sout << endl;
 
-  if(params->profile_step1) {
-    const double wall_ms = std::chrono::duration<double, std::milli>(
-      std::chrono::high_resolution_clock::now() -
-        level1_wall_start).count();
-    const double backend_ms = level1_timings.upload_ms +
-      level1_timings.crossproduct_ms + level1_timings.gram_ms +
-      level1_timings.ridge_ms + level1_timings.download_ms;
-    std::ostringstream profile;
-    profile << std::fixed << std::setprecision(3)
-      << "STEP1_PROFILE scope=level1_logistic"
-      << " wall_ms=" << wall_ms
-      << " read_l0_ms=" << read_l0_ms
-      << " read_l0_wait_ms=" << read_l0_wait_ms
-      << " read_l0_overlap_ms=" <<
-           std::max(0.0, read_l0_ms - read_l0_wait_ms)
-      << " l0_prefetch=" << use_l0_prefetch
-      << " l0_read_threads=" << step1_level1_l0_read_threads(params)
-      << " check_l0_ms=" << check_l0_ms
-      << " cache_wall_ms=" << cache_wall_ms
-      << " irls_wall_ms=" << irls_wall_ms
-      << " path_newton_wall_ms=" << path_newton_wall_ms
-      << " validation_ms=" << validation_ms
-      << " prediction_cache_wall_ms=" << prediction_cache_wall_ms
-      << " prediction_cache_write_ms=" << prediction_cache_write_ms
-      << " prediction_cache_phenotypes=" << prediction_cache_phenotypes
-      << " prediction_cache_bytes=" << prediction_cache_bytes
-      << " resident_design_phenotypes=" << resident_design_phenotypes
-      << " resident_design_uploads=" <<
-        level1_timings.resident_design_upload_count
-      << " resident_design_upload_bytes=" <<
-        level1_timings.resident_design_upload_bytes
-      << " resident_design_reuses=" <<
-        level1_timings.resident_design_reuse_count
-      << " irls_iterations=" << irls_iterations
-      << " line_search_iterations=" << line_search_iterations
-      << " prediction_calls=" << prediction_calls
-      << " weighted_product_calls=" << weighted_product_calls
-      << " score_calls=" << score_calls
-      << " solve_calls=" << solve_calls
-      << " path_newton_solves=" << path_newton_solves
-      << " path_newton_score_calls=" << path_newton_score_calls
-      << " path_newton_converged_models=" <<
-           path_newton_converged_models
-      << " upload_ms=" << level1_timings.upload_ms
-      << " gram_ms=" << level1_timings.gram_ms
-      << " crossproduct_ms=" << level1_timings.crossproduct_ms
-      << " ridge_ms=" << level1_timings.ridge_ms
-      << " download_ms=" << level1_timings.download_ms
-      << " host_orchestration_ms=" << std::max(0.0, wall_ms - backend_ms)
-      << "\n";
-    sout << profile.str();
-  }
+  if(params->profile_step1)
+    profile.write(params, use_l0_prefetch, level1_wall_start, sout);
 
 }
 
@@ -3792,23 +3880,9 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
   sout << endl << " Level 1 ridge with cox regression..." << endl << flush;
 
   const auto level1_wall_start = std::chrono::high_resolution_clock::now();
-  Step1ComputeTimings level1_timings;
+  CoxLevel1Profile profile;
   Step1ComputeTimings* profile_timings =
-    params->profile_step1 ? &level1_timings : nullptr;
-  double read_l0_ms = 0;
-  double read_l0_wait_ms = 0;
-  double check_l0_ms = 0;
-  double survival_setup_ms = 0;
-  double lambda_max_ms = 0;
-  double cache_wall_ms = 0;
-  double fold_setup_ms = 0;
-  double fit_ms = 0;
-  double validation_ms = 0;
-  double prediction_cache_wall_ms = 0;
-  double prediction_cache_write_ms = 0;
-  uint64_t prediction_cache_bytes = 0;
-  uint64_t prediction_cache_phenotypes = 0;
-  uint64_t resident_design_phenotypes = 0;
+    profile.backend_timings(params->profile_step1);
   
   int ph_eff, l0_idx;
   int time_index, event_index;
@@ -3868,14 +3942,14 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
         l0_idx,
         trait_position + 1 < active_traits.size() ?
           active_traits[trait_position + 1].l0_index : -1,
-        trait_position, read_l0_ms, read_l0_wait_ms);
+        trait_position, profile.read_l0_ms, profile.read_l0_wait_ms);
 
     bool resident_design = false;
     if(!params->select_l0) {
       const auto cache_start = std::chrono::high_resolution_clock::now();
       resident_design = compute_backend->cache_design_matrix(
         l1->test_mat_conc[ph_eff], profile_timings);
-      cache_wall_ms += std::chrono::duration<double, std::milli>(
+      profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - cache_start).count();
     }
 
@@ -3886,7 +3960,8 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
     const auto survival_setup_start =
       std::chrono::high_resolution_clock::now();
     survivalNullData.setup(ph_time, ph_event, mask, true);
-    survival_setup_ms += std::chrono::duration<double, std::milli>(
+    profile.survival_setup_ms +=
+      std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() -
         survival_setup_start).count();
     // initialize at lambda 0, to find lambda_max
@@ -3899,23 +3974,23 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
       l1->test_mat_conc[ph_eff], gradient, compute_backend,
       resident_design);
     pheno_data->cox_max_tau[time_index] = lambda_max;
-    lambda_max_ms += std::chrono::duration<double, std::milli>(
+    profile.lambda_max_ms += std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() -
         lambda_max_start).count();
 
     const auto check_l0_start = std::chrono::high_resolution_clock::now();
     check_l0(time_index, ph_eff, params, l1, pheno_data, sout);
-    check_l0_ms += std::chrono::duration<double, std::milli>(
+    profile.check_l0_ms += std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() - check_l0_start).count();
 
     if(!resident_design) {
       const auto cache_start = std::chrono::high_resolution_clock::now();
       resident_design = compute_backend->cache_design_matrix(
         l1->test_mat_conc[ph_eff], profile_timings);
-      cache_wall_ms += std::chrono::duration<double, std::milli>(
+      profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - cache_start).count();
     }
-    if(resident_design) resident_design_phenotypes++;
+    if(resident_design) profile.resident_design_phenotypes++;
     if(params->profile_step1)
       sout << "\nSTEP1_LEVEL1_CACHE phenotype=" << time_name
            << " rows=" << l1->test_mat_conc[ph_eff].rows()
@@ -3933,13 +4008,13 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
       const auto fold_setup_start =
         std::chrono::high_resolution_clock::now();
       survivalData_fold.setup(ph_time, ph_event, fold_train_mask, true);
-      fold_setup_ms += std::chrono::duration<double, std::milli>(
+      profile.fold_setup_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() -
           fold_setup_start).count();
       const auto fit_start = std::chrono::high_resolution_clock::now();
       cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true, compute_backend, resident_design, profile_timings);
       coxRidgePath_fold.fit(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask);
-      fit_ms += std::chrono::duration<double, std::milli>(
+      profile.fit_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - fit_start).count();
 
       if (!coxRidgePath_fold.converge.all()) {
@@ -3962,7 +4037,7 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
           compute_backend, resident_design, profile_timings);
         l1->cumsum_values[5](time_index, l) += coxRidge_test.get_null_deviance();
       }
-      validation_ms += std::chrono::duration<double, std::milli>(
+      profile.validation_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() -
           validation_start).count();
     }
@@ -3970,9 +4045,9 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
        should_cache_level1_predictions(params)) {
       cache_concatenated_level1_predictions(
         time_index, ph_eff, files, params, l1, compute_backend,
-        profile_timings, prediction_cache_wall_ms,
-        prediction_cache_write_ms, prediction_cache_bytes);
-      prediction_cache_phenotypes++;
+        profile_timings, profile.prediction_cache_wall_ms,
+        profile.prediction_cache_write_ms, profile.prediction_cache_bytes);
+      profile.prediction_cache_phenotypes++;
     }
     if(resident_design) compute_backend->release_cached_design();
     sout << "done";
@@ -3982,49 +4057,6 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
   }
   sout << endl;
 
-  if(params->profile_step1) {
-    const double wall_ms = std::chrono::duration<double, std::milli>(
-      std::chrono::high_resolution_clock::now() -
-        level1_wall_start).count();
-    const double backend_ms = level1_timings.upload_ms +
-      level1_timings.crossproduct_ms + level1_timings.gram_ms +
-      level1_timings.ridge_ms + level1_timings.download_ms;
-    std::ostringstream profile;
-    profile << std::fixed << std::setprecision(3)
-      << "STEP1_PROFILE scope=level1_cox"
-      << " wall_ms=" << wall_ms
-      << " read_l0_ms=" << read_l0_ms
-      << " read_l0_wait_ms=" << read_l0_wait_ms
-      << " read_l0_overlap_ms=" <<
-           std::max(0.0, read_l0_ms - read_l0_wait_ms)
-      << " l0_prefetch=" << use_l0_prefetch
-      << " l0_read_threads=" << step1_level1_l0_read_threads(params)
-      << " check_l0_ms=" << check_l0_ms
-      << " survival_setup_ms=" << survival_setup_ms
-      << " lambda_max_ms=" << lambda_max_ms
-      << " cache_wall_ms=" << cache_wall_ms
-      << " fold_setup_ms=" << fold_setup_ms
-      << " fit_ms=" << fit_ms
-      << " validation_ms=" << validation_ms
-      << " prediction_cache_wall_ms=" << prediction_cache_wall_ms
-      << " prediction_cache_write_ms=" << prediction_cache_write_ms
-      << " prediction_cache_phenotypes=" << prediction_cache_phenotypes
-      << " prediction_cache_bytes=" << prediction_cache_bytes
-      << " resident_design_phenotypes=" << resident_design_phenotypes
-      << " resident_design_uploads=" <<
-           level1_timings.resident_design_upload_count
-      << " resident_design_upload_bytes=" <<
-           level1_timings.resident_design_upload_bytes
-      << " resident_design_reuses=" <<
-        level1_timings.resident_design_reuse_count
-      << " upload_ms=" << level1_timings.upload_ms
-      << " gram_ms=" << level1_timings.gram_ms
-      << " crossproduct_ms=" << level1_timings.crossproduct_ms
-      << " ridge_ms=" << level1_timings.ridge_ms
-      << " download_ms=" << level1_timings.download_ms
-      << " host_orchestration_ms=" <<
-           std::max(0.0, wall_ms - backend_ms)
-      << "\n";
-    sout << profile.str();
-  }
+  if(params->profile_step1)
+    profile.write(params, use_l0_prefetch, level1_wall_start, sout);
 }
