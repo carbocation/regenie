@@ -97,6 +97,28 @@ changes among variants with `abs(z) >= 3`.
 
 ## Rejected alternatives
 
+A post-selection canonical-refit experiment used path-Newton only for the
+cross-validation grid, then discarded its selected coefficients and refit the
+winning penalty with ordinary FP64 IRLS from zero. The premise of one final
+fit per trait does not apply to this Stage 1 path: LOCO predictions are made
+from five held-out-fold models, so preserving the algorithm requires five
+refits per trait. Matched logs first confirmed that path-Newton and ordinary
+IRLS selected the same penalty for 8/8 P=8 and 32/32 P=32 traits; the P=8
+sequence was `5, 5, 2, 2, 5, 5, 3, 3`. The P=8 refits then added 53.5 seconds
+and still left 0/8 LOCO files byte-identical. Total time was 507.154 seconds,
+compared with 453.624 for path-Newton and 589.753 for ordinary IRLS.
+
+The refit reduced changed printed LOCO values from 1,620,880 to 1,072,964 out
+of 92 million, but not consistently by trait. In the full P=8 Stage 2 suite,
+it reduced the aggregate number of association rows with a changed printed
+numeric field from 467,231 to 386,994 out of 5.6 million, while increasing
+the worst per-trait count from 114,284 to 149,929. Maximum differences were
+unchanged, and both versions retained identical top-100, top-1,000, `p <=
+1e-5`, and genome-wide-significant sets with no strong-signal sign flips.
+This inconsistent rounding improvement did not strengthen either the exact
+or scientific contract enough to justify giving back 39% of path-Newton's
+time saving. P=32 was therefore not run.
+
 A three-point Level 0 ridge grid reduced the P=8 Stage 1 total to 323.710
 seconds, but changed top-ranked variants and significance-threshold
 membership in Stage 2. It was rejected.
