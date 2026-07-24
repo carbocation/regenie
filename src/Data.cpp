@@ -581,6 +581,137 @@ void install_step1_prefetched_block(
     "ms wait)" << endl;
 }
 
+template <typename Parameters>
+void initialize_step1_level0_ridge_state(
+  Parameters& parameters,
+  ridgel0& ridge) {
+
+  parameters.lambda =
+    (parameters.run_l0_only ?
+      parameters.parallel_nGeno : parameters.n_variants) *
+    (1 - parameters.lambda) / parameters.lambda;
+  if(!parameters.use_loocv) {
+    ridge.G_folds.resize(parameters.cv_folds);
+    ridge.GtY.resize(parameters.cv_folds);
+  }
+}
+
+template <typename Parameters, typename Files, typename OutputStream>
+void open_step1_level0_prediction_streams(
+  const Parameters& parameters,
+  Files& files,
+  OutputStream& output) {
+
+  if(parameters.write_l0_pred) {
+    string output_path;
+    files.write_preds_files.resize(parameters.n_pheno);
+    for(int phenotype = 0; phenotype < parameters.n_pheno; phenotype++) {
+      if(!parameters.pheno_pass(phenotype)) continue;
+      files.write_preds_files[phenotype] = std::make_shared<ofstream>();
+      output_path = files.loco_tmp_prefix + "_l0_Y" +
+        to_string(phenotype + 1);
+      openStream(files.write_preds_files[phenotype].get(), output_path,
+        ios::out | ios::binary, output);
+    }
+  }
+}
+
+template <
+  typename Parameters,
+  typename PhenotypeData,
+  typename Level1Estimates,
+  typename OutputStream>
+void initialize_step1_level0_test_state(
+  Parameters& parameters,
+  const PhenotypeData& phenotype_data,
+  Level1Estimates& level1_estimates,
+  ridgel0& ridge,
+  OutputStream& output) {
+
+  if(parameters.test_l0) {
+    ridge.ymat_res = phenotype_data.phenotypes;
+    level1_estimates.top_snp_pgs.assign(
+      parameters.nChrom + 1,
+      MatrixXd::Zero(parameters.n_samples, parameters.n_pheno));
+    ridge.nspns_picked = ridge.nspns_picked_block =
+      ArrayXi::Zero(parameters.n_pheno);
+    if(parameters.l0_snp_pval_thr < 0)
+      parameters.l0_snp_pval_thr =
+        0.05 / min((uint)1e6, parameters.n_variants);
+    output <<
+      " * p-value threshold for selecting top SNPs in level 0 blocks = " <<
+      parameters.l0_snp_pval_thr << "\n\n";
+  }
+}
+
+template <typename Parameters, typename Files>
+void close_step1_level0_prediction_streams(
+  const Parameters& parameters,
+  Files& files) {
+
+  if(parameters.write_l0_pred) {
+    for(int phenotype = 0; phenotype < parameters.n_pheno; phenotype++) {
+      if(!parameters.pheno_pass(phenotype)) continue;
+      if(files.write_preds_files[phenotype]->is_open())
+        files.write_preds_files[phenotype]->close();
+    }
+  }
+}
+
+template <typename Parameters, typename PhenotypeData,
+          typename Level1Estimates>
+void finalize_step1_level0_test_phenotypes(
+  const Parameters& parameters,
+  const PhenotypeData& phenotype_data,
+  Level1Estimates& level1_estimates) {
+
+  if(parameters.test_l0) {
+    if(parameters.use_loocv) {
+    } else {
+      uint32_t cumulative_fold_size = 0;
+      for(int phenotype = 0;
+          phenotype < parameters.n_pheno; phenotype++)
+        for(int fold = 0; fold < parameters.cv_folds; ++fold) {
+          level1_estimates.test_pheno[phenotype][fold] =
+            phenotype_data.phenotypes.block(
+              cumulative_fold_size, phenotype,
+              parameters.cv_sizes(fold), 1) -
+            level1_estimates.top_snp_pgs[0].block(
+              cumulative_fold_size, phenotype,
+              parameters.cv_sizes(fold), 1);
+          cumulative_fold_size += parameters.cv_sizes(fold);
+        }
+    }
+  }
+}
+
+template <typename Parameters, typename GenoBlock, typename Level1Estimates>
+void release_step1_level0_host_storage(
+  const Parameters& parameters,
+  GenoBlock& genotype_block,
+  Level1Estimates& level1_estimates) {
+
+  genotype_block.Gmat.resize(0, 0);
+  std::vector<unsigned char>().swap(
+    genotype_block.step1_pgen_packed_hardcalls);
+  genotype_block.step1_pgen_packed_stride_bytes = 0;
+  genotype_block.step1_pgen_packed_block = false;
+  if(parameters.write_l0_pred && (parameters.n_pheno > 1)) {
+    // Free Level 0 predictions for (P-1) indices in test_mat.
+    for(int phenotype = 1;
+        phenotype < parameters.n_pheno; ++phenotype) {
+      if(!parameters.pheno_pass(phenotype)) continue;
+      if(!parameters.use_loocv && parameters.trait_mode != 3) {
+        for(int fold = 0; fold < parameters.cv_folds; ++fold)
+          level1_estimates.test_mat[phenotype][fold].resize(0, 0);
+        level1_estimates.test_mat[phenotype].resize(0);
+      } else {
+        level1_estimates.test_mat_conc[phenotype].resize(0, 0);
+      }
+    }
+  }
+}
+
 struct Step1NextBlock {
   bool available = false;
   int chromosome_variant_count = 0;
@@ -1690,35 +1821,10 @@ void Data::level_0_calculations() {
   int block = 0, bs; 
   if(params.print_block_betas) params.print_snpcount = 0;
   ridgel0 l0;
-
-  // set ridge params
-  params.lambda = (params.run_l0_only ? params.parallel_nGeno : params.n_variants) * (1 - params.lambda) / params.lambda;
-
-  if(!params.use_loocv){
-    l0.G_folds.resize(params.cv_folds);
-    l0.GtY.resize(params.cv_folds);
-  }
-
-  // open streams to write level 0 predictions
-  if(params.write_l0_pred){
-    string fout_p;
-    files.write_preds_files.resize(params.n_pheno);
-    for(int ph = 0; ph < params.n_pheno; ph++){
-      if( !params.pheno_pass(ph) ) continue;
-      files.write_preds_files[ph] = std::make_shared<ofstream>();
-      fout_p = files.loco_tmp_prefix + "_l0_Y" + to_string(ph+1);
-      openStream(files.write_preds_files[ph].get(), fout_p, ios::out | ios::binary, sout);
-    }
-  }
-
-  if(params.test_l0){
-    l0.ymat_res = pheno_data.phenotypes;
-    l1_ests.top_snp_pgs.assign(params.nChrom + 1, MatrixXd::Zero(params.n_samples, params.n_pheno));
-    l0.nspns_picked = l0.nspns_picked_block = ArrayXi::Zero(params.n_pheno);
-    if(params.l0_snp_pval_thr < 0)
-      params.l0_snp_pval_thr = 0.05 / min((uint)1e6, params.n_variants);
-    sout << " * p-value threshold for selecting top SNPs in level 0 blocks = " <<  params.l0_snp_pval_thr << "\n\n";
-  }
+  initialize_step1_level0_ridge_state(params, l0);
+  open_step1_level0_prediction_streams(params, files, sout);
+  initialize_step1_level0_test_state(
+    params, pheno_data, l1_ests, l0, sout);
 
   const bool pgen_cuda_backend = params.file_type == "pgen" &&
     std::string(step1_compute_backend->name()) == "cuda";
@@ -1971,28 +2077,11 @@ void Data::level_0_calculations() {
   level0_pipeline.release_packed_hardcall_buffers(
     *step1_compute_backend);
   finish_l0_write(&l1_ests);
-
-  // close streams
-  if(params.write_l0_pred) {
-    for(int ph = 0; ph < params.n_pheno; ph++){
-      if( !params.pheno_pass(ph) ) continue;
-      if(files.write_preds_files[ph]->is_open()) files.write_preds_files[ph]->close();
-    }
-  }
+  close_step1_level0_prediction_streams(params, files);
 
   if(params.profile_step1) print_step1_profile();
-  
-  if(params.test_l0) {
-    if(params.use_loocv) {
-    } else {
-      uint32_t cum_size_folds = 0;
-      for(int ph = 0; ph < params.n_pheno; ph++)
-        for(int i = 0; i < params.cv_folds; ++i ) {
-          l1_ests.test_pheno[ph][i] = pheno_data.phenotypes.block(cum_size_folds, ph, params.cv_sizes(i), 1) - l1_ests.top_snp_pgs[0].block(cum_size_folds, ph, params.cv_sizes(i), 1);
-          cum_size_folds += params.cv_sizes(i);
-        }
-    }
-  }
+  finalize_step1_level0_test_phenotypes(
+    params, pheno_data, l1_ests);
 
   if(params.early_exit) {
     sout << "\nDone printing out level 0 predictions. There are " <<
@@ -2005,25 +2094,7 @@ void Data::level_0_calculations() {
     exit_early();
   }
   if(params.test_l0) sout << "\n* # picked top SNPs at level 0 for each trait = [ " << l0.nspns_picked.matrix().transpose() << " ]\n";
-
-  // free up memory not used anymore
-  Gblock.Gmat.resize(0,0);
-  std::vector<unsigned char>().swap(Gblock.step1_pgen_packed_hardcalls);
-  Gblock.step1_pgen_packed_stride_bytes = 0;
-  Gblock.step1_pgen_packed_block = false;
-  if(params.write_l0_pred && (params.n_pheno > 1) ){
-    // free level 0 predictions for (P-1) indices in test_mat
-    for(int ph = 1; ph < params.n_pheno; ++ph ) {
-      if( !params.pheno_pass(ph) ) continue;
-      if((!params.use_loocv) && (params.trait_mode != 3)){ // k-fold
-        for(int i = 0; i < params.cv_folds; ++i ) 
-          l1_ests.test_mat[ph][i].resize(0,0);
-        l1_ests.test_mat[ph].resize(0);
-      } else {
-        l1_ests.test_mat_conc[ph].resize(0,0); // loocv
-      }
-    }
-  }
+  release_step1_level0_host_storage(params, Gblock, l1_ests);
 }
 
 void Data::calc_cv_matrices(struct ridgel0* l0) {
