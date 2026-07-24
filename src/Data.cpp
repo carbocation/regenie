@@ -1413,10 +1413,14 @@ void Data::level_0_calculations() {
     pgen_packed_hardcalls && pgen_prefetch_enabled;
   step1_sample_weights =
     in_filters.ind_in_analysis.matrix().cast<double>();
+  std::unique_ptr<Step1ComputeBackend> level0_pipeline_backend;
+  Step1Level0StaticInputScope level0_static_input_scope(
+    *step1_compute_backend, 1);
   Step1PgenPrefetchBuffer pgen_prefetch_buffer;
   std::future<Step1PgenPrefetchResult> pgen_prefetch_future;
   bool pgen_prefetch_pending = false;
-  std::unique_ptr<Step1ComputeBackend> level0_pipeline_backend;
+  std::unique_ptr<Step1Level0StaticInputScope>
+    level0_pipeline_static_input_scope;
   std::future<Step1Level0PipelineResult> level0_pipeline_future;
   bool level0_pipeline_pending = false;
   if(pgen_packed_hardcalls && pgen_block_bytes > 0 &&
@@ -1437,9 +1441,12 @@ void Data::level_0_calculations() {
     !level0_pipeline_enabled &&
     step1_compute_backend->initialize_level1_design_cache(
       params.n_samples, level1_design_columns);
-  if(level0_pipeline_enabled)
+  if(level0_pipeline_enabled) {
     level0_pipeline_backend = make_step1_compute_backend(
       "cuda", params.gpu_device);
+    level0_pipeline_static_input_scope.reset(
+      new Step1Level0StaticInputScope(*level0_pipeline_backend, 1));
+  }
   if(pgen_cuda_backend) {
     sout << " - Step 1 PGEN block prefetch : [" <<
       (pgen_prefetch_enabled ? "enabled" : "disabled") << "]";

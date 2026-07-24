@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <Eigen/Dense>
@@ -70,6 +71,65 @@ struct Step1ComputeTimings {
   double host_materialization_ms = 0;
 };
 
+// Generation zero is deliberately never cacheable. A nonzero generation is a
+// caller assertion that the Level 0 inputs covered by that generation remain
+// immutable until the generation is changed or cleared.
+class Step1StaticInputGenerationState {
+  public:
+    void set(uint64_t generation) noexcept {
+      if(generation_ == generation && generation != 0) return;
+      generation_ = generation;
+      ++cache_key_;
+      if(cache_key_ == 0) ++cache_key_;
+    }
+
+    uint64_t generation() const noexcept {
+      return generation_;
+    }
+
+    uint64_t cache_key() const noexcept {
+      return generation_ == 0 ? 0 : cache_key_;
+    }
+
+  private:
+    uint64_t generation_ = 0;
+    uint64_t cache_key_ = 0;
+};
+
+// Device caches record the internal cache key rather than the caller's
+// generation value. This prevents an old entry from becoming reusable when a
+// generation value is cleared and later reused.
+class Step1StaticInputCacheState {
+  public:
+    bool matches(uint64_t cache_key, Eigen::Index rows,
+      Eigen::Index columns) const noexcept {
+      return cache_key != 0 && cached_cache_key_ == cache_key &&
+        rows_ == rows && columns_ == columns;
+    }
+
+    void record(uint64_t cache_key, Eigen::Index rows,
+      Eigen::Index columns) noexcept {
+      if(cache_key == 0) {
+        invalidate();
+        return;
+      }
+      cached_cache_key_ = cache_key;
+      rows_ = rows;
+      columns_ = columns;
+    }
+
+    void invalidate() noexcept {
+      cached_cache_key_ = 0;
+      rows_ = 0;
+      columns_ = 0;
+    }
+
+  private:
+    uint64_t cached_cache_key_ = 0;
+    Eigen::Index rows_ = 0;
+    Eigen::Index columns_ = 0;
+};
+
 class Step1ComputeBackend {
 
   public:
@@ -77,6 +137,18 @@ class Step1ComputeBackend {
 
     virtual const char* name() const = 0;
     virtual std::string description() const = 0;
+
+    // A nonzero generation explicitly enables reuse of immutable packed
+    // preprocessing inputs and full Level 0 phenotypes. Changing or clearing
+    // it invalidates that reuse. Generation zero is the safe default.
+    virtual void set_level0_static_input_generation(
+      uint64_t generation) noexcept {
+      level0_static_input_generation_.set(generation);
+    }
+
+    uint64_t level0_static_input_generation() const noexcept {
+      return level0_static_input_generation_.generation();
+    }
 
     virtual bool preprocess_genotypes(
       Eigen::MatrixXd& genotypes,
@@ -375,6 +447,10 @@ class Step1ComputeBackend {
       Step1ComputeTimings* timings = nullptr);
 
   protected:
+    uint64_t level0_static_input_cache_key() const noexcept {
+      return level0_static_input_generation_.cache_key();
+    }
+
     static void validate_packed_hardcall_preprocessing_inputs(
       const unsigned char* packed_hardcalls,
       size_t packed_bytes,
@@ -385,6 +461,53 @@ class Step1ComputeBackend {
       const Eigen::Ref<const Eigen::VectorXd>& sample_weights,
       double degrees_of_freedom,
       double minimum_scale);
+
+  private:
+    Step1StaticInputGenerationState level0_static_input_generation_;
+};
+
+class Step1Level0StaticInputScope {
+  public:
+    Step1Level0StaticInputScope(
+      Step1ComputeBackend& backend, uint64_t generation)
+      : backend_(&backend) {
+      if(generation == 0)
+        throw std::invalid_argument(
+          "Step 1 Level 0 static-input scope requires a nonzero generation");
+      backend_->set_level0_static_input_generation(generation);
+    }
+
+    ~Step1Level0StaticInputScope() {
+      clear();
+    }
+
+    Step1Level0StaticInputScope(const Step1Level0StaticInputScope&) = delete;
+    Step1Level0StaticInputScope& operator=(
+      const Step1Level0StaticInputScope&) = delete;
+
+    Step1Level0StaticInputScope(
+      Step1Level0StaticInputScope&& other) noexcept
+      : backend_(other.backend_) {
+      other.backend_ = nullptr;
+    }
+
+    Step1Level0StaticInputScope& operator=(
+      Step1Level0StaticInputScope&& other) noexcept {
+      if(this == &other) return *this;
+      clear();
+      backend_ = other.backend_;
+      other.backend_ = nullptr;
+      return *this;
+    }
+
+  private:
+    void clear() noexcept {
+      if(backend_)
+        backend_->set_level0_static_input_generation(0);
+      backend_ = nullptr;
+    }
+
+    Step1ComputeBackend* backend_;
 };
 
 std::unique_ptr<Step1ComputeBackend> make_cpu_step1_compute_backend();

@@ -24,6 +24,93 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+static_assert(
+  !std::is_copy_constructible<Step1Level0StaticInputScope>::value,
+  "Level 0 static-input scope must not be copyable");
+static_assert(
+  std::is_nothrow_move_constructible<
+    Step1Level0StaticInputScope>::value,
+  "Level 0 static-input scope must be nothrow movable");
+static_assert(
+  std::is_nothrow_move_assignable<
+    Step1Level0StaticInputScope>::value,
+  "Level 0 static-input scope must be nothrow move assignable");
+
+void check_static_input_cache_state() {
+  Step1StaticInputGenerationState generation;
+  Step1StaticInputCacheState cache;
+  if(generation.generation() != 0 || generation.cache_key() != 0)
+    throw std::runtime_error(
+      "Level 0 static-input generation was not initially disabled");
+
+  cache.record(generation.cache_key(), 12, 3);
+  if(cache.matches(generation.cache_key(), 12, 3))
+    throw std::runtime_error(
+      "Level 0 static-input cache reused generation zero");
+
+  generation.set(7);
+  const uint64_t first_cache_key = generation.cache_key();
+  cache.record(first_cache_key, 12, 3);
+  if(first_cache_key == 0 ||
+     !cache.matches(first_cache_key, 12, 3) ||
+     cache.matches(first_cache_key, 13, 3) ||
+     cache.matches(first_cache_key, 12, 4))
+    throw std::runtime_error(
+      "Level 0 static-input cache identity did not include generation and shape");
+
+  generation.set(7);
+  if(generation.cache_key() != first_cache_key ||
+     !cache.matches(generation.cache_key(), 12, 3))
+    throw std::runtime_error(
+      "Level 0 static-input cache invalidated an unchanged generation");
+
+  generation.set(8);
+  if(generation.cache_key() == first_cache_key ||
+     cache.matches(generation.cache_key(), 12, 3))
+    throw std::runtime_error(
+      "Level 0 static-input cache survived a generation change");
+  cache.record(generation.cache_key(), 12, 3);
+  generation.set(0);
+  if(generation.cache_key() != 0 ||
+     cache.matches(generation.cache_key(), 12, 3))
+    throw std::runtime_error(
+      "Level 0 static-input cache survived generation clearing");
+
+  generation.set(7);
+  if(generation.cache_key() == first_cache_key ||
+     cache.matches(generation.cache_key(), 12, 3))
+    throw std::runtime_error(
+      "Level 0 static-input cache revived after generation reuse");
+
+  std::unique_ptr<Step1ComputeBackend> backend =
+    make_cpu_step1_compute_backend();
+  {
+    Step1Level0StaticInputScope source(*backend, 23);
+    if(backend->level0_static_input_generation() != 23)
+      throw std::runtime_error(
+        "Level 0 static-input scope did not activate its generation");
+    Step1Level0StaticInputScope destination(std::move(source));
+    if(backend->level0_static_input_generation() != 23)
+      throw std::runtime_error(
+        "Level 0 static-input scope move lost its generation");
+  }
+  if(backend->level0_static_input_generation() != 0)
+    throw std::runtime_error(
+      "Level 0 static-input scope did not clear its generation");
+
+  bool rejected_zero_generation = false;
+  try {
+    Step1Level0StaticInputScope invalid(*backend, 0);
+  } catch(const std::invalid_argument&) {
+    rejected_zero_generation = true;
+  }
+  if(!rejected_zero_generation)
+    throw std::runtime_error(
+      "Level 0 static-input scope accepted generation zero");
+
+  std::cout << "STEP1_BACKEND_TEST case=static_input_cache_state status=PASS\n";
+}
+
 #ifdef WITH_CUDA
 static_assert(
   !std::is_copy_constructible<regenie::cuda::EventPair>::value,
@@ -426,6 +513,8 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
               << " supported=0 status=PASS\n";
     return;
   }
+  std::unique_ptr<Step1Level0StaticInputScope> static_inputs(
+    new Step1Level0StaticInputScope(candidate, 1));
 
   const size_t stride = (static_cast<size_t>(samples) + 3) / 4;
   std::vector<unsigned char> packed(static_cast<size_t>(rows) * stride, 0);
@@ -927,6 +1016,7 @@ void check_packed_hardcall_preprocessing(Step1ComputeBackend& candidate) {
     candidate.release_level1_design_cache();
   }
   candidate.release_preprocessed_genotypes();
+  static_inputs.reset();
 
   bool rejected_negative_weight = false;
   Eigen::VectorXd invalid_weights = sample_weights;
@@ -2791,6 +2881,7 @@ void run_level1_benchmark(Step1ComputeBackend& backend,
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
+    check_static_input_cache_state();
     std::unique_ptr<Step1ComputeBackend> backend =
       make_step1_compute_backend(options.backend, options.device);
     std::cout << "STEP1_BACKEND_TEST backend=" << backend->name()

@@ -611,35 +611,6 @@ struct CudaResidentFoldSystems {
   }
 };
 
-struct CudaPackedStaticInputs {
-  bool valid = false;
-  const double* covariates = nullptr;
-  const double* weights = nullptr;
-  Eigen::Index samples = 0;
-  Eigen::Index covariate_count = 0;
-
-  bool matches(const double* candidate_covariates,
-    const double* candidate_weights, Eigen::Index candidate_samples,
-    Eigen::Index candidate_covariate_count) const {
-    return valid && covariates == candidate_covariates &&
-      weights == candidate_weights && samples == candidate_samples &&
-      covariate_count == candidate_covariate_count;
-  }
-
-  void update(const double* new_covariates, const double* new_weights,
-    Eigen::Index new_samples, Eigen::Index new_covariate_count) {
-    covariates = new_covariates;
-    weights = new_weights;
-    samples = new_samples;
-    covariate_count = new_covariate_count;
-    valid = true;
-  }
-
-  void invalidate() {
-    valid = false;
-  }
-};
-
 struct CudaResidentGenotypes {
   const double* host_data = nullptr;
   Eigen::Index rows = 0;
@@ -804,8 +775,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
-        level0_phenotypes_host_(nullptr),
-        level0_phenotype_rows_(0), level0_phenotype_columns_(0),
         factorized_size_(-1),
         pinned_staging_capacity_(0), pinned_staging_available_(true),
         ridge_factorized_size_(-1), ridge_factorized_rhs_count_(0) {
@@ -877,6 +846,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       return result.str();
     }
 
+    void set_level0_static_input_generation(
+      uint64_t generation) noexcept override {
+      if(generation == level0_static_input_generation() && generation != 0)
+        return;
+      Step1ComputeBackend::set_level0_static_input_generation(generation);
+      packed_static_inputs_.invalidate();
+      level0_phenotypes_.invalidate();
+    }
+
     bool can_preprocess_packed_hardcalls(
       Eigen::Index variants, Eigen::Index samples) const override {
       if(variants < 0 || samples < 0) return false;
@@ -906,8 +884,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ComputeClock::now();
       const ComputeClock::time_point validation_start =
         ComputeClock::now();
+      const uint64_t static_input_cache_key =
+        level0_static_input_cache_key();
       const bool static_inputs_cached = packed_static_inputs_.matches(
-        covariates.data(), sample_weights.data(), samples, covariates.cols());
+        static_input_cache_key, samples, covariates.cols());
       if(static_inputs_cached) {
         if(variants < 0 || samples < 0 || covariates.rows() != samples ||
            sample_weights.size() != samples)
@@ -1033,8 +1013,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           check_cuda(cudaMemcpy(d_preprocess_covariates_, covariate_data,
             covariates.size() * sizeof(double), cudaMemcpyHostToDevice),
             "copy packed hardcall covariates to CUDA device");
-        packed_static_inputs_.update(covariates.data(), sample_weights.data(),
-          samples, covariates.cols());
+        packed_static_inputs_.record(
+          static_input_cache_key, samples, covariates.cols());
       }
       if(timings) {
         timings->upload_ms += elapsed_ms(transfer_start);
@@ -2152,9 +2132,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const bool cache_full_phenotypes = phenotypes.innerStride() == 1 &&
         phenotypes.outerStride() == phenotypes.rows();
       const bool reuse_cached_phenotypes = cache_full_phenotypes &&
-        level0_phenotypes_host_ == phenotypes.data() &&
-        level0_phenotype_rows_ == phenotypes.rows() &&
-        level0_phenotype_columns_ == phenotypes.cols();
+        level0_phenotypes_.matches(level0_static_input_cache_key(),
+          phenotypes.rows(), phenotypes.cols());
       if(cache_full_phenotypes && !reuse_cached_phenotypes)
         ensure_capacity(d_level0_phenotypes_,
           phenotypes.size(), "cudaMalloc(static Level 0 phenotypes)");
@@ -2185,9 +2164,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           static_cast<size_t>(phenotypes.size()) * sizeof(double),
           cudaMemcpyHostToDevice),
           "copy static Level 0 phenotypes to CUDA device");
-        level0_phenotypes_host_ = phenotypes.data();
-        level0_phenotype_rows_ = phenotypes.rows();
-        level0_phenotype_columns_ = phenotypes.cols();
+        level0_phenotypes_.record(level0_static_input_cache_key(),
+          phenotypes.rows(), phenotypes.cols());
       } else if(!cache_full_phenotypes) {
         for(size_t system = 0; system < system_count; ++system) {
           if(phenotype_count == 0) continue;
@@ -6012,10 +5990,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaResidentDesign resident_design_;
     CudaLevel1DesignCache level1_design_;
     CudaResidentFoldSystems resident_fold_systems_;
-    CudaPackedStaticInputs packed_static_inputs_;
-    const double* level0_phenotypes_host_;
-    Eigen::Index level0_phenotype_rows_;
-    Eigen::Index level0_phenotype_columns_;
+    Step1StaticInputCacheState packed_static_inputs_;
+    Step1StaticInputCacheState level0_phenotypes_;
     int factorized_size_;
     size_t pinned_staging_capacity_;
     bool pinned_staging_available_;
