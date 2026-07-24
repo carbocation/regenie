@@ -493,6 +493,60 @@ __global__ void apply_leave_one_out_correction(double* predictions,
 using CudaEventPair = regenie::cuda::EventPair;
 using CudaHostRegistration = regenie::cuda::HostRegistration;
 
+template <typename T>
+class CudaDeviceBuffer {
+ public:
+  CudaDeviceBuffer() noexcept : data_(nullptr), capacity_(0) {}
+
+  ~CudaDeviceBuffer() {
+    if(data_) cudaFree(data_);
+  }
+
+  CudaDeviceBuffer(const CudaDeviceBuffer&) = delete;
+  CudaDeviceBuffer& operator=(const CudaDeviceBuffer&) = delete;
+
+  operator T*() noexcept {
+    return data_;
+  }
+
+  operator const T*() const noexcept {
+    return data_;
+  }
+
+  T* data() noexcept {
+    return data_;
+  }
+
+  const T* data() const noexcept {
+    return data_;
+  }
+
+  size_t capacity() const noexcept {
+    return capacity_;
+  }
+
+  void ensure(size_t required, const char* label) {
+    if(required <= capacity_) return;
+    if(required > std::numeric_limits<size_t>::max() / sizeof(T))
+      throw std::runtime_error(
+        std::string("CUDA allocation size overflow for ") + label);
+    release("cudaFree while growing buffer");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&data_),
+      required * sizeof(T)), label);
+    capacity_ = required;
+  }
+
+  void release(const char* operation) {
+    if(data_) check_cuda(cudaFree(data_), operation);
+    data_ = nullptr;
+    capacity_ = 0;
+  }
+
+ private:
+  T* data_;
+  size_t capacity_;
+};
+
 struct CudaLevel0CholeskyLane {
   cudaStream_t stream = nullptr;
   cublasHandle_t blas = nullptr;
@@ -592,23 +646,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
-        d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
-        d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
-        d_factorized_(nullptr),
-        d_ridge_vectors_(nullptr), d_ridge_values_(nullptr),
-        d_ridge_rhs_(nullptr),
-        d_eigenvalues_(nullptr), d_solver_workspace_(nullptr), d_solver_info_(nullptr),
-        d_ridge_parameters_(nullptr), d_inverse_(nullptr), d_scaled_rhs_(nullptr),
-        d_predictions_(nullptr), d_outcomes_(nullptr), d_projected_(nullptr),
-        d_level1_design_(nullptr), d_level1_ones_(nullptr),
-        d_level0_phenotypes_(nullptr), d_level0_prediction_block_(nullptr),
-        d_level0_normalized_predictions_(nullptr),
-        d_squared_(nullptr), d_leverage_(nullptr),
-        d_preprocess_covariates_(nullptr), d_preprocess_weights_(nullptr),
-        d_preprocess_coefficients_(nullptr), d_preprocess_scales_(nullptr),
-        d_preprocess_multipliers_(nullptr), d_packed_hardcalls_(nullptr),
-        d_transposed_hardcalls_(nullptr), d_packed_row_counts_(nullptr),
-        genotypes_capacity_(0), resident_genotypes_capacity_(0),
         resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
         resident_valid_(false), resident_design_rows_(0),
         resident_design_columns_(0), resident_design_valid_(false),
@@ -618,11 +655,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         level1_design_cached_columns_(0),
         level0_phenotypes_host_(nullptr),
         level0_phenotype_rows_(0), level0_phenotype_columns_(0),
-        phenotypes_capacity_(0), gram_capacity_(0),
-        factorized_capacity_(0), factorized_size_(-1),
-        ridge_vectors_capacity_(0), ridge_values_capacity_(0),
-        ridge_rhs_capacity_(0),
-        crossproduct_capacity_(0), eigenvalues_capacity_(0), solver_workspace_capacity_(0),
+        factorized_size_(-1),
         pinned_staging_capacity_(0), pinned_staging_available_(true),
         ridge_factorized_size_(-1), ridge_factorized_rhs_count_(0) {
 
@@ -635,8 +668,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cublas(cublasCreate(&handle_), "cublasCreate");
       try {
         check_cusolver(cusolverDnCreate(&solver_handle_), "cusolverDnCreate");
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_solver_info_), sizeof(int)),
-          "cudaMalloc(cuSOLVER info)");
+        ensure_capacity(
+          d_solver_info_, 1, "cudaMalloc(cuSOLVER info)");
       } catch(...) {
         if(solver_handle_) cusolverDnDestroy(solver_handle_);
         if(handle_) cublasDestroy(handle_);
@@ -656,40 +689,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(upload_streams_[index])
           cudaStreamDestroy(upload_streams_[index]);
       }
-      if(d_preprocess_multipliers_) cudaFree(d_preprocess_multipliers_);
-      if(d_preprocess_scales_) cudaFree(d_preprocess_scales_);
-      if(d_preprocess_coefficients_) cudaFree(d_preprocess_coefficients_);
-      if(d_preprocess_weights_) cudaFree(d_preprocess_weights_);
-      if(d_preprocess_covariates_) cudaFree(d_preprocess_covariates_);
-      if(d_packed_row_counts_) cudaFree(d_packed_row_counts_);
-      if(d_transposed_hardcalls_) cudaFree(d_transposed_hardcalls_);
-      if(d_packed_hardcalls_) cudaFree(d_packed_hardcalls_);
-      if(d_leverage_) cudaFree(d_leverage_);
-      if(d_squared_) cudaFree(d_squared_);
-      if(d_projected_) cudaFree(d_projected_);
-      if(d_level1_design_) cudaFree(d_level1_design_);
-      if(d_level1_ones_) cudaFree(d_level1_ones_);
-      if(d_level0_phenotypes_) cudaFree(d_level0_phenotypes_);
-      if(d_level0_prediction_block_) cudaFree(d_level0_prediction_block_);
-      if(d_level0_normalized_predictions_)
-        cudaFree(d_level0_normalized_predictions_);
-      if(d_outcomes_) cudaFree(d_outcomes_);
-      if(d_predictions_) cudaFree(d_predictions_);
-      if(d_scaled_rhs_) cudaFree(d_scaled_rhs_);
-      if(d_inverse_) cudaFree(d_inverse_);
-      if(d_ridge_parameters_) cudaFree(d_ridge_parameters_);
-      if(d_solver_info_) cudaFree(d_solver_info_);
-      if(d_solver_workspace_) cudaFree(d_solver_workspace_);
-      if(d_eigenvalues_) cudaFree(d_eigenvalues_);
-      if(d_ridge_rhs_) cudaFree(d_ridge_rhs_);
-      if(d_ridge_values_) cudaFree(d_ridge_values_);
-      if(d_ridge_vectors_) cudaFree(d_ridge_vectors_);
-      if(d_factorized_) cudaFree(d_factorized_);
-      if(d_crossproduct_) cudaFree(d_crossproduct_);
-      if(d_gram_) cudaFree(d_gram_);
-      if(d_phenotypes_) cudaFree(d_phenotypes_);
-      if(d_resident_genotypes_) cudaFree(d_resident_genotypes_);
-      if(d_genotypes_) cudaFree(d_genotypes_);
       if(solver_handle_) cusolverDnDestroy(solver_handle_);
       if(handle_) cublasDestroy(handle_);
     }
@@ -828,26 +827,23 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return true;
       }
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         element_count,
         "cudaMalloc(packed hardcall resident genotype block)");
-      ensure_capacity(d_packed_hardcalls_, packed_hardcalls_capacity_,
+      ensure_capacity(d_packed_hardcalls_,
         required_packed_bytes, "cudaMalloc(packed hardcall block)");
-      ensure_capacity(d_transposed_hardcalls_,
-        transposed_hardcalls_capacity_, required_packed_bytes,
+      ensure_capacity(d_transposed_hardcalls_, required_packed_bytes,
         "cudaMalloc(transposed packed hardcall block)");
-      ensure_capacity(d_packed_row_counts_, packed_row_counts_capacity_,
+      ensure_capacity(d_packed_row_counts_,
         rows, "cudaMalloc(packed hardcall row counts)");
-      ensure_capacity(d_preprocess_weights_, preprocess_weights_capacity_,
+      ensure_capacity(d_preprocess_weights_,
         columns, "cudaMalloc(packed hardcall sample weights)");
-      ensure_capacity(d_preprocess_scales_, preprocess_scales_capacity_,
+      ensure_capacity(d_preprocess_scales_,
         rows, "cudaMalloc(packed hardcall row statistics)");
       if(covariate_count > 0) {
-        ensure_capacity(d_preprocess_covariates_,
-          preprocess_covariates_capacity_, covariates.size(),
+        ensure_capacity(d_preprocess_covariates_, covariates.size(),
           "cudaMalloc(packed hardcall covariates)");
         ensure_capacity(d_preprocess_coefficients_,
-          preprocess_coefficients_capacity_,
           static_cast<Eigen::Index>(rows) * covariate_count,
           "cudaMalloc(packed hardcall projection coefficients)");
       }
@@ -1035,25 +1031,22 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(rows == 0) return true;
       if(columns == 0) return false;
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         element_count,
         "cudaMalloc(resident genotype preprocessing block)");
-      ensure_capacity(d_preprocess_weights_, preprocess_weights_capacity_,
+      ensure_capacity(d_preprocess_weights_,
         columns, "cudaMalloc(genotype preprocessing sample weights)");
-      ensure_capacity(d_preprocess_scales_, preprocess_scales_capacity_,
+      ensure_capacity(d_preprocess_scales_,
         rows, "cudaMalloc(genotype preprocessing row scales)");
       if(covariate_count > 0) {
-        ensure_capacity(d_preprocess_covariates_,
-          preprocess_covariates_capacity_, covariates.size(),
+        ensure_capacity(d_preprocess_covariates_, covariates.size(),
           "cudaMalloc(genotype preprocessing covariates)");
         ensure_capacity(d_preprocess_coefficients_,
-          preprocess_coefficients_capacity_,
           static_cast<Eigen::Index>(rows) * covariate_count,
           "cudaMalloc(genotype preprocessing coefficients)");
       }
       if(row_multipliers.size() > 0)
-        ensure_capacity(d_preprocess_multipliers_,
-          preprocess_multipliers_capacity_, rows,
+        ensure_capacity(d_preprocess_multipliers_, rows,
           "cudaMalloc(genotype preprocessing row multipliers)");
 
       const Eigen::MatrixXd packed_covariates = covariate_count > 0 ?
@@ -1136,7 +1129,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
       scale_genotype_rows<<<element_blocks, threads>>>(
         d_resident_genotypes_, d_preprocess_scales_,
-        row_multipliers.size() ? d_preprocess_multipliers_ : nullptr,
+        row_multipliers.size() ? d_preprocess_multipliers_.data() : nullptr,
         rows, element_count);
       check_cuda(cudaGetLastError(),
         "scale genotype preprocessing rows kernel");
@@ -1227,14 +1220,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
       (void)total_bytes;
       const size_t resident_growth = required_elements >
-        static_cast<Eigen::Index>(resident_genotypes_capacity_) ?
+        static_cast<Eigen::Index>(d_resident_genotypes_.capacity()) ?
         static_cast<size_t>(required_elements -
-          static_cast<Eigen::Index>(resident_genotypes_capacity_)) *
+          static_cast<Eigen::Index>(d_resident_genotypes_.capacity())) *
             sizeof(double) : 0;
       const size_t workspace_growth = required_elements >
-        static_cast<Eigen::Index>(projected_capacity_) ?
+        static_cast<Eigen::Index>(d_projected_.capacity()) ?
         static_cast<size_t>(required_elements -
-          static_cast<Eigen::Index>(projected_capacity_)) *
+          static_cast<Eigen::Index>(d_projected_.capacity())) *
             sizeof(double) : 0;
       const size_t reserve_bytes = size_t(512) * 1000000;
       if(resident_growth > free_bytes ||
@@ -1242,9 +1235,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          reserve_bytes > free_bytes - resident_growth - workspace_growth)
         return false;
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         required_elements, "cudaMalloc(resident Level 1 design)");
-      ensure_capacity(d_projected_, projected_capacity_, required_elements,
+      ensure_capacity(d_projected_, required_elements,
         "cudaMalloc(resident Level 1 weighted-design workspace)");
 
       ComputeClock::time_point transfer_start;
@@ -1299,14 +1292,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
       (void)total_bytes;
       const size_t resident_growth = required_elements >
-        static_cast<Eigen::Index>(resident_genotypes_capacity_) ?
+        static_cast<Eigen::Index>(d_resident_genotypes_.capacity()) ?
         static_cast<size_t>(required_elements -
-          static_cast<Eigen::Index>(resident_genotypes_capacity_)) *
+          static_cast<Eigen::Index>(d_resident_genotypes_.capacity())) *
             sizeof(double) : 0;
       const size_t workspace_growth = required_elements >
-        static_cast<Eigen::Index>(projected_capacity_) ?
+        static_cast<Eigen::Index>(d_projected_.capacity()) ?
         static_cast<size_t>(required_elements -
-          static_cast<Eigen::Index>(projected_capacity_)) *
+          static_cast<Eigen::Index>(d_projected_.capacity())) *
             sizeof(double) : 0;
       const size_t reserve_bytes = size_t(512) * 1000000;
       if(resident_growth > free_bytes ||
@@ -1314,9 +1307,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          reserve_bytes > free_bytes - resident_growth - workspace_growth)
         return false;
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         required_elements, "cudaMalloc(resident Level 1 design)");
-      ensure_capacity(d_projected_, projected_capacity_, required_elements,
+      ensure_capacity(d_projected_, required_elements,
         "cudaMalloc(resident Level 1 weighted-design workspace)");
 
       const Eigen::MatrixXd packed_design =
@@ -1365,7 +1358,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          reserve_bytes > free_bytes - required_bytes)
         return false;
 
-      ensure_capacity(d_level1_design_, level1_design_capacity_,
+      ensure_capacity(d_level1_design_,
         static_cast<Eigen::Index>(required_elements_long),
         "cudaMalloc(persistent Level 1 design)");
       level1_design_rows_ = rows;
@@ -1426,11 +1419,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         invalidate_resident_design();
       if(d_level1_design_) {
         check_cuda(cudaSetDevice(device_), "cudaSetDevice");
-        check_cuda(cudaFree(d_level1_design_),
+        d_level1_design_.release(
           "cudaFree(persistent Level 1 design)");
       }
-      d_level1_design_ = nullptr;
-      level1_design_capacity_ = 0;
       level1_design_rows_ = 0;
       level1_design_columns_ = 0;
       level1_design_cached_columns_ = 0;
@@ -1456,9 +1447,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_design_rows_, "cached design prediction row count");
       const int columns = checked_int(
         resident_design_columns_, "cached design prediction column count");
-      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+      ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(cached design coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_, predictions.size(),
+      ensure_capacity(d_predictions_, predictions.size(),
         "cudaMalloc(cached design predictions)");
 
       ComputeClock::time_point transfer_start;
@@ -1553,9 +1544,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           partition < row_counts.size(); ++partition)
         maximum_rows = std::max<Eigen::Index>(
           maximum_rows, row_counts(partition));
-      ensure_capacity(d_inverse_, inverse_capacity_, design_columns,
+      ensure_capacity(d_inverse_, design_columns,
         "cudaMalloc(cached grouped prediction coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         maximum_rows * group_count,
         "cudaMalloc(cached grouped predictions)");
 
@@ -1761,9 +1752,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
       const Eigen::Index gram_elements =
         static_cast<Eigen::Index>(features) * features;
-      if(gram_capacity_ < gram_elements) return false;
+      if(d_gram_.capacity() < gram_elements) return false;
 
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+      ensure_capacity(d_crossproduct_,
         right_hand_sides.size(),
         "cudaMalloc(cached weighted Gram right hand sides)");
       const Eigen::MatrixXd packed_right_hand_sides =
@@ -1810,9 +1801,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
+      ensure_capacity(d_phenotypes_, outcomes.size(),
         "cudaMalloc(cached crossproduct outcomes)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+      ensure_capacity(d_crossproduct_,
         crossproduct.size(), "cudaMalloc(cached design crossproduct)");
       const Eigen::MatrixXd packed_outcomes =
         contiguous_copy_if_needed(outcomes);
@@ -1886,13 +1877,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+      ensure_capacity(d_gram_, gram.size(),
         "cudaMalloc(resident genotype Gram matrix)");
       if(phenotype_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           phenotypes.size(),
           "cudaMalloc(resident genotype phenotype block)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        ensure_capacity(d_crossproduct_,
           crossproduct.size(),
           "cudaMalloc(resident genotype crossproduct)");
       }
@@ -2026,10 +2017,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Index gram_elements = resident_rows_ * resident_rows_;
       const Eigen::Index rhs_elements = resident_rows_ * phenotypes.cols();
       ensure_level0_cholesky_lane_count(system_count);
-      ensure_capacity(d_gram_, gram_capacity_, gram_elements,
+      ensure_capacity(d_gram_, gram_elements,
         "cudaMalloc(resident fold total Gram matrix)");
       if(rhs_elements > 0)
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, rhs_elements,
+        ensure_capacity(d_crossproduct_, rhs_elements,
           "cudaMalloc(resident fold total right-hand sides)");
 
       const bool cache_full_phenotypes = phenotypes.innerStride() == 1 &&
@@ -2039,7 +2030,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         level0_phenotype_rows_ == phenotypes.rows() &&
         level0_phenotype_columns_ == phenotypes.cols();
       if(cache_full_phenotypes && !reuse_cached_phenotypes)
-        ensure_capacity(d_level0_phenotypes_, level0_phenotypes_capacity_,
+        ensure_capacity(d_level0_phenotypes_,
           phenotypes.size(), "cudaMalloc(static Level 0 phenotypes)");
       std::vector<Eigen::MatrixXd> packed_phenotypes(
         cache_full_phenotypes ? 0 : system_count);
@@ -2210,15 +2201,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_design_columns_ * outcomes.cols();
       const Eigen::Index resident_design_elements =
         resident_design_rows_ * resident_design_columns_;
-      if(!resident_design_uses_level1_cache_ && projected_capacity_ <
+      if(!resident_design_uses_level1_cache_ && d_projected_.capacity() <
            static_cast<size_t>(resident_design_elements))
         throw std::runtime_error(
           "Step 1 resident design fold staging workspace is unavailable");
       ensure_level0_cholesky_lane_count(system_count);
-      ensure_capacity(d_gram_, gram_capacity_, gram_elements,
+      ensure_capacity(d_gram_, gram_elements,
         "cudaMalloc(resident design fold total Gram matrix)");
       if(rhs_elements > 0)
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, rhs_elements,
+        ensure_capacity(d_crossproduct_, rhs_elements,
           "cudaMalloc(resident design fold total right-hand sides)");
 
       std::vector<Eigen::MatrixXd> packed_outcomes(system_count);
@@ -2424,18 +2415,18 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
         column_count, combination_count);
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         ridge_parameters.size(),
         "cudaMalloc(resident ridge parameters)");
-      ensure_capacity(d_inverse_, inverse_capacity_,
+      ensure_capacity(d_inverse_,
         static_cast<Eigen::Index>(size) * parameter_count,
         "cudaMalloc(resident ridge inverse)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         static_cast<Eigen::Index>(size) * combination_count,
         "cudaMalloc(resident ridge scaled right-hand sides)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+      ensure_capacity(d_phenotypes_,
         coefficients.size(), "cudaMalloc(resident ridge coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_samples * combination_count,
         "cudaMalloc(resident ridge prediction chunk)");
 
@@ -2564,7 +2555,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
-      ensure_capacity(d_inverse_, inverse_capacity_, predictions.size(),
+      ensure_capacity(d_inverse_, predictions.size(),
         "cudaMalloc(resident Cholesky ridge predictions)");
       const double* device_prediction_matrix = d_resident_genotypes_ +
         start_column * resident_rows_;
@@ -2910,8 +2901,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         assembled_predictions = d_level1_design_ +
           level1_start_column * level1_design_rows_;
       } else {
-        ensure_capacity(d_level0_prediction_block_,
-          level0_prediction_block_capacity_, element_count,
+        ensure_capacity(d_level0_prediction_block_, element_count,
           "cudaMalloc(Level 0 prediction block)");
         assembled_predictions = d_level0_prediction_block_;
       }
@@ -2934,7 +2924,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       synchronize_level0_cholesky_lanes(
         static_cast<size_t>(start_columns.size()));
 
-      ensure_capacity(d_level1_ones_, level1_ones_capacity_, rows,
+      ensure_capacity(d_level1_ones_, rows,
         "cudaMalloc(Level 0 normalization ones)");
       const int threads = 256;
       fill_constant<<<(rows + threads - 1) / threads, threads>>>(
@@ -2964,9 +2954,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         inverse_standard_deviations[column] = std::sqrt(
           (effective_sample_count - 1.0) / centered_sum_of_squares);
       }
-      ensure_capacity(d_inverse_, inverse_capacity_, columns,
+      ensure_capacity(d_inverse_, columns,
         "cudaMalloc(Level 0 prediction means)");
-      ensure_capacity(d_eigenvalues_, eigenvalues_capacity_, columns,
+      ensure_capacity(d_eigenvalues_, columns,
         "cudaMalloc(Level 0 prediction inverse standard deviations)");
       check_cuda(cudaMemcpy(d_inverse_, means.data(),
         static_cast<size_t>(columns) * sizeof(double),
@@ -2986,8 +2976,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         check_cuda(cudaGetLastError(),
           "normalize Level 0 prediction columns kernel");
       } else {
-        ensure_capacity(d_level0_normalized_predictions_,
-          level0_normalized_predictions_capacity_, element_count,
+        ensure_capacity(d_level0_normalized_predictions_, element_count,
           "cudaMalloc(normalized Level 0 prediction block)");
         normalized_destination = d_level0_normalized_predictions_;
         normalize_and_reorder_design_columns<<<
@@ -3418,13 +3407,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const bool genotypes_are_resident =
         resident_genotype_columns(genotypes, 0, genotypes.cols()) != nullptr;
       if(!genotypes_are_resident)
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           chunk_samples * genotypes.rows(), "cudaMalloc(genotype chunk)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(Gram matrix)");
+      ensure_capacity(d_gram_, gram.size(), "cudaMalloc(Gram matrix)");
       if(phenotype_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           chunk_samples * phenotypes.cols(), "cudaMalloc(phenotype chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(), "cudaMalloc(crossproduct)");
+        ensure_capacity(d_crossproduct_, crossproduct.size(), "cudaMalloc(crossproduct)");
       }
 
       const double alpha = 1.0;
@@ -3552,13 +3541,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(), "cudaMalloc(design product chunk)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(design Gram matrix)");
+      ensure_capacity(d_gram_, gram.size(), "cudaMalloc(design Gram matrix)");
       if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           chunk_rows * outcomes.cols(), "cudaMalloc(design outcome chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(),
+        ensure_capacity(d_crossproduct_, crossproduct.size(),
           "cudaMalloc(design crossproduct)");
       }
 
@@ -3650,13 +3639,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(),
         "cudaMalloc(design crossproduct design)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+      ensure_capacity(d_phenotypes_,
         chunk_rows * outcomes.cols(),
         "cudaMalloc(design crossproduct outcomes)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(),
+      ensure_capacity(d_crossproduct_, crossproduct.size(),
         "cudaMalloc(design crossproduct)");
       const double alpha = 1.0;
       for(Eigen::Index start = 0; start < design.rows(); start += chunk_rows) {
@@ -3728,21 +3717,21 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(), "cudaMalloc(weighted design chunk)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, chunk_rows,
+      ensure_capacity(d_ridge_parameters_, chunk_rows,
         "cudaMalloc(design weight chunk)");
-      ensure_capacity(d_projected_, projected_capacity_,
+      ensure_capacity(d_projected_,
         chunk_rows * design.cols(), "cudaMalloc(weighted design matrix chunk)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+      ensure_capacity(d_gram_, gram.size(),
         "cudaMalloc(weighted Gram matrix)");
       if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           chunk_rows * outcomes.cols(), "cudaMalloc(weighted outcome chunk)");
-        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+        ensure_capacity(d_scaled_rhs_,
           chunk_rows * outcomes.cols(),
           "cudaMalloc(weighted outcome matrix chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(),
+        ensure_capacity(d_crossproduct_, crossproduct.size(),
           "cudaMalloc(weighted crossproduct)");
       }
 
@@ -3878,9 +3867,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+      ensure_capacity(d_gram_, gram.size(),
         "cudaMalloc(diagonal-penalty Gram matrix)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_, right_hand_sides.size(),
+      ensure_capacity(d_crossproduct_, right_hand_sides.size(),
         "cudaMalloc(diagonal-penalty right-hand sides)");
 
       const Eigen::MatrixXd packed_gram = contiguous_copy_if_needed(gram);
@@ -3968,12 +3957,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           size, combination_count);
         const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
           sample_count_index, streaming_columns);
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           chunk_samples * size,
           "cudaMalloc(diagonal-penalty prediction chunk)");
-        ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+        ensure_capacity(d_inverse_, coefficients.size(),
           "cudaMalloc(diagonal-penalty streamed coefficients)");
-        ensure_capacity(d_predictions_, predictions_capacity_,
+        ensure_capacity(d_predictions_,
           chunk_samples * combination_count,
           "cudaMalloc(diagonal-penalty prediction result chunk)");
 
@@ -4052,7 +4041,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         Eigen::VectorXi::Constant(1, size);
       const int saved_factorized_size = factorized_size_;
       if(saved_factorized_size > 0) {
-        ensure_capacity(d_gram_, gram_capacity_,
+        ensure_capacity(d_gram_,
           static_cast<Eigen::Index>(saved_factorized_size) *
             saved_factorized_size,
           "cudaMalloc(saved diagonal-penalty factorization)");
@@ -4134,9 +4123,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         factorized_size_ = 0;
         return;
       }
-      ensure_capacity(d_factorized_, factorized_capacity_, gram.size(),
+      ensure_capacity(d_factorized_, gram.size(),
         "cudaMalloc(reusable factorization matrix)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         penalty_multipliers.size(), "cudaMalloc(reusable factorization multipliers)");
 
       const Eigen::MatrixXd packed_gram = contiguous_copy_if_needed(gram);
@@ -4159,7 +4148,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
         CUBLAS_FILL_MODE_LOWER, size, d_factorized_, size, &workspace_size),
         "cusolverDnDpotrf_bufferSize(reusable factorization)");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER reusable Cholesky workspace)");
 
       std::unique_ptr<CudaEventPair> solve_events;
@@ -4206,7 +4195,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "reusable solve right-hand-side count");
       const Eigen::Index chunk_columns = bounded_cuda_chunk_rows(
         right_hand_sides.cols(), factorized_size_);
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         chunk_columns * factorized_size_,
         "cudaMalloc(reusable solve right-hand-side chunk)");
 
@@ -4328,23 +4317,23 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         size, group_count);
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), streaming_columns);
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * size, "cudaMalloc(grouped LOOCV design chunk)");
-      ensure_capacity(d_projected_, projected_capacity_,
+      ensure_capacity(d_projected_,
         chunk_rows * size,
         "cudaMalloc(grouped LOOCV transposed design chunk)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         chunk_rows * size,
         "cudaMalloc(grouped LOOCV influence solve chunk)");
-      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+      ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(grouped LOOCV coefficients)");
-      ensure_capacity(d_outcomes_, outcomes_capacity_, chunk_rows,
+      ensure_capacity(d_outcomes_, chunk_rows,
         "cudaMalloc(grouped LOOCV residual chunk)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         chunk_rows, "cudaMalloc(grouped LOOCV leverage weight chunk)");
-      ensure_capacity(d_leverage_, leverage_capacity_, chunk_rows,
+      ensure_capacity(d_leverage_, chunk_rows,
         "cudaMalloc(grouped LOOCV leverage chunk)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_rows * group_count,
         "cudaMalloc(grouped LOOCV prediction chunk)");
 
@@ -4501,12 +4490,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         group_offsets.size(), "grouped prediction group count");
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(),
         "cudaMalloc(grouped prediction design)");
-      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+      ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(grouped prediction coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_rows * group_offsets.size(),
         "cudaMalloc(grouped predictions)");
 
@@ -4613,11 +4602,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const int saved_factorized_size = ridge_factorized_size_;
       const int saved_rhs_count = ridge_factorized_rhs_count_;
       if(saved_factorized_size > 0) {
-        ensure_capacity(d_gram_, gram_capacity_,
+        ensure_capacity(d_gram_,
           static_cast<Eigen::Index>(saved_factorized_size) *
             saved_factorized_size,
           "cudaMalloc(saved ridge eigenvectors)");
-        ensure_capacity(d_eigenvalues_, eigenvalues_capacity_,
+        ensure_capacity(d_eigenvalues_,
           saved_factorized_size, "cudaMalloc(saved ridge eigenvalues)");
         check_cuda(cudaMemcpy(d_gram_, d_ridge_vectors_,
           static_cast<size_t>(saved_factorized_size) *
@@ -4629,7 +4618,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           cudaMemcpyDeviceToDevice),
           "save reusable ridge eigenvalues");
         if(saved_rhs_count > 0) {
-          ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+          ensure_capacity(d_crossproduct_,
             static_cast<Eigen::Index>(saved_factorized_size) *
               saved_rhs_count,
             "cudaMalloc(saved transformed ridge right-hand sides)");
@@ -4661,13 +4650,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       };
       try {
         if(size > 0) {
-          ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
+          ensure_capacity(d_ridge_vectors_,
             eigenvectors.size(),
             "cudaMalloc(ridge eigenvectors)");
-          ensure_capacity(d_ridge_values_, ridge_values_capacity_,
+          ensure_capacity(d_ridge_values_,
             eigenvalues.size(), "cudaMalloc(ridge eigenvalues)");
           if(phenotype_count > 0)
-            ensure_capacity(d_ridge_rhs_, ridge_rhs_capacity_,
+            ensure_capacity(d_ridge_rhs_,
               transformed_right_hand_sides.size(),
               "cudaMalloc(ridge transformed right-hand sides)");
         }
@@ -4740,15 +4729,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
+      ensure_capacity(d_ridge_vectors_,
         symmetric_matrix.size(),
         "cudaMalloc(reusable ridge factorization matrix)");
-      ensure_capacity(d_ridge_values_, ridge_values_capacity_, size,
+      ensure_capacity(d_ridge_values_, size,
         "cudaMalloc(reusable ridge eigenvalues)");
       if(right_hand_side_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, right_hand_sides.size(),
+        ensure_capacity(d_phenotypes_, right_hand_sides.size(),
           "cudaMalloc(reusable ridge right-hand sides)");
-        ensure_capacity(d_ridge_rhs_, ridge_rhs_capacity_,
+        ensure_capacity(d_ridge_rhs_,
           right_hand_sides.size(),
           "cudaMalloc(reusable transformed ridge right-hand sides)");
       }
@@ -4778,7 +4767,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, size,
         d_ridge_vectors_, size, d_ridge_values_, &workspace_size),
         "cusolverDnDsyevd_bufferSize(reusable ridge)");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER reusable ridge workspace)");
 
       std::unique_ptr<CudaEventPair> eigensolve_events;
@@ -4855,25 +4844,25 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const bool genotypes_are_resident =
         resident_genotype_columns(genotypes, 0, genotypes.cols()) != nullptr;
       if(!genotypes_are_resident)
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           std::max<Eigen::Index>(1, chunk_samples * genotypes.rows()),
           "cudaMalloc(fused ridge genotype chunk)");
-      ensure_capacity(d_gram_, gram_capacity_,
+      ensure_capacity(d_gram_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge Gram matrix)");
-      ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
+      ensure_capacity(d_ridge_vectors_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge eigenvectors)");
-      ensure_capacity(d_ridge_values_, ridge_values_capacity_, blocks,
+      ensure_capacity(d_ridge_values_, blocks,
         "cudaMalloc(fused ridge eigenvalues)");
       if(phenotype_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           std::max<Eigen::Index>(1, chunk_samples * phenotypes.cols()),
           "cudaMalloc(fused ridge phenotype chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        ensure_capacity(d_crossproduct_,
           static_cast<Eigen::Index>(blocks) * phenotype_count,
           "cudaMalloc(fused ridge crossproduct)");
-        ensure_capacity(d_ridge_rhs_, ridge_rhs_capacity_,
+        ensure_capacity(d_ridge_rhs_,
           static_cast<Eigen::Index>(blocks) * phenotype_count,
           "cudaMalloc(fused transformed ridge right-hand sides)");
       }
@@ -4990,7 +4979,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, blocks,
         d_ridge_vectors_, blocks, d_ridge_values_, &workspace_size),
         "cusolverDnDsyevd_bufferSize(fused ridge)");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER fused ridge workspace)");
 
       std::unique_ptr<CudaEventPair> eigensolve_events;
@@ -5096,33 +5085,33 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_genotype_columns(
           prediction_matrix, 0, prediction_matrix.cols()) != nullptr;
       if(!prediction_is_resident)
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           chunk_samples * size,
           "cudaMalloc(factorized ridge prediction chunk)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         ridge_parameters.size(), "cudaMalloc(factorized ridge parameters)");
-      ensure_capacity(d_inverse_, inverse_capacity_,
+      ensure_capacity(d_inverse_,
         static_cast<Eigen::Index>(size) * parameter_count,
         "cudaMalloc(factorized ridge inverse)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         static_cast<Eigen::Index>(size) * combination_count,
         "cudaMalloc(factorized ridge scaled right-hand sides)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_, coefficients.size(),
+      ensure_capacity(d_phenotypes_, coefficients.size(),
         "cudaMalloc(factorized ridge coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_samples * combination_count,
         "cudaMalloc(factorized ridge prediction results chunk)");
       if(leave_one_out) {
-        ensure_capacity(d_outcomes_, outcomes_capacity_,
+        ensure_capacity(d_outcomes_,
           chunk_samples * phenotype_count,
           "cudaMalloc(factorized ridge LOOCV outcome chunk)");
-        ensure_capacity(d_projected_, projected_capacity_,
+        ensure_capacity(d_projected_,
           chunk_samples * size,
           "cudaMalloc(factorized ridge projected matrix chunk)");
-        ensure_capacity(d_squared_, squared_capacity_,
+        ensure_capacity(d_squared_,
           chunk_samples * size,
           "cudaMalloc(factorized ridge squared projected matrix chunk)");
-        ensure_capacity(d_leverage_, leverage_capacity_,
+        ensure_capacity(d_leverage_,
           chunk_samples * parameter_count,
           "cudaMalloc(factorized ridge LOOCV leverage chunk)");
       }
@@ -5304,14 +5293,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       transformed_right_hand_sides.resize(size, right_hand_side_count);
       if(size == 0) return;
 
-      ensure_capacity(d_gram_, gram_capacity_, symmetric_matrix.size(),
+      ensure_capacity(d_gram_, symmetric_matrix.size(),
         "cudaMalloc(eigendecomposition matrix)");
-      ensure_capacity(d_eigenvalues_, eigenvalues_capacity_, size,
+      ensure_capacity(d_eigenvalues_, size,
         "cudaMalloc(eigenvalues)");
       if(right_hand_side_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, right_hand_sides.size(),
+        ensure_capacity(d_phenotypes_, right_hand_sides.size(),
           "cudaMalloc(eigendecomposition right-hand sides)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, right_hand_sides.size(),
+        ensure_capacity(d_crossproduct_, right_hand_sides.size(),
           "cudaMalloc(transformed right-hand sides)");
       }
 
@@ -5334,7 +5323,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cusolver(cusolverDnDsyevd_bufferSize(solver_handle_, CUSOLVER_EIG_MODE_VECTOR,
         CUBLAS_FILL_MODE_LOWER, size, d_gram_, size, d_eigenvalues_, &workspace_size),
         "cusolverDnDsyevd_bufferSize");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER workspace)");
 
       std::unique_ptr<CudaEventPair> eigensolve_events;
@@ -5427,18 +5416,18 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Index crossproduct_elements =
         static_cast<Eigen::Index>(features) * outcome_count;
 
-      ensure_capacity(d_projected_, projected_capacity_, design_count,
+      ensure_capacity(d_projected_, design_count,
         "cudaMalloc(cached weighted design matrix)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, rows,
+      ensure_capacity(d_ridge_parameters_, rows,
         "cudaMalloc(cached design weights)");
-      ensure_capacity(d_gram_, gram_capacity_, gram_elements,
+      ensure_capacity(d_gram_, gram_elements,
         "cudaMalloc(cached weighted Gram matrix)");
       if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
+        ensure_capacity(d_phenotypes_, outcomes.size(),
           "cudaMalloc(cached weighted outcomes)");
-        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, outcomes.size(),
+        ensure_capacity(d_scaled_rhs_, outcomes.size(),
           "cudaMalloc(cached weighted outcome matrix)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        ensure_capacity(d_crossproduct_,
           crossproduct_elements, "cudaMalloc(cached weighted crossproduct)");
       }
 
@@ -5531,14 +5520,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const Eigen::Index right_hand_side_elements =
         static_cast<Eigen::Index>(size) * right_hand_side_count;
 
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         penalty_multipliers.size(), "cudaMalloc(diagonal-penalty multipliers)");
-      ensure_capacity(d_projected_, projected_capacity_, gram_elements,
+      ensure_capacity(d_projected_, gram_elements,
         "cudaMalloc(diagonal-penalty factorization matrix)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         right_hand_side_elements,
         "cudaMalloc(diagonal-penalty solve workspace)");
-      ensure_capacity(d_predictions_, predictions_capacity_, solutions.size(),
+      ensure_capacity(d_predictions_, solutions.size(),
         "cudaMalloc(diagonal-penalty solutions)");
 
       ComputeClock::time_point transfer_start;
@@ -5552,7 +5541,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
         CUBLAS_FILL_MODE_LOWER, size, d_projected_, size, &workspace_size),
         "cusolverDnDpotrf_bufferSize");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_,
+      ensure_capacity(d_solver_workspace_,
         workspace_size, "cudaMalloc(cuSOLVER Cholesky workspace)");
 
       std::unique_ptr<CudaEventPair> solve_events;
@@ -5873,6 +5862,21 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         throw std::invalid_argument("Step 1 LOOCV outcomes have incompatible dimensions");
     }
 
+    template <typename T>
+    static void ensure_capacity(CudaDeviceBuffer<T>& buffer,
+      Eigen::Index required, const char* label) {
+      if(required < 0)
+        throw std::runtime_error(
+          std::string("negative CUDA allocation size for ") + label);
+      buffer.ensure(static_cast<size_t>(required), label);
+    }
+
+    static void ensure_capacity(
+      CudaDeviceBuffer<unsigned char>& buffer,
+      size_t required, const char* label) {
+      buffer.ensure(required, label);
+    }
+
     static void ensure_capacity(double*& pointer, size_t& capacity,
       Eigen::Index required, const char* label) {
       if(required < 0)
@@ -5887,38 +5891,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       capacity = 0;
       check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
         required_size * sizeof(double)), label);
-      capacity = required_size;
-    }
-
-    static void ensure_capacity(unsigned char*& pointer, size_t& capacity,
-      size_t required, const char* label) {
-      if(required <= capacity) return;
-      if(pointer) check_cuda(cudaFree(pointer),
-        "cudaFree while growing byte buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer), required),
-        label);
-      capacity = required;
-    }
-
-    static void ensure_capacity(unsigned int*& pointer, size_t& capacity,
-      Eigen::Index required, const char* label) {
-      if(required < 0)
-        throw std::runtime_error(
-          std::string("negative CUDA allocation size for ") + label);
-      const size_t required_size = static_cast<size_t>(required);
-      if(required_size <= capacity) return;
-      if(required_size >
-         std::numeric_limits<size_t>::max() / sizeof(unsigned int))
-        throw std::runtime_error(
-          std::string("CUDA allocation size overflow for ") + label);
-      if(pointer) check_cuda(cudaFree(pointer),
-        "cudaFree while growing unsigned buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
-        required_size * sizeof(unsigned int)), label);
       capacity = required_size;
     }
 
@@ -5956,41 +5928,39 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     Eigen::Index level1_resident_max_elements_;
     void* pinned_staging_[2] = {nullptr, nullptr};
     cudaStream_t upload_streams_[2] = {nullptr, nullptr};
-    double* d_genotypes_;
-    double* d_resident_genotypes_;
-    double* d_phenotypes_;
-    double* d_gram_;
-    double* d_crossproduct_;
-    double* d_factorized_;
-    double* d_ridge_vectors_;
-    double* d_ridge_values_;
-    double* d_ridge_rhs_;
-    double* d_eigenvalues_;
-    double* d_solver_workspace_;
-    int* d_solver_info_;
-    double* d_ridge_parameters_;
-    double* d_inverse_;
-    double* d_scaled_rhs_;
-    double* d_predictions_;
-    double* d_outcomes_;
-    double* d_projected_;
-    double* d_level1_design_;
-    double* d_level1_ones_;
-    double* d_level0_phenotypes_;
-    double* d_level0_prediction_block_;
-    double* d_level0_normalized_predictions_;
-    double* d_squared_;
-    double* d_leverage_;
-    double* d_preprocess_covariates_;
-    double* d_preprocess_weights_;
-    double* d_preprocess_coefficients_;
-    double* d_preprocess_scales_;
-    double* d_preprocess_multipliers_;
-    unsigned char* d_packed_hardcalls_;
-    unsigned char* d_transposed_hardcalls_;
-    unsigned int* d_packed_row_counts_;
-    size_t genotypes_capacity_;
-    size_t resident_genotypes_capacity_;
+    CudaDeviceBuffer<double> d_genotypes_;
+    CudaDeviceBuffer<double> d_resident_genotypes_;
+    CudaDeviceBuffer<double> d_phenotypes_;
+    CudaDeviceBuffer<double> d_gram_;
+    CudaDeviceBuffer<double> d_crossproduct_;
+    CudaDeviceBuffer<double> d_factorized_;
+    CudaDeviceBuffer<double> d_ridge_vectors_;
+    CudaDeviceBuffer<double> d_ridge_values_;
+    CudaDeviceBuffer<double> d_ridge_rhs_;
+    CudaDeviceBuffer<double> d_eigenvalues_;
+    CudaDeviceBuffer<double> d_solver_workspace_;
+    CudaDeviceBuffer<int> d_solver_info_;
+    CudaDeviceBuffer<double> d_ridge_parameters_;
+    CudaDeviceBuffer<double> d_inverse_;
+    CudaDeviceBuffer<double> d_scaled_rhs_;
+    CudaDeviceBuffer<double> d_predictions_;
+    CudaDeviceBuffer<double> d_outcomes_;
+    CudaDeviceBuffer<double> d_projected_;
+    CudaDeviceBuffer<double> d_level1_design_;
+    CudaDeviceBuffer<double> d_level1_ones_;
+    CudaDeviceBuffer<double> d_level0_phenotypes_;
+    CudaDeviceBuffer<double> d_level0_prediction_block_;
+    CudaDeviceBuffer<double> d_level0_normalized_predictions_;
+    CudaDeviceBuffer<double> d_squared_;
+    CudaDeviceBuffer<double> d_leverage_;
+    CudaDeviceBuffer<double> d_preprocess_covariates_;
+    CudaDeviceBuffer<double> d_preprocess_weights_;
+    CudaDeviceBuffer<double> d_preprocess_coefficients_;
+    CudaDeviceBuffer<double> d_preprocess_scales_;
+    CudaDeviceBuffer<double> d_preprocess_multipliers_;
+    CudaDeviceBuffer<unsigned char> d_packed_hardcalls_;
+    CudaDeviceBuffer<unsigned char> d_transposed_hardcalls_;
+    CudaDeviceBuffer<unsigned int> d_packed_row_counts_;
     const double* resident_host_data_;
     Eigen::Index resident_rows_;
     Eigen::Index resident_columns_;
@@ -6008,39 +5978,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     const double* level0_phenotypes_host_;
     Eigen::Index level0_phenotype_rows_;
     Eigen::Index level0_phenotype_columns_;
-    size_t phenotypes_capacity_;
-    size_t gram_capacity_;
-    size_t factorized_capacity_;
     int factorized_size_;
-    size_t ridge_vectors_capacity_;
-    size_t ridge_values_capacity_;
-    size_t ridge_rhs_capacity_;
-    size_t crossproduct_capacity_;
-    size_t eigenvalues_capacity_;
-    size_t solver_workspace_capacity_;
     size_t pinned_staging_capacity_;
     bool pinned_staging_available_;
-    size_t ridge_parameters_capacity_ = 0;
-    size_t inverse_capacity_ = 0;
-    size_t scaled_rhs_capacity_ = 0;
-    size_t predictions_capacity_ = 0;
-    size_t outcomes_capacity_ = 0;
-    size_t projected_capacity_ = 0;
-    size_t level1_design_capacity_ = 0;
-    size_t level1_ones_capacity_ = 0;
-    size_t level0_phenotypes_capacity_ = 0;
-    size_t level0_prediction_block_capacity_ = 0;
-    size_t level0_normalized_predictions_capacity_ = 0;
-    size_t squared_capacity_ = 0;
-    size_t leverage_capacity_ = 0;
-    size_t preprocess_covariates_capacity_ = 0;
-    size_t preprocess_weights_capacity_ = 0;
-    size_t preprocess_coefficients_capacity_ = 0;
-    size_t preprocess_scales_capacity_ = 0;
-    size_t preprocess_multipliers_capacity_ = 0;
-    size_t packed_hardcalls_capacity_ = 0;
-    size_t transposed_hardcalls_capacity_ = 0;
-    size_t packed_row_counts_capacity_ = 0;
     std::vector<std::pair<unsigned char*, size_t>>
       registered_packed_hardcall_buffers_;
     int ridge_factorized_size_;
