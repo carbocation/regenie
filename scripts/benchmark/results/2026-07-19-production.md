@@ -1,10 +1,14 @@
 # Stage 1 performance at biobank scale
 
-This report compares the best validated version of this branch with upstream
-REGENIE v4.1.2. The primary workload has **500,000 samples**, **700,000
-variants used to fit the Stage 1 model**, and multiple outcomes fitted jointly.
-The traits have 0-10% outcome-specific missingness unless the table says
-otherwise.
+Last refreshed: 2026-07-23.
+
+This report compares the current byte-exact default with upstream REGENIE
+v4.1.2. The primary workload has **500,000 samples**, **700,000 variants used
+to fit the Stage 1 model**, and multiple outcomes fitted jointly. The traits
+have 0-10% outcome-specific missingness unless the table says otherwise.
+
+Level 1 path-Newton continuation is not part of the default. Its explicitly
+enabled sensitivity is reported separately below.
 
 `P` is the number of outcomes. “Stage 1 variants” is the number of markers
 used for model fitting; it is not the number of variants later tested in
@@ -20,12 +24,12 @@ one REGENIE process.
 | Model | Missingness | N | Stage 1 variants | P | Current A100 wall / compute cost | Upstream v4.1.2 N2 wall / compute cost | Speedup | Evidence |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Quantitative | none | 500,000 | 700,000 | 1 | **1.74 min / $0.11** | 136.79 min / $1.77 | **78.73x** | Both full runs measured directly; current Level 0 intermediates on SSD Persistent Disk |
-| Quantitative | 0-10% | 500,000 | 700,000 | 8 | **4.92 min / $0.30** | 155.51 min / $2.01 | **31.62x** | Both full runs measured directly; current Level 0 intermediates on SSD Persistent Disk |
-| Quantitative | 0-10% | 500,000 | 700,000 | 32 | **18.71 min / $1.15** | 243.08 min / $3.15 | **12.99x** | Both full runs measured directly; current Level 0 intermediates on SSD Persistent Disk |
-| Binary | 0-10% | 500,000 | 700,000 | 8 | **10.41 min / $0.64** | 366.56-388.74 min / $4.75-$5.03 | **35.23-37.36x** | Current full run measured; upstream completed Level 0 and four of eight phenotype fits |
-| Binary | 0-10% | 500,000 | 700,000 | 32 | **36.33 min / $2.22** | 1,065.89-1,161.49 min / $13.80-$15.04 | **29.34-31.97x** | Current full run measured; upstream range projected from a matched 210-block Level 0 prefix |
-| Survival | 0-10% | 500,000 | 700,000 | 8 | **9.60 min / $0.59** | 230.19-239.78 min / $2.98-$3.10 | **23.99-24.99x** | Current full run measured; upstream completed Level 0 and four of eight phenotype fits |
-| Survival | 0-10% | 500,000 | 700,000 | 32 | **33.15 min / $2.03** | 540.91-586.64 min / $7.00-$7.60 | **16.32-17.70x** | Current full run measured; upstream range projected from a matched 192-block Level 0 prefix |
+| Quantitative | 0-10% | 500,000 | 700,000 | 8 | **4.92 min / $0.30** | 155.51 min / $2.01 | **31.64x** | Both full runs measured directly; current Level 0 intermediates on SSD Persistent Disk |
+| Quantitative | 0-10% | 500,000 | 700,000 | 32 | **18.73 min / $1.15** | 243.08 min / $3.15 | **12.98x** | Both full runs measured directly; current Level 0 intermediates on SSD Persistent Disk |
+| Binary | 0-10% | 500,000 | 700,000 | 8 | **9.85 min / $0.60** | 366.56-388.74 min / $4.75-$5.03 | **37.22-39.47x** | Current full run measured; upstream completed Level 0 and four of eight phenotype fits |
+| Binary | 0-10% | 500,000 | 700,000 | 32 | **34.27 min / $2.10** | 1,065.89-1,161.49 min / $13.80-$15.04 | **31.10-33.89x** | Current full run measured; upstream range projected from a matched 210-block Level 0 prefix |
+| Survival | 0-10% | 500,000 | 700,000 | 8 | **8.16 min / $0.50** | 230.19-239.78 min / $2.98-$3.10 | **28.22-29.40x** | Current full run measured; upstream completed Level 0 and four of eight phenotype fits |
+| Survival | 0-10% | 500,000 | 700,000 | 32 | **30.63 min / $1.87** | 540.91-586.64 min / $7.00-$7.60 | **17.66-19.16x** | Current full run measured; upstream range projected from a matched 192-block Level 0 prefix |
 
 Compute costs use the 2026-07-20 price snapshot: $3.673385/hour for the
 on-demand A100 system and $0.776944/hour for the on-demand N2 system. They are
@@ -49,51 +53,68 @@ Their Level 1 projections use the observed P=8 per-trait fit times because
 upstream fits traits serially. Each range reflects both instrumented phase
 rates and observed wall time.
 
-## Where the A100 time goes
+## Where the current default time goes
 
-| Model | N | Stage 1 variants | P | Setup | Level 0 | Level 1 | LOCO output | Full run | Mean GPU utilization, Level 0 / Level 1 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Quantitative, complete; SSD Level 0 | 500,000 | 700,000 | 1 | 2.04 s | 98.80 s | 0.66 s | 2.74 s | **104.24 s** | 84.9% / not meaningful (0.66 s) |
-| Quantitative, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 8 | 3.42 s | 158.95 s | 122.98 s | 9.74 s | **295.09 s** | 62.7% / 10.2% |
-| Quantitative, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 32 | 5.93 s | 533.34 s | 541.66 s | 41.50 s | **1,122.43 s** | 25.2% / 9.6% |
-| Binary, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 8 | 5.61 s | 309.13 s | 294.04 s | 15.52 s | **624.32 s** | 31.6% / 82.6% |
-| Binary, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 32 | 15.25 s | 966.00 s | 1,144.88 s | 53.80 s | **2,179.92 s** | 14.2% / 85.3% |
-| Survival, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 8 | 6.75 s | 319.93 s | 233.26 s | 15.77 s | **575.71 s** | 33.7% / 67.6% |
-| Survival, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 32 | 21.38 s | 1,008.61 s | 903.57 s | 55.50 s | **1,989.06 s** | 13.9% / 72.8% |
+| Model | N | Stage 1 variants | P | Setup | Level 0 | Level 1 | LOCO output | Full run |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Quantitative, complete; SSD Level 0 | 500,000 | 700,000 | 1 | 2.04 s | 98.80 s | 0.66 s | 2.74 s | **104.24 s** |
+| Quantitative, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 8 | 3.35 s | 157.75 s | 124.14 s | 9.68 s | **294.93 s** |
+| Quantitative, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 32 | 5.84 s | 533.54 s | 543.86 s | 40.78 s | **1,124.01 s** |
+| Binary, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 8 | 5.77 s | 277.05 s | 292.20 s | 15.92 s | **590.94 s** |
+| Binary, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 32 | 15.21 s | 843.41 s | 1,143.68 s | 53.85 s | **2,056.15 s** |
+| Survival, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 8 | 6.73 s | 233.53 s | 233.43 s | 15.70 s | **489.38 s** |
+| Survival, 0-10% missing; SSD Level 0 | 500,000 | 700,000 | 32 | 21.71 s | 854.42 s | 906.57 s | 54.83 s | **1,837.54 s** |
 
-Low utilization does not have one explanation across the run. Level 0 mixes
-GPU solves with genotype preprocessing, host orchestration, and writing the
-Level 0 predictions. Level 1 quantitative is storage-bound. The P=32 design
-occupies 455.04 GB on disk; with its intermediates on balanced Persistent
-Disk, 498.61 of 618.73 Level 1 seconds were foreground read wait.
+All current multi-trait rows put only the Level 0 intermediates on a 2 TB,
+network-attached SSD Persistent Disk. Input genotypes and final output remain
+on the original disk. The intermediates occupy 113.76 GB at P=8 and 455.04 GB
+at P=32.
 
-A matched run put only those intermediates on a 2 TB SSD Persistent Disk.
-Input genotypes and final output stayed on the original balanced disk. Full
-runtime fell from 1,289.32 to 1,122.43 seconds, a 12.9% wall-time reduction.
-Level 0 fell from 608.48 to 533.34 seconds and Level 1 from 618.73 to 541.66
-seconds. Level 1 still spent 421.50 seconds waiting for reads, and mean GPU
-utilization there was 9.6%. The faster disk therefore helps, but does not
-remove the cost of materializing and rereading the 455 GB design. This test
-uses network-attached Persistent Disk SSD, not Local SSD.
+Quantitative Level 1 remains storage-bound: the P=32 run spent 423.15 of
+543.86 seconds waiting for foreground reads. Binary and survival Level 1 are
+compute-bound; their P=32 foreground read waits were only 15.26 seconds within
+1,143.68 and 906.57 seconds, respectively.
 
-At P=8, where the intermediates occupy 113.76 GB, the same change reduced the
-full run from 316.86 to 295.09 seconds (6.9%). Level 0 was effectively
-unchanged; Level 1 fell from 139.72 to 122.98 seconds. All 32 P=32 and all
-eight P=8 LOCO files are byte-identical to the matched balanced-disk runs.
+The current byte-exact default uses ordinary FP64 IRLS for binary Level 1.
+The survival event fields are not Stage 1 outcomes; Level 0 downloads only
+the active time-outcome columns.
 
-Binary and survival Level 1 contain much more GPU work. Mean Level 1
-utilization is 82.6% and 67.6% at P=8, and 85.3% and 72.8% at P=32. Moving
-their Level 0 intermediates from balanced to SSD Persistent Disk changed the
-P=32 full runtimes by only 0.5% for binary and 0.6% for survival. In the SSD
-runs, Level 1 foreground read wait was 15.4 seconds of 1,144.9 seconds for
-binary and 15.0 seconds of 903.6 seconds for survival. These Level 1 workloads
-are compute-bound rather than storage-bound.
+## Opt-in path-Newton sensitivity
 
-For survival, the event fields are not Stage 1 outcomes. The current
-implementation performs the full FP64 cuBLAS/cuSOLVER calculation but
-downloads only the 32 active time-outcome columns. GPU-to-host result transfer
-accounts for 398.37 seconds of the 1,008.61-second Level 0 phase in the
-production-size run.
+Path-Newton is disabled by default because it changes low-order printed digits
+in final Stage 2 results. It can be enabled explicitly with:
+
+```bash
+REGENIE_STEP1_LEVEL1_PATH_NEWTON=1 regenie ...
+```
+
+The following matched binary runs include the same unconditional Level 0
+transport path as the default. P=8 uses seed 20260721 in both rows and P=32
+uses seed 20260722 in both rows.
+
+| P | Byte-exact default | Default + path-Newton | Incremental speedup | Runtime reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 589.753 s | **453.624 s** | **1.30x** | **23.1%** |
+| 32 | 2,056.154 s | **1,526.362 s** | **1.35x** | **25.8%** |
+
+Path-Newton preserves the model specification, ridge grids, convergence
+tolerance, and scientific conclusions tested, but it is not byte-identical.
+The direct P=8 and P=32 Stage 2 comparisons covered 5.6 million and 22.4
+million association rows. Maximum absolute differences in printed fields
+were:
+
+| Field | Maximum absolute difference |
+| --- | ---: |
+| `BETA` | 0.000001 |
+| `SE` | 0.0000001 |
+| `CHISQ` | 0.0001 |
+| `LOG10P` | 0.00001 |
+
+All numeric-field correlations exceeded 0.9999999999998. Every trait retained
+identical top-100 and top-1,000 variants, identical membership at `p <= 1e-5`
+and genome-wide significance, and no sign changes among variants with
+`abs(z) >= 3`. These rows are a sensitivity analysis, not the default
+headline configuration.
 
 ## Same-machine CPU comparison
 
@@ -118,9 +139,18 @@ path. Dense host operations use oneMKL; dense GPU operations use
 cuBLAS/cuSOLVER.
 
 The A100 build passes the CPU, CUDA, Stage 2 CPU, and Cox test targets. The N2
-build passes the CPU, automatic-backend, and Cox targets. Production-size
-outputs for all seven current A100 rows are byte-identical to matched
-validated controls.
+build passes the CPU, automatic-backend, and Cox targets.
+
+The default path keeps the original model, ridge grids, initialization,
+iteration order, convergence checks, and line-search semantics. Every
+production-size Stage 1 LOCO file in the current P=8/P=32 quantitative,
+binary, and survival runs is byte-for-byte identical to its matched validated
+control. Those files are the inputs to Stage 2; with unchanged Stage 2 code,
+the final Stage 2 scientific output is therefore also byte-identical.
+
+The path-Newton sensitivity is the sole exception discussed in this report.
+It requires an explicit opt-in and its final Stage 2 differences are
+quantified above.
 
 ## Raw results
 
@@ -130,4 +160,8 @@ projected upstream comparisons are in
 [`2026-07-22-step1-upstream.tsv`](2026-07-22-step1-upstream.tsv). The larger
 [`2026-07-19-production.tsv`](2026-07-19-production.tsv) is a historical raw
 run ledger retained for reproducibility; it is not used as a current-branch
-comparison table.
+comparison table. Transport-safety A/B measurements are kept out of this
+headline report and are recorded in
+[`2026-07-23-step1-pinned-download.md`](2026-07-23-step1-pinned-download.md).
+The full opt-in sensitivity is in
+[`2026-07-23-step1-path-newton.md`](2026-07-23-step1-path-newton.md).

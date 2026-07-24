@@ -41,15 +41,18 @@ model-fitting variants, binary traits with 0-10% missingness, `--bsize 1000`,
 
 | Traits | Implementation | Level 0 (s) | Level 1 (s) | Total (s) | Level 1 weighted Grams |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 8 | matched FP64 reference | 309.579 | 293.186 | 617.837 | 508 |
-| 8 | path-Newton | 310.281 | 157.339 | 482.626 | 170 |
-| 32 | current reference | 965.997 | 1,144.876 | 2,179.918 | 2,038 |
-| 32 | path-Newton | 981.171 | 614.276 | 1,664.349 | 695 |
+| 8 | ordinary IRLS, pre-transport | 309.579 | 293.186 | 617.837 | 508 |
+| 8 | path-Newton, pre-transport | 310.281 | 157.339 | 482.626 | 170 |
+| 32 | ordinary IRLS, pre-transport | 965.997 | 1,144.876 | 2,179.918 | 2,038 |
+| 32 | path-Newton, pre-transport | 981.171 | 614.276 | 1,664.349 | 695 |
 
 The experiment reduced Level 1 by 46.3% at both P=8 and P=32. End-to-end
-time fell by 21.9% in the matched P=8 pair and 23.7% at P=32. The P=8
-production-table reference is 624.316 seconds, against which the same
-candidate is 22.7% faster.
+time fell by 21.9% in the matched P=8 pair and 23.7% at P=32.
+
+Those rows isolate path-Newton before the later unconditional Level 0
+transport change. The current matched opt-in sensitivity includes both:
+589.753 to 453.624 seconds at P=8 and 2,056.154 to 1,526.362 seconds at P=32.
+The cross-product is recorded in `2026-07-23-step1-pinned-download.md`.
 
 At P=32, the method made 2,560 path corrections, allowed 323 ridge fits to
 finish without another ordinary IRLS iteration, and reduced weighted-Gram

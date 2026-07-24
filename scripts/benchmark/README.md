@@ -5,7 +5,7 @@ REGENIE v4.1.2. Start with the report for the stage you plan to run:
 
 | Report | Workload shapes | Main conclusion |
 | --- | --- | --- |
-| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000; 700,000 model-fitting variants; quantitative, binary, and survival traits with 0-10% missingness | Direct current A100 measurements versus upstream v4.1.2 on an eight-core N2, plus a same-N2 software comparison |
+| [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000; 700,000 model-fitting variants; quantitative, binary, and survival traits with 0-10% missingness | Latest byte-exact default on A100 versus upstream v4.1.2 on an eight-core N2, plus a clearly separated opt-in path-Newton sensitivity |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `3ab5fbb` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=32 with 0-10% missingness, current processes 848.2 quantitative, 792.7 binary, and 524.9 survival variants/s; CPU chromosome fan-out remains the recommended production placement |
 
 Every headline table states the sample count, trait count, model, hardware,
@@ -83,12 +83,12 @@ checksum across systems.
 
 Stage 1:
 
-- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — upstream and best branch Stage 1
-  placement measurements, with sample count, Stage 1 variants, trait count,
+- [`results/2026-07-19-production.tsv`](results/2026-07-19-production.tsv) — historical
+  Stage 1 placement ledger, with sample count, Stage 1 variants, trait count,
   system, revision, and cache state in every row.
 - [`results/2026-07-22-step1-level1.tsv`](results/2026-07-22-step1-level1.tsv) — focused
-  latest or best-applicable branch measurements at N=500,000 and 700,000
-  Stage 1 variants. Intermediate branch revisions are not included.
+  latest byte-exact default measurements at N=500,000 and 700,000 Stage 1
+  variants. Intermediate branch revisions are not included.
 - [`results/2026-07-22-step1-upstream.tsv`](results/2026-07-22-step1-upstream.tsv) — direct upstream v4.1.2
   comparisons and clearly labeled projections for slow multi-trait runs.
 - [`results/2026-07-23-step1-path-newton.md`](results/2026-07-23-step1-path-newton.md) and
@@ -97,9 +97,9 @@ Stage 1:
   P=8/P=32, including full downstream Stage 2 validation.
 - [`results/2026-07-23-step1-pinned-download.md`](results/2026-07-23-step1-pinned-download.md)
   and [`TSV`](results/2026-07-23-step1-pinned-download.tsv) — unconditional,
-  byte-exact CUDA Level 0 download optimization, including isolated and
-  combined four-cell P=8/P=32 profiles and the combined 30.0% P=32 Stage 1
-  reduction.
+  byte-exact CUDA Level 0 download optimization, including the quantitative,
+  binary, and survival P=8/P=32 safety gate and isolated/combined binary
+  profiles.
 
 Stage 2:
 

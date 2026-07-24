@@ -22,7 +22,38 @@ This closes a gap between paths: the complete-case, device-normalized Level 0
 path already registered its output destination, while the
 variable-missingness path did not.
 
-## Stage 1 performance
+## Cross-model transport gate
+
+The unconditional change was checked at P=8 and P=32 for quantitative,
+binary, and survival traits. All runs used the same A100 40 GB, N=500,000,
+700,000 model-fitting variants, `--bsize 1000`, 12 threads, FP64 CUDA solves,
+and SSD-backed Level 0 intermediates. Path-Newton was disabled or unset.
+
+| Model | Traits | Pre-change Level 0 (s) | Current Level 0 (s) | Pre-change total (s) | Current total (s) | Final Stage 1 output |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Quantitative | 8 | 158.946 | 157.754 | 295.088 | 294.933 | 8/8 LOCO files byte-identical |
+| Quantitative | 32 | 533.339 | 533.537 | 1,122.427 | 1,124.013 | 32/32 LOCO files byte-identical |
+| Binary | 8 | 309.579 | 275.605 | 617.837 | 589.753 | 8/8 LOCO files byte-identical |
+| Binary | 32 | 965.997 | 843.412 | 2,179.918 | 2,056.154 | 32/32 LOCO files byte-identical |
+| Survival | 8 | 319.932 | 233.525 | 575.711 | 489.381 | 8/8 LOCO files byte-identical |
+| Survival | 32 | 1,008.611 | 854.424 | 1,989.062 | 1,837.541 | 32/32 LOCO files byte-identical |
+
+Quantitative does not enter the newly registered variable-missingness result
+path; its P=8 total changed by -0.05% and its P=32 total by +0.14%, both run
+noise. The new code therefore does not regress the unaffected model.
+
+For binary, the current default reduced matched P=8 total time by 4.5% and
+P=32 by 5.7%. For survival it reduced P=8 by 15.0% and P=32 by 7.6%.
+The unusually fast P=8 survival registration trial transferred ridge results
+in 19.35 seconds; the P=32 result, 235.12 seconds versus 398.37 seconds
+before the change, demonstrates that the gain also scales under the larger
+459.52 GB cumulative transfer workload.
+
+Because every default LOCO file is byte-identical to its matched pre-change
+control, the transport change leaves the input to Stage 2 unchanged and
+therefore cannot alter the final Stage 2 read-out.
+
+## Binary factorial performance
 
 All runs used the same A100 40 GB, N=500,000, 700,000 model-fitting variants,
 binary traits with 0-10% missingness, `--bsize 1000`, 12 threads, FP64 CUDA
@@ -48,15 +79,15 @@ The gains stack. At P=8 the additive prediction from the two isolated wins is
 455.192 seconds, versus an observed combined time of 453.624 seconds. At P=32
 the additive prediction is 1,540.585 seconds, versus 1,526.362 observed.
 The interactions are only 1.568 and 14.223 seconds, or 0.3% and 0.7% of the
-respective baselines. The two retained changes together reduce P=8 by 26.6%
-and P=32 by 30.0%.
+respective baselines. When path-Newton is explicitly enabled, the two changes
+together reduce P=8 by 26.6% and P=32 by 30.0%.
 
 Linux page-registration latency is variable. An additional byte-identical P=8
 trial completed in 412.171 seconds with 19.884 seconds of transfer, versus
-453.624 seconds and 56.415 seconds in the final no-flags replay. Two subsequent
-P=8 measurements, including the ordinary-IRLS isolation, reproduced the
-56-57-second range. Pinning remained faster in every matched run, but the
-variance motivates a future persistent pinned-buffer pool.
+453.624 seconds and 56.415 seconds in the final combined replay. Two
+subsequent P=8 measurements, including the ordinary-IRLS isolation,
+reproduced the 56-57-second range. Pinning remained faster in every matched
+run, but the variance motivates a future persistent pinned-buffer pool.
 
 The P=32 run successfully registered all 7,110 destinations: 459.52 GB
 cumulatively over 711 blocks. At any one block, the registered prediction and
