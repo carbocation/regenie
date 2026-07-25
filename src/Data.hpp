@@ -27,6 +27,8 @@
 #ifndef DATA_H
 #define DATA_H
 
+#include "Step2_Compute.hpp"
+
 class Step1ComputeBackend;
 
 struct Step1GroupedPredictionProfile {
@@ -63,6 +65,8 @@ struct Step1Profile {
   double ridge_transfer_ms = 0;
   double ridge_backend_compute_ms = 0;
   double ridge_host_orchestration_ms = 0;
+  uint64_t ridge_pinned_download_count = 0;
+  uint64_t ridge_pinned_download_bytes = 0;
   uint64_t ridge_cholesky_folds = 0;
   uint64_t ridge_batched_cholesky_blocks = 0;
   uint64_t ridge_eigendecomposition_folds = 0;
@@ -80,6 +84,8 @@ struct Step1Profile {
   uint64_t preprocess_pinned_staging_upload_bytes = 0;
   uint64_t preprocess_packed_hardcall_blocks = 0;
   uint64_t preprocess_packed_hardcall_upload_bytes = 0;
+  uint64_t preprocess_registered_packed_uploads = 0;
+  uint64_t preprocess_registered_packed_upload_bytes = 0;
   double preprocess_packed_hardcall_expand_ms = 0;
   double preprocess_packed_hardcall_validation_ms = 0;
   double preprocess_packed_hardcall_allocation_ms = 0;
@@ -88,6 +94,9 @@ struct Step1Profile {
   uint64_t pgen_prefetched_blocks = 0;
   double pgen_prefetch_service_ms = 0;
   double pgen_prefetch_wait_ms = 0;
+  uint64_t level0_pipelined_blocks = 0;
+  double level0_pipeline_service_ms = 0;
+  double level0_pipeline_wait_ms = 0;
   double initialization_ms = 0;
   double level0_wall_ms = 0;
   double level1_prepare_ms = 0;
@@ -96,9 +105,37 @@ struct Step1Profile {
   uint64_t prediction_output_rows = 0;
   uint64_t prediction_output_values = 0;
   uint64_t prediction_output_threads = 0;
+  double prediction_output_read_l0_ms = 0;
+  double prediction_output_read_cache_ms = 0;
+  double prediction_output_check_l0_ms = 0;
+  double prediction_output_model_ms = 0;
   double prediction_output_format_ms = 0;
   double prediction_output_write_ms = 0;
   Step1GroupedPredictionProfile grouped_prediction;
+  double end_to_end_ms = 0;
+};
+
+struct Step2Profile {
+  uint64_t chromosomes = 0;
+  uint64_t blocks = 0;
+  uint64_t variants = 0;
+  uint64_t corrected_tests = 0;
+  uint64_t failed_tests = 0;
+  double setup_ms = 0;
+  double setup_file_initialization_ms = 0;
+  double setup_phenotype_covariate_ms = 0;
+  double setup_preparation_ms = 0;
+  double setup_block_ms = 0;
+  double setup_output_ms = 0;
+  double setup_model_ms = 0;
+  double setup_thread_ms = 0;
+  double prediction_read_ms = 0;
+  double null_model_ms = 0;
+  double qt_sparse_residual_layout_ms = 0;
+  double qt_packed_direct_layout_ms = 0;
+  double genotype_io_ms = 0;
+  double variant_compute_ms = 0;
+  double output_ms = 0;
   double end_to_end_ms = 0;
 };
 
@@ -137,15 +174,24 @@ class Data {
     Eigen::MatrixXd res, stats, W_hat;
     Eigen::RowVectorXd p_sd_yres;
     Eigen::VectorXd scale_G; // keep track of sd(Y) (1xP) and sd(G) (M*1)
+    Eigen::VectorXd step1_sample_weights;
     MultiPhen mphen;
     Step1Profile step1_profile;
     Step1PgenReadProfile step1_pgen_read_profile;
+    Step2Profile step2_profile;
+    Step2PgenReadProfile step2_pgen_read_profile;
+    Step2BgenParseProfile step2_bgen_parse_profile;
+    Step2VariantComputeProfile step2_variant_compute_profile;
     std::unique_ptr<Step1ComputeBackend> step1_compute_backend;
+    std::unique_ptr<Step2ComputeBackend> step2_compute_backend;
+    Step2ComputeTimings step2_compute_timings;
 
     // function definitions
     void run();
     void run_step1();
     void run_step2();
+    void print_step2_profile();
+    void prepare_step2_compute_backend();
 
     void file_read_initialization();
     void residualize_genotypes();
@@ -183,6 +229,7 @@ class Data {
       const Eigen::Ref<const Eigen::VectorXi>&,
       const Eigen::Ref<const Eigen::VectorXi>&,
       Eigen::MatrixXd&);
+    bool read_level1_prediction_cache(int const&);
     void print_snp_betas(const Eigen::Ref<const Eigen::VectorXd>&);
     void write_predictions(int const&);
     std::string write_ID_header(std::vector<uint32_t>&);

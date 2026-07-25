@@ -8,6 +8,7 @@ nav:
   - Home: index.md
   - Overview: overview.md
   - Install: install.md
+  - Compute Backends: compute-backends.md
   - Documentation: options.md
   - Performance: performance.md
   - UKBB Analysis: recommendations.md

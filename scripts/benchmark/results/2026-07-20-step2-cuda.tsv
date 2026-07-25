@@ -1,0 +1,13 @@
+run_id	system	revision	gpu	compute_capability	samples	variants_per_block	phenotypes	covariates	mode	repetitions	upload_ms	kernel_ms	combined_ms	projected_700k_s	wrapper_wall_s	gpu_util_mean_pct	gpu_util_median_pct	power_mean_w	power_limit_pct	peak_memory_mib	scope
+step2-cuda-t4-p32-quantitative	n1-standard-8-t4	bfff7de	Tesla_T4	7.5	50000	1000	32	NA	quantitative	50	2.700	48.811	51.511	36.058	23.85	96.041	100.000	65.826	94.037	273	kernel_feasibility_only
+step2-cuda-t4-p32-weighted	n1-standard-8-t4	bfff7de	Tesla_T4	7.5	50000	1000	32	5	weighted_projection	50	2.700	151.123	153.823	107.676	23.85	96.041	100.000	65.826	94.037	273	kernel_feasibility_only
+step2-cuda-t4-p32-cox	n1-standard-8-t4	bfff7de	Tesla_T4	7.5	50000	1000	32	5	cox_projection	50	2.700	250.838	253.538	177.477	23.85	96.041	100.000	65.826	94.037	273	kernel_feasibility_only
+step2-cuda-a100-p32-quantitative	a2-highgpu-1g	bfff7de	A100_SXM4_40GB	8.0	50000	1000	32	NA	quantitative	1000	2.564	3.956	6.520	4.564	32.79	93.007	100.000	303.646	75.911	596	kernel_feasibility_only
+step2-cuda-a100-p32-weighted	a2-highgpu-1g	bfff7de	A100_SXM4_40GB	8.0	50000	1000	32	5	weighted_projection	1000	2.564	10.502	13.065	9.146	32.79	93.007	100.000	303.646	75.911	596	kernel_feasibility_only
+step2-cuda-a100-p32-cox	a2-highgpu-1g	bfff7de	A100_SXM4_40GB	8.0	50000	1000	32	5	cox_projection	1000	2.564	15.089	17.652	12.357	32.79	93.007	100.000	303.646	75.911	596	kernel_feasibility_only
+step2-cuda-t4-p8-quantitative	n1-standard-8-t4	bfff7de	Tesla_T4	7.5	50000	1000	8	NA	quantitative	100	2.554	12.416	14.969	10.479	11.97	92.918	100.000	65.247	93.210	159	kernel_feasibility_only
+step2-cuda-t4-p8-weighted	n1-standard-8-t4	bfff7de	Tesla_T4	7.5	50000	1000	8	5	weighted_projection	100	2.554	38.452	41.006	28.704	11.97	92.918	100.000	65.247	93.210	159	kernel_feasibility_only
+step2-cuda-t4-p8-cox	n1-standard-8-t4	bfff7de	Tesla_T4	7.5	50000	1000	8	5	cox_projection	100	2.554	58.862	61.416	42.991	11.97	92.918	100.000	65.247	93.210	159	kernel_feasibility_only
+step2-cuda-a100-p8-quantitative	a2-highgpu-1g	bfff7de	A100_SXM4_40GB	8.0	50000	1000	8	NA	quantitative	2000	2.530	0.997	3.527	2.469	21.02	82.640	100.000	250.737	62.684	482	kernel_feasibility_only
+step2-cuda-a100-p8-weighted	a2-highgpu-1g	bfff7de	A100_SXM4_40GB	8.0	50000	1000	8	5	weighted_projection	2000	2.530	2.794	5.324	3.727	21.02	82.640	100.000	250.737	62.684	482	kernel_feasibility_only
+step2-cuda-a100-p8-cox	a2-highgpu-1g	bfff7de	A100_SXM4_40GB	8.0	50000	1000	8	5	cox_projection	2000	2.530	3.900	6.429	4.501	21.02	82.640	100.000	250.737	62.684	482	kernel_feasibility_only

@@ -128,6 +128,10 @@ void print_header(std::ostream& o){
   o << "Compiled with HTSlib.\n";
 #endif
 
+#if defined(WITH_LIBDEFLATE)
+  o << "Compiled with libdeflate BGEN decompression.\n";
+#endif
+
   // adding BLAS/LAPACK external routines
 #if defined(WITH_MKL)
   o << "Using Intel MKL with Eigen.\n";
@@ -258,8 +262,9 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
   AllOptions.add_options("Additional")
     ("v,verbose", "verbose screen output")
     ("step1-profile", "output structured timing data for step 1 level 0")
-    ("compute-backend", "Step 1 compute backend: cpu, cuda, or auto", cxxopts::value<std::string>(params->compute_backend), "STRING(=" + params->compute_backend + ")")
-    ("gpu-device", "CUDA device index for the Step 1 compute backend", cxxopts::value<int>(params->gpu_device),"INT(=0)")
+    ("step2-profile", "output structured timing data for step 2")
+    ("compute-backend", "compute backend: cpu, cuda, or auto", cxxopts::value<std::string>(params->compute_backend), "STRING(=" + params->compute_backend + ")")
+    ("gpu-device", "CUDA device index for the compute backend", cxxopts::value<int>(params->gpu_device),"INT(=0)")
     ("version", "print version number and exit")
     ("minCaseCount", "minimum number of cases per trait", cxxopts::value<int>(params->mcc),"INT=10")
     ("tpheno-file", "transposed phenotype file (each row is a phenotype)", cxxopts::value<std::string>(files->pheno_file),"FILE")
@@ -462,6 +467,7 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
     if( vm.count("tpheno-file") ) params->transposedPheno = true;
     if( vm.count("v") ) params->verbose = true;
     if( vm.count("step1-profile") ) params->profile_step1 = true;
+    if( vm.count("step2-profile") ) params->profile_step2 = true;
     if( vm.count("debug") ) params->verbose = params->debug = true;
     if( vm.count("range") ) params->set_range = true;
     if( vm.count("print") ) params->print_block_betas = true;
@@ -908,22 +914,15 @@ void read_params_and_check(int& argc, char *argv[], struct param* params, struct
       params->profile_step1 = false;
       valid_args[ "step1-profile" ] = false;
     }
+    if(!params->test_mode && params->profile_step2) {
+      sout << "WARNING: option --step2-profile is only available in step 2.\n";
+      params->profile_step2 = false;
+      valid_args[ "step2-profile" ] = false;
+    }
     if(params->compute_backend != "cpu" && params->compute_backend != "cuda" && params->compute_backend != "auto")
       throw "--compute-backend must be one of: cpu, cuda, auto";
     if(params->gpu_device < 0)
       throw "--gpu-device must be non-negative";
-    if(params->test_mode) {
-      bool const invalid_step2_backend =
-        (vm.count("compute-backend") && params->compute_backend != "cpu") ||
-        vm.count("gpu-device");
-      if(invalid_step2_backend) {
-        sout << "WARNING: options --compute-backend/--gpu-device currently only apply to step 1.\n";
-        valid_args[ "compute-backend" ] = valid_args[ "gpu-device" ] = false;
-      }
-      params->compute_backend = "cpu";
-      params->gpu_device = 0;
-    }
-
     if( (vm.count("write-samples") || vm.count("write-mask")) && vm.count("bgen") && !vm.count("sample") )
       throw "must specify sample file (using --sample) if writing sample IDs to file.";
 
@@ -1541,7 +1540,8 @@ void print_usage_info(struct param const* params, struct in_files* files, mstrea
     // Step 1
     // 4P + max( B + PRT, PRT) + #chrs [P:#traits;R=#ridge l0;T=#predictions from l0]
     int t_eff = ( params->write_l0_pred ? 1 : params->total_n_block );
-    int p_eff = ( params->write_l0_pred ? 1 : params->n_pheno );
+    int p_eff = ( params->write_l0_pred ?
+      std::min(2, params->n_pheno) : params->n_pheno );
     int b_eff = params->total_n_block;
 
     total_ram = 4 * params->n_pheno + params->nChrom + params->ncov;
@@ -1691,8 +1691,9 @@ double convertDouble(const string& val, struct param const* params, mstream& sou
   else if( (val == "nan") || (val == "inf") )
     return params->missing_value_double;
 
-  double dval;
-  if(sscanf(val.c_str(), "%lf", &dval) != 1)
+  char* end = nullptr;
+  const double dval = std::strtod(val.c_str(), &end);
+  if(end == val.c_str())
     throw "could not convert value to double: '" + val + "'";
 
   return dval;
@@ -1705,8 +1706,9 @@ float convertFloat(const string& val, struct param const* params, mstream& sout)
   else if( (val == "nan") || (val == "inf") )
     return params->missing_value_float;
 
-  float dval;
-  if(sscanf(val.c_str(), "%f", &dval) != 1)
+  char* end = nullptr;
+  const float dval = std::strtof(val.c_str(), &end);
+  if(end == val.c_str())
     throw "could not convert value to float: '" + val + "'";
 
   return dval;

@@ -987,7 +987,7 @@ void GenoMask::buildMask(int const& isnp, int const& chrom, uint32_t const& phys
         snp_data->ns1++;
 
         // counts by trait
-        if(filters->has_missing(index)) update_trait_counts(index, ds, mval, lval, 0, snp_data, masked_indivs);
+        if(filters->has_missing(index)) update_trait_counts(index, ds, mval, lval, 0, snp_data, filters->missing_pheno_indices[index]);
 
         /* // get genotype counts (convert to hardcall)
         if( params->htp_out && (take_max || take_comphet) ) {

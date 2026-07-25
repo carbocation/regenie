@@ -161,7 +161,8 @@ void cox_mle::cox_test_prep(const survival_data& survivalData, const Eigen::Matr
     X1 << Eigen::VectorXd::Ones(survivalData.n), Xmat;
     WX1 = X1.array().colwise() * mu.array();
     Eigen::MatrixXd X1tWX1 = X1.transpose() * WX1;
-    X1_X1WX1inv = X1 * X1tWX1.colPivHouseholderQr().inverse();
+    X1tWX1inv = X1tWX1.colPivHouseholderQr().inverse();
+    X1_X1WX1inv.noalias() = X1 * X1tWX1inv;
     
     double res_mean = residual.mean();
     // Compute the variance

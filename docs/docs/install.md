@@ -57,7 +57,14 @@ To use with Boost Iostreams and/or Intel MKL library,
 add the corresponding flags before the `cmake` command on line 3
 (e.g. `BGEN_PATH=<path_to_bgen_lib> HAS_BOOST_IOSTREAM=1 cmake ..`).
 
-### Experimental CUDA Step 1 backend
+If libdeflate development headers and its library are installed, CMake uses
+libdeflate automatically to decompress zlib-compressed BGEN blocks and falls
+back to zlib when it is unavailable. Use `-DREGENIE_LIBDEFLATE=ON` to require
+libdeflate or `-DREGENIE_LIBDEFLATE=OFF` to disable it. For a nonstandard
+installation, set `-DREGENIE_LIBDEFLATE_ROOT=<path>`. Makefile builds can opt
+in with `LIBDEFLATE_ROOT=<path>`.
+
+### Experimental CUDA backends
 
 The CUDA backend accelerates the FP64 matrix work in Step 1, including Gram
 and phenotype crossproducts, symmetric eigensystems, batched ridge prediction,
@@ -77,6 +84,10 @@ BGEN_PATH=<path_to_bgen_lib> cmake -S . -B build-cuda \
 cmake --build build-cuda -j
 ```
 
+Stage 2 CUDA support is included by default in a CUDA build. Add
+`-DREGENIE_WITH_STEP2_CUDA=OFF` to build the Stage 1 CUDA backend without
+compiling or linking the Stage 2 CUDA implementation.
+
 The existing `STATIC=1` mode remains available for CUDA-enabled builds. It
 retains its usual behavior for oneMKL and the supported host dependencies,
 while the CUDA libraries remain dynamically linked:
@@ -89,11 +100,25 @@ cmake -S . -B build-cuda-mkl \
 cmake --build build-cuda-mkl -j
 ```
 
-CUDA-enabled builds default to `--compute-backend auto`: Step 1 uses device 0
-when it is available and otherwise falls back to the CPU backend. Use
+CUDA-enabled builds default to `--compute-backend auto`: supported work uses
+device 0 when it is available and otherwise falls back to the CPU backend. Use
 `--gpu-device` to select a different visible device, `--compute-backend cpu` to
 prevent GPU use, or `--compute-backend cuda` to require CUDA rather than fall
 back.
+
+Step 2 CUDA support is limited to additive single-variant score tests from PGEN
+hardcalls. Quantitative, binary, and approximate Cox scores are eligible when
+the surrounding workflow does not require dosage, interaction, set-based, or
+other unsupported processing. Exact Cox scores run on the CPU. Approximate
+Firth and SPA corrections also run on the CPU after the initial score, so GPU
+utilization can be low when many variants require correction. The Step 2
+backend consumes PGEN's packed hardcalls directly and avoids expanding an
+otherwise-unused dense host genotype block for eligible score-only analyses.
+When phenotype masks differ, it also derives each trait's allele count and
+nonmissing sample count from the packed block on the GPU instead of expanding
+the genotype for host-side bookkeeping.
+Use `--step2-profile` to report whether CUDA was selected, the main Step 2 phase
+times, and the backend's transfer and kernel times.
 
 Sample-major device buffers are limited to approximately 1 GB by default.
 Set `REGENIE_CUDA_CHUNK_MB` to a positive integer to use a smaller per-buffer

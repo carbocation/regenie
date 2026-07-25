@@ -38,6 +38,7 @@
 #endif
 
 #include "pgenlibr.h"
+#include "Step2_Compute.hpp"
 
 struct annoinfo {
   uint64 regionid = 0ULL;
@@ -85,6 +86,54 @@ struct Step1PgenReadProfile {
   double reader_call_thread_ms = 0;
 };
 
+struct Step2PgenReadProfile {
+  uint64_t variants = 0;
+  uint64_t fast_path_variants = 0;
+  uint64_t packed_hardcall_variants = 0;
+  uint64_t packed_hardcall_bytes = 0;
+  uint64_t packed_unexpanded_variants = 0;
+  double thread_work_ms = 0;
+  double decode_thread_ms = 0;
+  double packed_expand_thread_ms = 0;
+};
+
+struct Step2BgenParseProfile {
+  uint64_t variants = 0;
+  uint64_t fast_path_variants = 0;
+  uint64_t lookup_path_variants = 0;
+  double thread_work_ms = 0;
+  double decompress_thread_ms = 0;
+  double header_thread_ms = 0;
+  double sample_decode_thread_ms = 0;
+  double finalize_thread_ms = 0;
+};
+
+struct Step2VariantComputeProfile {
+  uint64_t variants = 0;
+  uint64_t sparse_variants = 0;
+  uint64_t packed_sparse_variants = 0;
+  uint64_t packed_direct_qt_variants = 0;
+  uint64_t packed_direct_dense_qt_variants = 0;
+  uint64_t shared_denom_sparse_qt_variants = 0;
+  uint64_t rowmajor_sparse_qt_variants = 0;
+  uint64_t unscaled_dense_qt_variants = 0;
+  uint64_t shared_denom_dense_qt_variants = 0;
+  uint64_t missing_denom_dense_qt_variants = 0;
+  uint64_t algebraic_dense_qt_variants = 0;
+  uint64_t dense_qt_score_candidates = 0;
+  uint64_t batched_dense_qt_blocks = 0;
+  uint64_t batched_dense_qt_variants = 0;
+  uint64_t batched_dense_qt_columns = 0;
+  double batched_dense_qt_ms = 0;
+  double thread_work_ms = 0;
+  double parse_thread_ms = 0;
+  double preprocess_thread_ms = 0;
+  double score_thread_ms = 0;
+  double sparse_score_thread_ms = 0;
+  double dense_score_thread_ms = 0;
+  double interaction_thread_ms = 0;
+};
+
 // for step 2 per thread
 struct data_thread {
   SpVec Gsparse;
@@ -100,6 +149,8 @@ struct data_thread {
   Eigen::ArrayXd bhat;
   Eigen::ArrayXd se_b;
   Eigen::ArrayXd skat_var;
+  // Covariate crossproducts for the algebraic dense-QT projection path.
+  Eigen::VectorXd qt_XtG;
   // for spa
   bool pos_score;
   double val_a, val_b, val_c, val_d; 
@@ -109,9 +160,12 @@ struct data_thread {
   // reset each time
   bool fastSPA = true;
   bool is_sparse = false;
+  bool sparse_from_packed = false;
+  bool qt_packed_direct = false;
   // QT residual is retained on its raw scale for the dense score path.
   bool qt_unscaled = false;
   bool qt_complete_masks = false;
+  bool qt_algebraic_projection = false;
 };
 
 struct geno_block {
@@ -119,6 +173,39 @@ struct geno_block {
   BgenParser bgen;
   PgenReader pgr;
   Eigen::MatrixXd Gmat;
+  // Retain simple Step 2 PGEN hardcalls so packed CPU or CUDA scores can be
+  // accumulated from two-bit codes without materializing sample vectors.
+  std::vector<std::vector<unsigned char>> step2_pgen_packed_hardcalls;
+  std::vector<double> step2_pgen_packed_means;
+  std::vector<unsigned char> step2_pgen_packed_unexpanded;
+  Step2ScoreBatch step2_backend_scores;
+  bool step2_pgen_direct_qt_enabled = false;
+  // Covariates followed by the one phenotype residual, contiguous by sample,
+  // for cache-friendly direct packed scoring.
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    step2_pgen_direct_qt_terms;
+  bool step2_pgen_direct_qt_terms_valid = false;
+  // Optional phenotype-by-variant score crossproducts for dense QT blocks.
+  Eigen::MatrixXd step2_qt_YtG;
+  bool step2_qt_YtG_valid = false;
+  // Complete-mask QT residuals laid out contiguously by sample so one sparse
+  // genotype traversal can accumulate every phenotype score.
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    step2_qt_sparse_residuals;
+  bool step2_qt_sparse_residuals_valid = false;
+  Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    step2_qt_observed_masks;
+  bool step2_qt_observed_masks_valid = false;
+  const std::vector<std::vector<int>>*
+    step2_qt_missing_pheno_indices = nullptr;
+  // X'Y terms for the weighted binary-trait score projection. These let the
+  // dense path evaluate the score without materializing an N-sample Gres.
+  std::vector<Eigen::VectorXd> step2_binary_XtY;
+  // Cached terms for the default Cox score approximation. The projected
+  // genotype norm and score can then be formed from small crossproducts.
+  std::vector<Eigen::MatrixXd> step2_cox_projection_gram;
+  std::vector<Eigen::VectorXd> step2_cox_projection_score;
+  std::vector<Eigen::VectorXd> step2_cox_score_residual;
   Eigen::MatrixXd snp_afs;
   std::vector<std::vector<double>> step1_pgen_worker_tiles;
   std::vector<unsigned char> step1_pgen_packed_hardcalls;
@@ -131,6 +218,10 @@ struct variant_block {
   bool ignored, flipped;
   int n_rr, n_aa, n_zero = -1;
   double scale_fac, mac1, af1, info1, ns1, ns1_adj;
+  // Exact squared norm after minor-allele flipping and mean imputation when
+  // the source is an unmodified standard diploid additive PGEN hardcall
+  // vector. A negative value means that the dense vector must be inspected.
+  double hardcall_squared_norm = -1;
   Eigen::ArrayXi ns, ns_case, ns_control, nmales, ns_case_adj;
   Eigen::ArrayXd af, af_case, af_control, mac, info, cf_burden;
   Eigen::MatrixXi genocounts;
@@ -211,10 +302,10 @@ void readChunkFromPGENFileToPackedHardcalls(const int&,const uint32_t&,
 
 void readChunkFromBGENFileToG(std::vector<uint64> const&,const int&,std::vector<snp> const&,struct param const*,Eigen::Ref<Eigen::MatrixXd>,BgenParser&,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<variant_block>&,mstream&);
 void readChunkFromBGEN(std::istream*,std::vector<uint32_t>&,std::vector<uint32_t>&,std::vector<std::vector<uchar>>&,std::vector<uint64>&);
-void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool = false);
-void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool);
+void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool = false,Step2BgenParseProfile* = nullptr);
+void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool,Step2BgenParseProfile* = nullptr);
 void parseSnpfromBed(const int&,const int&,const std::vector<uchar>&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*);
-void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&);
+void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&,Step2PgenReadProfile* = nullptr,std::vector<std::vector<unsigned char>>* = nullptr,bool = false,std::vector<double>* = nullptr,std::vector<unsigned char>* = nullptr,bool = false);
 
 void skip_snps(uint64 const&,struct param const*,struct in_files*,struct geno_block*);
 void jumpto_bed(uint64 const&,uint64 const&,std::ifstream&);
@@ -223,7 +314,7 @@ void prep_snp_stats(variant_block*,struct param const*);
 void initialize_thread_data(std::vector<data_thread>&,struct param const&);
 void reset_thread(data_thread*,struct param const&);
 void reset_stats(variant_block*,struct param const&);
-void update_trait_counts(int const&,double const&,double const&,int const&,double const&,variant_block*,const Eigen::Ref<const MatrixXb>&);
+void update_trait_counts(int const&,double const&,double const&,int const&,double const&,variant_block*,const std::vector<int>&);
 void update_genocounts(bool const&,int const&,int const&,Eigen::MatrixXd&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&);
 void compute_genocounts(bool const&,bool const&,double const&,const Eigen::Ref<const Eigen::ArrayXd>&,Eigen::Ref<Eigen::MatrixXi>,const Eigen::Ref<const Eigen::ArrayXi>&,std::vector<std::vector<Eigen::ArrayXi>> const&);
 void update_genocounts(bool const&,bool const&,Eigen::Ref<Eigen::VectorXi>,const Eigen::Ref<const Eigen::ArrayXi>&,const Eigen::Ref<const Eigen::ArrayXd>&,std::vector<Eigen::ArrayXi> const&);
@@ -238,6 +329,7 @@ void mean_impute_g(const double&,Eigen::Ref<Eigen::ArrayXd>,const Eigen::Ref<con
 void residualize_geno(int const&,int const&,variant_block*,bool const&,const Eigen::Ref<const Eigen::MatrixXd>&,struct geno_block*,struct param const*);
 void residualize_geno(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
 void residualize_geno_unscaled(const Eigen::Ref<const Eigen::MatrixXd>&,Eigen::Ref<Eigen::VectorXd>,variant_block*,struct param const&);
+bool prepare_geno_qt_algebraic(const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const Eigen::VectorXd>&,variant_block*,data_thread*,struct param const&);
 void writeSnplist(std::string const&,int const&,int const&,std::vector<snp> const&,mstream&);
 
 bool in_chrList(const int&,struct filter const*);

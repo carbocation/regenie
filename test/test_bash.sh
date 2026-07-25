@@ -90,7 +90,7 @@ if [ ! -f "${REGENIE_PATH}test/fit_bin_out.log" ] || \
   print_custom_err "$fail_msg"
 elif [ "`grep \"0.4504\" ${REGENIE_PATH}test/fit_bin_out.log | grep \"min value\"`" = "" ]; then
   print_custom_err "$fail_msg"
-elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "11" ]; then
+elif [ "`grep -c '^STEP1_PROFILE stage=' ${REGENIE_PATH}test/fit_bin_out.log`" != "12" ]; then
   print_custom_err "Step 1 profiling output is incomplete."
 elif ! grep -q '^STEP1_PROFILE version=9 backend=cpu mode=loocv ' ${REGENIE_PATH}test/fit_bin_out.log; then
   print_custom_err "Step 1 profiling header is missing."
@@ -172,6 +172,7 @@ rgcmd="--step 2 \
   --bt \
   --firth --approx \
   --pThresh 0.01 \
+  --step2-profile \
   --pred ${mntpt}test/fit_bin_out_pred.list \
   $arg_gz \
   --out ${mntpt}test/test_bin_out_firth"
@@ -184,9 +185,20 @@ if [ -f ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie.gz ]; then
   ( zcat < ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie.gz ) > ${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie
 fi
 
-if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie")" != "1001" ]
-then
+if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_firth_Y1.regenie")" != "1001" ]; then
   print_err
+elif [ "$(grep -c '^STEP2_PROFILE stage=' "${REGENIE_PATH}test/test_bin_out_firth.log")" != "8" ]; then
+  print_custom_err "Step 2 profiling output is incomplete."
+elif ! grep -q '^STEP2_PROFILE version=2 mode=single_variant backend=cpu file_type=bgen trait=bt ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 profiling header is missing."
+elif ! grep -q '^STEP2_PROFILE scope=setup ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 setup profiling output is missing."
+elif ! grep -q '^STEP2_PROFILE scope=bgen_parse ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 BGEN profiling output is missing."
+elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 variant profiling output is missing."
+elif ! grep -q '^STEP2_PROFILE_FINAL version=2 mode=single_variant backend=cpu ' "${REGENIE_PATH}test/test_bin_out_firth.log"; then
+  print_custom_err "Step 2 final profiling output is missing."
 fi
 
 
@@ -226,7 +238,9 @@ rgcmd="--step 2 \
   --phenoFile ${mntpt}example/phenotype.txt \
   --remove ${mntpt}example/fid_iid_to_remove.txt \
   --bsize 200 \
+  --prop-zero-thr 1 \
   --ignore-pred \
+  --step2-profile \
   --out ${mntpt}test/test_bin_out_pgen_qt_complete"
 
 ./$regenie_bin $rgcmd
@@ -236,6 +250,199 @@ for phenotype in Y1 Y2; do
     print_err
   fi
 done
+
+if ! grep -q '^STEP2_PROFILE scope=pgen_ingest ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN profiling output is missing."
+elif ! grep -q ' packed_hardcall_variants=1000 ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN packed-hardcall ingestion was not exercised."
+elif ! grep -q '^STEP2_PROFILE scope=variant_compute ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN variant profiling output is missing."
+elif ! grep -q ' algebraic_dense_qt_variants=1000 ' "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete.log"; then
+  print_custom_err "Step 2 PGEN algebraic dense-QT projection was not exercised."
+fi
+
+# Force one complete quantitative phenotype through the sparse path. The
+# packed PGEN hardcalls should be scored directly without expanding a dense
+# sample vector or materializing an Eigen sparse vector.
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype.txt \
+  --phenoColList Y1 \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 0 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p1_packed"
+
+./$regenie_bin $rgcmd
+
+if ! grep -q ' packed_unexpanded_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN ingestion was not exercised."
+elif ! grep -q ' packed_direct_qt_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN QT scoring was not exercised."
+elif ! cmp --silent \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_Y1.regenie" \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_Y1.regenie"
+then
+  print_err
+fi
+
+# Exercise the same direct scorer on variants classified as dense while using
+# the generic multi-covariate crossproduct path.
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile ${mntpt}example/phenotype.txt \
+  --phenoColList Y1 \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 0.999 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p1_packed_dense"
+
+./$regenie_bin $rgcmd
+
+if ! grep -Eq ' packed_direct_dense_qt_variants=[1-9][0-9]* ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense.log"
+then
+  print_custom_err "Step 2 generic direct packed-PGEN dense-QT scoring was not exercised."
+elif ! grep -q '^STEP2_PROFILE scope=qt_score_layout .* packed_direct_layout_ms=' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN score layout was not exercised."
+elif ! cmp --silent \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_Y1.regenie" \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_packed_dense_Y1.regenie"
+then
+  print_err
+fi
+
+# Exercise direct packed scoring for both dense and sparse variants, including
+# the intercept-only specialization, against the materialized implementation.
+for representation in materialized direct_dense direct_sparse; do
+  case "$representation" in
+    materialized) prop_zero_thr=1 ;;
+    direct_dense) prop_zero_thr=0.999 ;;
+    direct_sparse) prop_zero_thr=0 ;;
+  esac
+  rgcmd="--step 2 \
+    --pgen ${mntpt}example/example \
+    --phenoFile ${mntpt}example/phenotype.txt \
+    --phenoColList Y1 \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --prop-zero-thr $prop_zero_thr \
+    --ignore-pred \
+    --step2-profile \
+    --out ${mntpt}test/test_bin_out_pgen_qt_p1_intercept_${representation}"
+  ./$regenie_bin $rgcmd
+done
+
+for representation in direct_dense direct_sparse; do
+  if ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_materialized_Y1.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_${representation}_Y1.regenie"
+  then
+    print_err
+  fi
+done
+
+if ! grep -Eq ' packed_direct_dense_qt_variants=[1-9][0-9]* ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p1_intercept_direct_dense.log"
+then
+  print_custom_err "Step 2 direct packed-PGEN dense-QT scoring was not exercised."
+fi
+
+
+(( i++ ))
+echo -e "\n==>Running test #$i\n"
+# Batched PGEN quantitative scores for a larger phenotype panel
+p16_pheno="${REGENIE_PATH}test/test_bin_out_pgen_qt_p16.pheno"
+awk '
+  NR == 1 {
+    printf "FID IID"
+    for (i = 1; i <= 16; ++i) printf " Y%d", i
+    printf "\n"
+    next
+  }
+  {
+    printf "%s %s", $1, $2
+    for (i = 0; i < 16; ++i) printf " %s", $(3 + (i % 2))
+    printf "\n"
+  }
+' "${REGENIE_PATH}example/phenotype.txt" > "$p16_pheno"
+
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile $p16_pheno \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 1 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p16"
+
+./$regenie_bin $rgcmd
+
+if ! grep -Eq '^STEP2_PROFILE scope=compute_backend name=cpu .* scored_blocks=5 .*scored_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16.log"
+then
+  print_custom_err "Step 2 PGEN blockwise dense-QT scores were not exercised."
+fi
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_complete_${phenotype}.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_${phenotype}.regenie"
+  then
+    print_err
+  fi
+done
+
+# Force the same complete-mask phenotype panel through the sparse genotype
+# path. Its shared denominator must be computed once per variant rather than
+# rebuilt independently for every phenotype.
+rgcmd="--step 2 \
+  --pgen ${mntpt}example/example \
+  --covarFile ${mntpt}example/covariates.txt \
+  --phenoFile $p16_pheno \
+  --remove ${mntpt}example/fid_iid_to_remove.txt \
+  --bsize 200 \
+  --prop-zero-thr 0 \
+  --ignore-pred \
+  --step2-profile \
+  --out ${mntpt}test/test_bin_out_pgen_qt_p16_sparse"
+
+./$regenie_bin $rgcmd
+
+if ! grep -q ' shared_denom_sparse_qt_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
+then
+  print_custom_err "Step 2 PGEN shared sparse-QT denominator was not exercised."
+elif ! grep -Eq '^STEP2_PROFILE scope=compute_backend name=cpu .* scored_blocks=5 .*scored_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse.log"
+then
+  print_custom_err "Step 2 PGEN sparse-threshold block scores were not exercised."
+fi
+
+for phenotype in Y1 Y2; do
+  if ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_${phenotype}.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_p16_sparse_${phenotype}.regenie"
+  then
+    print_err
+  fi
+done
+
+rm -f "$p16_pheno"
 
 
 (( i++ ))
@@ -267,24 +474,39 @@ done
 
 (( i++ ))
 echo -e "\n==>Running test #$i\n"
-# PGEN quantitative traits with phenotype-specific missingness
-rgcmd="--step 2 \
-  --pgen ${mntpt}example/example \
-  --covarFile ${mntpt}example/covariates.txt \
-  --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
-  --remove ${mntpt}example/fid_iid_to_remove.txt \
-  --bsize 200 \
-  --force-qt \
-  --ignore-pred \
-  --out ${mntpt}test/test_bin_out_pgen_qt_missing"
+# Quantitative traits with phenotype-specific missingness. PGEN should select
+# block scoring automatically and retain the materialized BED result exactly.
+for file_type in bed pgen; do
+  rgcmd="--step 2 \
+    --${file_type} ${mntpt}example/example \
+    --covarFile ${mntpt}example/covariates.txt \
+    --phenoFile ${mntpt}example/phenotype_bin_wNA.txt \
+    --remove ${mntpt}example/fid_iid_to_remove.txt \
+    --bsize 200 \
+    --force-qt \
+    --ignore-pred \
+    --step2-profile \
+    --out ${mntpt}test/test_bin_out_${file_type}_qt_missing"
 
-./$regenie_bin $rgcmd
+  ./$regenie_bin $rgcmd
+done
 
 for phenotype in Y1 Y2; do
   if [ "$(count_lines "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie")" != "1001" ]; then
     print_err
+  elif ! cmp --silent \
+    "${REGENIE_PATH}test/test_bin_out_bed_qt_missing_${phenotype}.regenie" \
+    "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing_${phenotype}.regenie"
+  then
+    print_err
   fi
 done
+
+if ! grep -Eq '^STEP2_PROFILE scope=compute_backend name=cpu .* scored_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_pgen_qt_missing.log"
+then
+  print_custom_err "Step 2 PGEN missing-QT block scoring was not exercised."
+fi
 
 
 (( i++ ))
@@ -301,7 +523,9 @@ for ref_mode in default ref_first; do
     --covarFile ${mntpt}example/covariates.txt${fsuf} \
     --phenoFile ${mntpt}example/phenotype.txt \
     --bsize 200 \
+    --prop-zero-thr 1 \
     --ignore-pred \
+    --step2-profile \
     $ref_arg \
     --out ${mntpt}test/test_bin_out_bgen_qt_${ref_mode}_bgen"
   ./$regenie_bin $rgcmd
@@ -313,6 +537,12 @@ for ref_mode in default ref_first; do
     fi
   done
 done
+
+if ! grep -q ' algebraic_dense_qt_variants=1000 ' \
+  "${REGENIE_PATH}test/test_bin_out_bgen_qt_default_bgen.log"
+then
+  print_custom_err "Step 2 BGEN algebraic dense-QT projection was not exercised."
+fi
 
 
 (( i++ ))

@@ -31,6 +31,10 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef WITH_MKL
+#include <mkl_cblas.h>
+#endif
+
 #ifdef WITH_CUDA
 std::unique_ptr<Step1ComputeBackend> make_cuda_step1_compute_backend(int device);
 bool cuda_step1_compute_backend_available(int device, std::string& reason);
@@ -153,6 +157,16 @@ bool Step1ComputeBackend::preprocess_packed_hardcalls(
   return false;
 }
 
+bool Step1ComputeBackend::register_packed_hardcall_buffer(
+  unsigned char* buffer, size_t bytes) {
+  (void)buffer;
+  (void)bytes;
+  return false;
+}
+
+void Step1ComputeBackend::release_packed_hardcall_buffers() {
+}
+
 void Step1ComputeBackend::compute_preprocessed_products(
   Eigen::Index start_column,
   Eigen::Index column_count,
@@ -170,6 +184,33 @@ void Step1ComputeBackend::compute_preprocessed_products(
   (void)timings;
   throw std::runtime_error(
     "Step 1 backend has no resident preprocessed genotype block");
+}
+
+bool Step1ComputeBackend::cache_preprocessed_fold_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+  Step1ComputeTimings* timings) {
+  (void)start_columns;
+  (void)column_counts;
+  (void)phenotypes;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::cache_preprocessed_fold_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+  const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
+    active_phenotypes,
+  Step1ComputeTimings* timings) {
+  if(active_phenotypes.size() != phenotypes.cols())
+    throw std::invalid_argument(
+      "Step 1 cached fold systems received an incompatible active-outcome mask");
+  if(!active_phenotypes.all()) return false;
+  return cache_preprocessed_fold_systems(
+    start_columns, column_counts, phenotypes, timings);
 }
 
 void Step1ComputeBackend::ridge_predict_preprocessed(
@@ -229,6 +270,40 @@ bool Step1ComputeBackend::ridge_predict_preprocessed_systems(
   return false;
 }
 
+bool Step1ComputeBackend::ridge_predict_cached_preprocessed_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  std::vector<Eigen::MatrixXd>& predictions,
+  std::vector<Eigen::MatrixXd>& coefficients,
+  Step1ComputeTimings* timings) {
+  (void)start_columns;
+  (void)column_counts;
+  (void)ridge_parameters;
+  (void)predictions;
+  (void)coefficients;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::ridge_predict_cached_preprocessed_systems_normalized(
+  const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+  const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  double effective_sample_count,
+  Eigen::Index level1_start_column,
+  Eigen::MatrixXd& normalized_predictions,
+  Step1ComputeTimings* timings) {
+  (void)start_columns;
+  (void)column_counts;
+  (void)ridge_parameters;
+  (void)effective_sample_count;
+  (void)level1_start_column;
+  (void)normalized_predictions;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::release_preprocessed_genotypes() {
 }
 
@@ -236,6 +311,54 @@ bool Step1ComputeBackend::cache_design_partitions(
   const std::vector<Eigen::MatrixXd>& partitions,
   Step1ComputeTimings* timings) {
   (void)partitions;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::cache_design_matrix(
+  const Eigen::Ref<const Eigen::MatrixXd>& design,
+  Step1ComputeTimings* timings) {
+  (void)design;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::initialize_level1_design_cache(
+  Eigen::Index rows, Eigen::Index columns) {
+  (void)rows;
+  (void)columns;
+  return false;
+}
+
+void Step1ComputeBackend::append_level1_design_cache(
+  Eigen::Index start_column,
+  const Eigen::Ref<const Eigen::MatrixXd>& columns,
+  Step1ComputeTimings* timings) {
+  (void)start_column;
+  (void)columns;
+  (void)timings;
+  throw std::runtime_error(
+    "Step 1 backend has no persistent Level 1 design cache");
+}
+
+bool Step1ComputeBackend::activate_level1_design_cache(
+  Eigen::Index rows, Eigen::Index columns) {
+  (void)rows;
+  (void)columns;
+  return false;
+}
+
+void Step1ComputeBackend::release_level1_design_cache() {
+}
+
+bool Step1ComputeBackend::cache_resident_design_fold_systems(
+  const Eigen::Ref<const Eigen::VectorXi>& start_rows,
+  const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+  const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+  Step1ComputeTimings* timings) {
+  (void)start_rows;
+  (void)row_counts;
+  (void)outcomes;
   (void)timings;
   return false;
 }
@@ -250,6 +373,24 @@ void Step1ComputeBackend::predict_cached_design(
   throw std::runtime_error("Step 1 backend has no cached design matrix");
 }
 
+bool Step1ComputeBackend::grouped_predict_cached_design_partitions(
+  const Eigen::Ref<const Eigen::MatrixXd>& coefficients,
+  const Eigen::Ref<const Eigen::VectorXi>& row_offsets,
+  const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+  const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+  const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+  Eigen::MatrixXd& predictions,
+  Step1ComputeTimings* timings) {
+  (void)coefficients;
+  (void)row_offsets;
+  (void)row_counts;
+  (void)group_offsets;
+  (void)group_sizes;
+  (void)predictions;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::compute_cached_weighted_design_products(
   const Eigen::Ref<const Eigen::VectorXd>& weights,
   const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
@@ -262,6 +403,68 @@ void Step1ComputeBackend::compute_cached_weighted_design_products(
   (void)crossproduct;
   (void)timings;
   throw std::runtime_error("Step 1 backend has no cached design matrix");
+}
+
+bool Step1ComputeBackend::solve_cached_weighted_design(
+  const Eigen::Ref<const Eigen::VectorXd>& weights,
+  const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  Eigen::MatrixXd& solutions,
+  Step1ComputeTimings* timings) {
+  (void)weights;
+  (void)outcomes;
+  (void)ridge_parameters;
+  (void)penalty_multipliers;
+  (void)solutions;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::solve_cached_weighted_gram(
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  Eigen::MatrixXd& solutions,
+  Step1ComputeTimings* timings) {
+  (void)right_hand_sides;
+  (void)ridge_parameters;
+  (void)penalty_multipliers;
+  (void)solutions;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::factorize_cached_weighted_gram(
+  double ridge_parameter,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  Step1ComputeTimings* timings) {
+  (void)ridge_parameter;
+  (void)penalty_multipliers;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::solve_factorized_cached_weighted_gram(
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  Eigen::MatrixXd& solutions,
+  Step1ComputeTimings* timings) {
+  (void)right_hand_sides;
+  (void)solutions;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::compute_cached_weighted_design_hessian_product(
+  const Eigen::Ref<const Eigen::VectorXd>& weights,
+  const Eigen::Ref<const Eigen::MatrixXd>& vectors,
+  Eigen::MatrixXd& products,
+  Step1ComputeTimings* timings) {
+  (void)weights;
+  (void)vectors;
+  (void)products;
+  (void)timings;
+  return false;
 }
 
 void Step1ComputeBackend::compute_cached_design_crossproduct(
@@ -588,7 +791,18 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
       crossproduct.noalias() = design.transpose() * outcomes;
       if(timings) timings->crossproduct_ms += elapsed_ms(start);
       if(timings) start = ComputeClock::now();
-      gram.noalias() = design.transpose() * design;
+      gram.setZero();
+#ifdef WITH_MKL
+      cblas_dsyrk(
+        CblasColMajor, CblasLower, CblasTrans,
+        static_cast<MKL_INT>(design.cols()),
+        static_cast<MKL_INT>(design.rows()),
+        1.0, design.data(), static_cast<MKL_INT>(design.rows()),
+        0.0, gram.data(), static_cast<MKL_INT>(gram.rows()));
+#else
+      gram.selfadjointView<Eigen::Lower>().rankUpdate(design.transpose());
+#endif
+      gram.triangularView<Eigen::Upper>() = gram.transpose();
       if(timings) timings->gram_ms += elapsed_ms(start);
     }
 
@@ -621,7 +835,19 @@ class CpuStep1ComputeBackend : public Step1ComputeBackend {
         (outcomes.array().colwise() * weights.array()).matrix();
       if(timings) timings->crossproduct_ms += elapsed_ms(start);
       if(timings) start = ComputeClock::now();
+#ifdef WITH_MKL
+      gram.setZero();
+      cblas_dgemmt(
+        CblasColMajor, CblasLower, CblasTrans, CblasNoTrans,
+        static_cast<MKL_INT>(design.cols()),
+        static_cast<MKL_INT>(design.rows()),
+        1.0, design.data(), static_cast<MKL_INT>(design.rows()),
+        weighted_design.data(), static_cast<MKL_INT>(weighted_design.rows()),
+        0.0, gram.data(), static_cast<MKL_INT>(gram.rows()));
+      gram.triangularView<Eigen::Upper>() = gram.transpose();
+#else
       gram.noalias() = design.transpose() * weighted_design;
+#endif
       if(timings) timings->gram_ms += elapsed_ms(start);
     }
 

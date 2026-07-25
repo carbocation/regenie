@@ -26,6 +26,7 @@
 
 #define EIGEN_NO_CUDA
 #include "Step1_Compute.hpp"
+#include "Cuda_Resources.hpp"
 
 #include <cublas_v2.h>
 #include <cusolverDn.h>
@@ -42,6 +43,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -185,6 +187,37 @@ bool cuda_level0_fold_batch_enabled() {
     "REGENIE_CUDA_LEVEL0_FOLD_BATCH must be '0' or '1'");
 }
 
+bool cuda_level0_resident_folds_enabled() {
+  const char* value = std::getenv("REGENIE_CUDA_LEVEL0_RESIDENT_FOLDS");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_CUDA_LEVEL0_RESIDENT_FOLDS must be '0' or '1'");
+}
+
+bool cuda_register_packed_hardcalls_enabled() {
+  const char* value = std::getenv("REGENIE_CUDA_REGISTER_PACKED");
+  if(!value || !*value || std::string(value) == "1") return true;
+  if(std::string(value) == "0") return false;
+  throw std::invalid_argument(
+    "REGENIE_CUDA_REGISTER_PACKED must be '0' or '1'");
+}
+
+bool cuda_host_pointer_is_registered(const void* pointer) {
+  if(!pointer) return false;
+  cudaPointerAttributes attributes;
+  const cudaError_t status = cudaPointerGetAttributes(&attributes, pointer);
+  if(status != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+#if CUDART_VERSION >= 10000
+  return attributes.type == cudaMemoryTypeHost;
+#else
+  return attributes.memoryType == cudaMemoryTypeHost;
+#endif
+}
+
 bool cuda_direct_grouped_upload_enabled() {
   const char* value = std::getenv("REGENIE_CUDA_DIRECT_GROUPED_UPLOAD");
   if(!value || !*value || std::string(value) == "1") return true;
@@ -225,6 +258,38 @@ __global__ void build_scaled_right_hand_sides(const double* inverse,
     const int parameter = combination / phenotype_count;
     scaled[index] = inverse[row + parameter * size] *
       right_hand_sides[row + phenotype * size];
+  }
+}
+
+__global__ void fill_constant(double* values, double value, int count) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < count) values[index] = value;
+}
+
+__global__ void normalize_design_columns(double* design, int rows,
+  int count, const double* means, const double* inverse_standard_deviations) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < count) {
+    const int column = index / rows;
+    design[index] = (design[index] - means[column]) *
+      inverse_standard_deviations[column];
+  }
+}
+
+__global__ void normalize_and_reorder_design_columns(
+  const double* source, double* destination, int rows, int count,
+  int outcome_count, int parameter_count, const double* means,
+  const double* inverse_standard_deviations) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index < count) {
+    const int source_column = index / rows;
+    const int row = index - source_column * rows;
+    const int parameter = source_column / outcome_count;
+    const int outcome = source_column - parameter * outcome_count;
+    const int destination_column = outcome * parameter_count + parameter;
+    destination[destination_column * rows + row] =
+      (source[index] - means[source_column]) *
+        inverse_standard_deviations[source_column];
   }
 }
 
@@ -425,60 +490,278 @@ __global__ void apply_leave_one_out_correction(double* predictions,
   }
 }
 
-class CudaEventPair {
-  public:
-    CudaEventPair() : start_(nullptr), stop_(nullptr) {
-      check_cuda(cudaEventCreate(&start_), "cudaEventCreate(start)");
-      try {
-        check_cuda(cudaEventCreate(&stop_), "cudaEventCreate(stop)");
-      } catch(...) {
-        cudaEventDestroy(start_);
-        throw;
-      }
-    }
+using CudaEventPair = regenie::cuda::EventPair;
+using CudaHostRegistration = regenie::cuda::HostRegistration;
 
-    ~CudaEventPair() {
-      if(stop_) cudaEventDestroy(stop_);
-      if(start_) cudaEventDestroy(start_);
-    }
+template <typename T>
+class CudaDeviceBuffer {
+ public:
+  CudaDeviceBuffer() noexcept : data_(nullptr), capacity_(0) {}
 
-    void record_start() {
-      check_cuda(cudaEventRecord(start_), "cudaEventRecord(start)");
-    }
+  ~CudaDeviceBuffer() {
+    if(data_) cudaFree(data_);
+  }
 
-    double record_stop_and_elapsed_ms() {
-      check_cuda(cudaEventRecord(stop_), "cudaEventRecord(stop)");
-      check_cuda(cudaEventSynchronize(stop_), "cudaEventSynchronize(stop)");
-      float milliseconds = 0;
-      check_cuda(cudaEventElapsedTime(&milliseconds, start_, stop_), "cudaEventElapsedTime");
-      return milliseconds;
-    }
+  CudaDeviceBuffer(const CudaDeviceBuffer&) = delete;
+  CudaDeviceBuffer& operator=(const CudaDeviceBuffer&) = delete;
 
-  private:
-    cudaEvent_t start_;
-    cudaEvent_t stop_;
+  CudaDeviceBuffer(CudaDeviceBuffer&& other) noexcept
+      : data_(other.data_), capacity_(other.capacity_) {
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+  }
+
+  CudaDeviceBuffer& operator=(CudaDeviceBuffer&& other) noexcept {
+    if(this == &other) return *this;
+    if(data_) cudaFree(data_);
+    data_ = other.data_;
+    capacity_ = other.capacity_;
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+    return *this;
+  }
+
+  operator T*() noexcept {
+    return data_;
+  }
+
+  operator const T*() const noexcept {
+    return data_;
+  }
+
+  T* data() noexcept {
+    return data_;
+  }
+
+  const T* data() const noexcept {
+    return data_;
+  }
+
+  size_t capacity() const noexcept {
+    return capacity_;
+  }
+
+  void ensure(size_t required, const char* label) {
+    if(required <= capacity_) return;
+    if(required > std::numeric_limits<size_t>::max() / sizeof(T))
+      throw std::runtime_error(
+        std::string("CUDA allocation size overflow for ") + label);
+    release("cudaFree while growing buffer");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&data_),
+      required * sizeof(T)), label);
+    capacity_ = required;
+  }
+
+  void release(const char* operation) {
+    if(data_) check_cuda(cudaFree(data_), operation);
+    data_ = nullptr;
+    capacity_ = 0;
+  }
+
+ private:
+  T* data_;
+  size_t capacity_;
 };
 
 struct CudaLevel0CholeskyLane {
   cudaStream_t stream = nullptr;
   cublasHandle_t blas = nullptr;
   cusolverDnHandle_t solver = nullptr;
-  double* gram = nullptr;
-  double* factor = nullptr;
-  double* right_hand_sides = nullptr;
-  double* solve = nullptr;
-  double* coefficients = nullptr;
-  double* predictions = nullptr;
-  double* workspace = nullptr;
-  int* info = nullptr;
-  size_t gram_capacity = 0;
-  size_t factor_capacity = 0;
-  size_t right_hand_sides_capacity = 0;
-  size_t solve_capacity = 0;
-  size_t coefficients_capacity = 0;
-  size_t predictions_capacity = 0;
-  size_t workspace_capacity = 0;
-  size_t info_capacity = 0;
+  CudaDeviceBuffer<double> gram;
+  CudaDeviceBuffer<double> factor;
+  CudaDeviceBuffer<double> right_hand_sides;
+  CudaDeviceBuffer<double> solve;
+  CudaDeviceBuffer<double> coefficients;
+  CudaDeviceBuffer<double> predictions;
+  CudaDeviceBuffer<double> workspace;
+  CudaDeviceBuffer<int> info;
+};
+
+enum class CudaFoldSystemOrientation {
+  genotype,
+  design
+};
+
+struct CudaResidentFoldSystems {
+  Eigen::Index system_count = 0;
+  Eigen::Index rhs_count = 0;
+  std::vector<int> output_indices;
+  bool valid = false;
+  CudaFoldSystemOrientation orientation =
+    CudaFoldSystemOrientation::genotype;
+
+  void activate(Eigen::Index new_system_count, Eigen::Index new_rhs_count,
+    CudaFoldSystemOrientation new_orientation) {
+    system_count = new_system_count;
+    rhs_count = new_rhs_count;
+    orientation = new_orientation;
+    valid = true;
+  }
+
+  bool uses_design() const {
+    return orientation == CudaFoldSystemOrientation::design;
+  }
+
+  void invalidate() {
+    system_count = 0;
+    rhs_count = 0;
+    output_indices.clear();
+    valid = false;
+    orientation = CudaFoldSystemOrientation::genotype;
+  }
+};
+
+struct CudaResidentGenotypes {
+  const double* host_data = nullptr;
+  Eigen::Index rows = 0;
+  Eigen::Index columns = 0;
+  bool valid = false;
+
+  void activate(const double* new_host_data, Eigen::Index new_rows,
+    Eigen::Index new_columns) {
+    host_data = new_host_data;
+    rows = new_rows;
+    columns = new_columns;
+    valid = true;
+  }
+
+  void invalidate() {
+    host_data = nullptr;
+    rows = 0;
+    columns = 0;
+    valid = false;
+  }
+
+  const double* device_columns(const double* device_data,
+    const Eigen::Ref<const Eigen::MatrixXd>& matrix,
+    Eigen::Index start_column, Eigen::Index column_count) const {
+
+    if(!valid || !host_data || matrix.rows() != rows ||
+       matrix.innerStride() != 1 || matrix.outerStride() != rows ||
+       start_column < 0 || column_count < 0 ||
+       start_column > matrix.cols() - column_count)
+      return nullptr;
+
+    const std::uintptr_t resident_address =
+      reinterpret_cast<std::uintptr_t>(host_data);
+    const std::uintptr_t matrix_address =
+      reinterpret_cast<std::uintptr_t>(matrix.data());
+    if(matrix_address < resident_address) return nullptr;
+    const std::uintptr_t byte_offset = matrix_address - resident_address;
+    if(byte_offset % sizeof(double) != 0) return nullptr;
+    const Eigen::Index element_offset =
+      static_cast<Eigen::Index>(byte_offset / sizeof(double));
+    if(rows <= 0 || element_offset % rows != 0) return nullptr;
+    const Eigen::Index first_column = element_offset / rows;
+    if(first_column < 0 || first_column > columns - matrix.cols())
+      return nullptr;
+    return device_data + (first_column + start_column) * rows;
+  }
+};
+
+enum class CudaResidentDesignStorage {
+  reusable_buffer,
+  level1_cache
+};
+
+struct CudaResidentDesign {
+  Eigen::Index rows = 0;
+  Eigen::Index columns = 0;
+  bool valid = false;
+  bool weighted_gram_valid = false;
+  bool weighted_gram_factor_valid = false;
+  CudaResidentDesignStorage storage =
+    CudaResidentDesignStorage::reusable_buffer;
+
+  void activate(Eigen::Index new_rows, Eigen::Index new_columns,
+    CudaResidentDesignStorage new_storage =
+      CudaResidentDesignStorage::reusable_buffer) {
+    rows = new_rows;
+    columns = new_columns;
+    valid = true;
+    weighted_gram_valid = false;
+    weighted_gram_factor_valid = false;
+    storage = new_storage;
+  }
+
+  void invalidate() {
+    rows = 0;
+    columns = 0;
+    valid = false;
+    weighted_gram_valid = false;
+    weighted_gram_factor_valid = false;
+    storage = CudaResidentDesignStorage::reusable_buffer;
+  }
+
+  bool uses_level1_cache() const {
+    return storage == CudaResidentDesignStorage::level1_cache;
+  }
+
+  const double* data(const double* reusable_buffer,
+    const double* level1_cache) const {
+    return uses_level1_cache() ? level1_cache : reusable_buffer;
+  }
+};
+
+struct CudaLevel1DesignCache {
+  CudaDeviceBuffer<double> values;
+  Eigen::Index rows = 0;
+  Eigen::Index columns = 0;
+  Eigen::Index cached_columns = 0;
+
+  void allocate(Eigen::Index new_rows, Eigen::Index new_columns,
+    Eigen::Index elements, const char* label) {
+    if(elements < 0)
+      throw std::runtime_error(
+        std::string("negative CUDA allocation size for ") + label);
+    values.ensure(static_cast<size_t>(elements), label);
+    rows = new_rows;
+    columns = new_columns;
+    cached_columns = 0;
+  }
+
+  bool accepts_append(Eigen::Index start_column,
+    Eigen::Index appended_rows, Eigen::Index appended_columns) const {
+    return values.data() && rows > 0 && appended_rows == rows &&
+      start_column == cached_columns && start_column >= 0 &&
+      appended_columns >= 0 &&
+      start_column <= columns - appended_columns;
+  }
+
+  bool accepts_append(Eigen::Index start_column,
+    double appended_rows, Eigen::Index appended_columns) const {
+    return appended_rows == rows &&
+      accepts_append(start_column, rows, appended_columns);
+  }
+
+  const double* data() const {
+    return values.data();
+  }
+
+  double* column_data(Eigen::Index start_column) {
+    return values.data() + start_column * rows;
+  }
+
+  void record_append(Eigen::Index appended_columns) {
+    cached_columns += appended_columns;
+  }
+
+  bool complete(Eigen::Index expected_rows,
+    Eigen::Index expected_columns) const {
+    return values.data() && rows == expected_rows &&
+      columns == expected_columns && cached_columns == columns;
+  }
+
+  bool allocated() const {
+    return values.data() != nullptr;
+  }
+
+  void release(const char* operation) {
+    values.release(operation);
+    rows = 0;
+    columns = 0;
+    cached_columns = 0;
+  }
 };
 
 class CudaStep1ComputeBackend : public Step1ComputeBackend {
@@ -488,31 +771,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         pinned_staging_chunk_bytes_(cuda_pinned_staging_bytes()),
         level0_cholesky_enabled_(cuda_level0_cholesky_enabled()),
         level0_fold_batch_enabled_(cuda_level0_fold_batch_enabled()),
+        level0_resident_folds_enabled_(
+          cuda_level0_resident_folds_enabled()),
+        register_packed_hardcalls_enabled_(
+          cuda_register_packed_hardcalls_enabled()),
         direct_grouped_upload_(cuda_direct_grouped_upload_enabled()),
         resident_preprocess_max_elements_(0),
         level1_resident_max_elements_(0),
-        d_genotypes_(nullptr), d_resident_genotypes_(nullptr),
-        d_phenotypes_(nullptr), d_gram_(nullptr), d_crossproduct_(nullptr),
-        d_factorized_(nullptr),
-        d_ridge_vectors_(nullptr), d_ridge_values_(nullptr),
-        d_ridge_rhs_(nullptr),
-        d_eigenvalues_(nullptr), d_solver_workspace_(nullptr), d_solver_info_(nullptr),
-        d_ridge_parameters_(nullptr), d_inverse_(nullptr), d_scaled_rhs_(nullptr),
-        d_predictions_(nullptr), d_outcomes_(nullptr), d_projected_(nullptr),
-        d_squared_(nullptr), d_leverage_(nullptr),
-        d_preprocess_covariates_(nullptr), d_preprocess_weights_(nullptr),
-        d_preprocess_coefficients_(nullptr), d_preprocess_scales_(nullptr),
-        d_preprocess_multipliers_(nullptr), d_packed_hardcalls_(nullptr),
-        d_transposed_hardcalls_(nullptr), d_packed_row_counts_(nullptr),
-        genotypes_capacity_(0), resident_genotypes_capacity_(0),
-        resident_host_data_(nullptr), resident_rows_(0), resident_columns_(0),
-        resident_valid_(false), resident_design_rows_(0),
-        resident_design_columns_(0), resident_design_valid_(false),
-        phenotypes_capacity_(0), gram_capacity_(0),
-        factorized_capacity_(0), factorized_size_(-1),
-        ridge_vectors_capacity_(0), ridge_values_capacity_(0),
-        ridge_rhs_capacity_(0),
-        crossproduct_capacity_(0), eigenvalues_capacity_(0), solver_workspace_capacity_(0),
+        factorized_size_(-1),
         pinned_staging_capacity_(0), pinned_staging_available_(true),
         ridge_factorized_size_(-1), ridge_factorized_rhs_count_(0) {
 
@@ -525,8 +791,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cublas(cublasCreate(&handle_), "cublasCreate");
       try {
         check_cusolver(cusolverDnCreate(&solver_handle_), "cusolverDnCreate");
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_solver_info_), sizeof(int)),
-          "cudaMalloc(cuSOLVER info)");
+        ensure_capacity(
+          d_solver_info_, 1, "cudaMalloc(cuSOLVER info)");
       } catch(...) {
         if(solver_handle_) cusolverDnDestroy(solver_handle_);
         if(handle_) cublasDestroy(handle_);
@@ -536,6 +802,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
     ~CudaStep1ComputeBackend() override {
       cudaSetDevice(device_);
+      release_packed_hardcall_buffers_noexcept();
       for(auto& lane : level0_cholesky_lanes_)
         release_level0_cholesky_lane(lane);
       for(int index = 0; index < 2; ++index) {
@@ -545,34 +812,6 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         if(upload_streams_[index])
           cudaStreamDestroy(upload_streams_[index]);
       }
-      if(d_preprocess_multipliers_) cudaFree(d_preprocess_multipliers_);
-      if(d_preprocess_scales_) cudaFree(d_preprocess_scales_);
-      if(d_preprocess_coefficients_) cudaFree(d_preprocess_coefficients_);
-      if(d_preprocess_weights_) cudaFree(d_preprocess_weights_);
-      if(d_preprocess_covariates_) cudaFree(d_preprocess_covariates_);
-      if(d_packed_row_counts_) cudaFree(d_packed_row_counts_);
-      if(d_transposed_hardcalls_) cudaFree(d_transposed_hardcalls_);
-      if(d_packed_hardcalls_) cudaFree(d_packed_hardcalls_);
-      if(d_leverage_) cudaFree(d_leverage_);
-      if(d_squared_) cudaFree(d_squared_);
-      if(d_projected_) cudaFree(d_projected_);
-      if(d_outcomes_) cudaFree(d_outcomes_);
-      if(d_predictions_) cudaFree(d_predictions_);
-      if(d_scaled_rhs_) cudaFree(d_scaled_rhs_);
-      if(d_inverse_) cudaFree(d_inverse_);
-      if(d_ridge_parameters_) cudaFree(d_ridge_parameters_);
-      if(d_solver_info_) cudaFree(d_solver_info_);
-      if(d_solver_workspace_) cudaFree(d_solver_workspace_);
-      if(d_eigenvalues_) cudaFree(d_eigenvalues_);
-      if(d_ridge_rhs_) cudaFree(d_ridge_rhs_);
-      if(d_ridge_values_) cudaFree(d_ridge_values_);
-      if(d_ridge_vectors_) cudaFree(d_ridge_vectors_);
-      if(d_factorized_) cudaFree(d_factorized_);
-      if(d_crossproduct_) cudaFree(d_crossproduct_);
-      if(d_gram_) cudaFree(d_gram_);
-      if(d_phenotypes_) cudaFree(d_phenotypes_);
-      if(d_resident_genotypes_) cudaFree(d_resident_genotypes_);
-      if(d_genotypes_) cudaFree(d_genotypes_);
       if(solver_handle_) cusolverDnDestroy(solver_handle_);
       if(handle_) cublasDestroy(handle_);
     }
@@ -601,8 +840,22 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         " MB";
       result << ", grouped upload " <<
         (direct_grouped_upload_ ? "direct" : "materialized");
+      result << ", resident fold systems " <<
+        (level0_resident_folds_enabled_ ? "enabled" : "disabled");
+      result << ", registered packed input " <<
+        (register_packed_hardcalls_enabled_ ? "enabled" : "disabled");
+      result << ", pinned level0 download enabled";
       result << ")";
       return result.str();
+    }
+
+    void set_level0_static_input_generation(
+      uint64_t generation) noexcept override {
+      if(generation == level0_static_input_generation() && generation != 0)
+        return;
+      Step1ComputeBackend::set_level0_static_input_generation(generation);
+      packed_static_inputs_.invalidate();
+      level0_phenotypes_.invalidate();
     }
 
     bool can_preprocess_packed_hardcalls(
@@ -634,10 +887,38 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         ComputeClock::now();
       const ComputeClock::time_point validation_start =
         ComputeClock::now();
-      validate_packed_hardcall_preprocessing_inputs(
-        packed_hardcalls, packed_bytes, packed_stride_bytes,
-        variants, samples, covariates, sample_weights,
-        degrees_of_freedom, minimum_scale);
+      const uint64_t static_input_cache_key =
+        level0_static_input_cache_key();
+      const bool static_inputs_cached = packed_static_inputs_.matches(
+        static_input_cache_key, samples, covariates.cols());
+      if(static_inputs_cached) {
+        if(variants < 0 || samples < 0 || covariates.rows() != samples ||
+           sample_weights.size() != samples)
+          throw std::invalid_argument(
+            "Step 1 packed hardcall preprocessing received incompatible dimensions");
+        if(!std::isfinite(degrees_of_freedom) || degrees_of_freedom <= 0)
+          throw std::invalid_argument(
+            "Step 1 packed hardcall preprocessing requires positive degrees of freedom");
+        if(!std::isfinite(minimum_scale) || minimum_scale < 0)
+          throw std::invalid_argument(
+            "Step 1 packed hardcall preprocessing requires a non-negative minimum scale");
+        const size_t minimum_stride =
+          (static_cast<size_t>(samples) + 3) / 4;
+        if(packed_stride_bytes < minimum_stride ||
+           (variants > 0 && packed_stride_bytes >
+             std::numeric_limits<size_t>::max() /
+               static_cast<size_t>(variants)) ||
+           packed_bytes < static_cast<size_t>(variants) *
+             packed_stride_bytes ||
+           (variants > 0 && !packed_hardcalls))
+          throw std::invalid_argument(
+            "Step 1 packed hardcall preprocessing received an invalid packed buffer");
+      } else {
+        validate_packed_hardcall_preprocessing_inputs(
+          packed_hardcalls, packed_bytes, packed_stride_bytes,
+          variants, samples, covariates, sample_weights,
+          degrees_of_freedom, minimum_scale);
+      }
       if(timings)
         timings->packed_hardcall_validation_ms +=
           elapsed_ms(validation_start);
@@ -668,9 +949,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         static_cast<size_t>(rows) * packed_stride_bytes;
       row_scales.resize(rows);
       if(rows == 0) {
-        resident_rows_ = 0;
-        resident_columns_ = columns;
-        resident_valid_ = true;
+        resident_genotypes_.activate(nullptr, 0, columns);
         if(timings) {
           timings->packed_hardcall_allocation_ms +=
             elapsed_ms(allocation_start);
@@ -680,26 +959,23 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return true;
       }
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         element_count,
         "cudaMalloc(packed hardcall resident genotype block)");
-      ensure_capacity(d_packed_hardcalls_, packed_hardcalls_capacity_,
+      ensure_capacity(d_packed_hardcalls_,
         required_packed_bytes, "cudaMalloc(packed hardcall block)");
-      ensure_capacity(d_transposed_hardcalls_,
-        transposed_hardcalls_capacity_, required_packed_bytes,
+      ensure_capacity(d_transposed_hardcalls_, required_packed_bytes,
         "cudaMalloc(transposed packed hardcall block)");
-      ensure_capacity(d_packed_row_counts_, packed_row_counts_capacity_,
+      ensure_capacity(d_packed_row_counts_,
         rows, "cudaMalloc(packed hardcall row counts)");
-      ensure_capacity(d_preprocess_weights_, preprocess_weights_capacity_,
+      ensure_capacity(d_preprocess_weights_,
         columns, "cudaMalloc(packed hardcall sample weights)");
-      ensure_capacity(d_preprocess_scales_, preprocess_scales_capacity_,
+      ensure_capacity(d_preprocess_scales_,
         rows, "cudaMalloc(packed hardcall row statistics)");
       if(covariate_count > 0) {
-        ensure_capacity(d_preprocess_covariates_,
-          preprocess_covariates_capacity_, covariates.size(),
+        ensure_capacity(d_preprocess_covariates_, covariates.size(),
           "cudaMalloc(packed hardcall covariates)");
         ensure_capacity(d_preprocess_coefficients_,
-          preprocess_coefficients_capacity_,
           static_cast<Eigen::Index>(rows) * covariate_count,
           "cudaMalloc(packed hardcall projection coefficients)");
       }
@@ -718,17 +994,31 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           elapsed_ms(host_prepare_start);
       ComputeClock::time_point transfer_start;
       if(timings) transfer_start = ComputeClock::now();
-      copy_host_to_device_staged(d_packed_hardcalls_, packed_hardcalls,
-        required_packed_bytes,
-        "copy packed hardcalls to CUDA device", timings);
-      check_cuda(cudaMemcpy(d_preprocess_weights_, sample_weights.data(),
-        static_cast<size_t>(columns) * sizeof(double),
-        cudaMemcpyHostToDevice),
-        "copy packed hardcall sample weights to CUDA device");
-      if(covariate_count > 0)
-        check_cuda(cudaMemcpy(d_preprocess_covariates_, covariate_data,
-          covariates.size() * sizeof(double), cudaMemcpyHostToDevice),
-          "copy packed hardcall covariates to CUDA device");
+      if(cuda_host_pointer_is_registered(packed_hardcalls)) {
+        check_cuda(cudaMemcpy(d_packed_hardcalls_, packed_hardcalls,
+          required_packed_bytes, cudaMemcpyHostToDevice),
+          "copy registered packed hardcalls to CUDA device");
+        if(timings) {
+          timings->registered_packed_upload_count++;
+          timings->registered_packed_upload_bytes += required_packed_bytes;
+        }
+      } else {
+        copy_host_to_device_staged(d_packed_hardcalls_, packed_hardcalls,
+          required_packed_bytes,
+          "copy packed hardcalls to CUDA device", timings);
+      }
+      if(!static_inputs_cached) {
+        check_cuda(cudaMemcpy(d_preprocess_weights_, sample_weights.data(),
+          static_cast<size_t>(columns) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "copy packed hardcall sample weights to CUDA device");
+        if(covariate_count > 0)
+          check_cuda(cudaMemcpy(d_preprocess_covariates_, covariate_data,
+            covariates.size() * sizeof(double), cudaMemcpyHostToDevice),
+            "copy packed hardcall covariates to CUDA device");
+        packed_static_inputs_.record(
+          static_input_cache_key, samples, covariates.cols());
+      }
       if(timings) {
         timings->upload_ms += elapsed_ms(transfer_start);
         timings->packed_hardcall_upload_count++;
@@ -828,10 +1118,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->preprocess_ms +=
           scale_events->record_stop_and_elapsed_ms();
 
-      resident_host_data_ = nullptr;
-      resident_rows_ = variants;
-      resident_columns_ = samples;
-      resident_valid_ = true;
+      resident_genotypes_.activate(nullptr, variants, samples);
       if(timings)
         timings->packed_hardcall_backend_wall_ms +=
           elapsed_ms(backend_wall_start);
@@ -849,6 +1136,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::VectorXd& row_scales,
       Step1ComputeTimings* timings) override {
 
+      packed_static_inputs_.invalidate();
       Step1ComputeBackend::preprocess_genotypes(genotypes, covariates,
         sample_weights, degrees_of_freedom, minimum_scale,
         row_multipliers, copy_to_host, row_scales, timings);
@@ -872,25 +1160,22 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(rows == 0) return true;
       if(columns == 0) return false;
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         element_count,
         "cudaMalloc(resident genotype preprocessing block)");
-      ensure_capacity(d_preprocess_weights_, preprocess_weights_capacity_,
+      ensure_capacity(d_preprocess_weights_,
         columns, "cudaMalloc(genotype preprocessing sample weights)");
-      ensure_capacity(d_preprocess_scales_, preprocess_scales_capacity_,
+      ensure_capacity(d_preprocess_scales_,
         rows, "cudaMalloc(genotype preprocessing row scales)");
       if(covariate_count > 0) {
-        ensure_capacity(d_preprocess_covariates_,
-          preprocess_covariates_capacity_, covariates.size(),
+        ensure_capacity(d_preprocess_covariates_, covariates.size(),
           "cudaMalloc(genotype preprocessing covariates)");
         ensure_capacity(d_preprocess_coefficients_,
-          preprocess_coefficients_capacity_,
           static_cast<Eigen::Index>(rows) * covariate_count,
           "cudaMalloc(genotype preprocessing coefficients)");
       }
       if(row_multipliers.size() > 0)
-        ensure_capacity(d_preprocess_multipliers_,
-          preprocess_multipliers_capacity_, rows,
+        ensure_capacity(d_preprocess_multipliers_, rows,
           "cudaMalloc(genotype preprocessing row multipliers)");
 
       const Eigen::MatrixXd packed_covariates = covariate_count > 0 ?
@@ -973,7 +1258,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
       scale_genotype_rows<<<element_blocks, threads>>>(
         d_resident_genotypes_, d_preprocess_scales_,
-        row_multipliers.size() ? d_preprocess_multipliers_ : nullptr,
+        row_multipliers.size() ? d_preprocess_multipliers_.data() : nullptr,
         rows, element_count);
       check_cuda(cudaGetLastError(),
         "scale genotype preprocessing rows kernel");
@@ -989,11 +1274,40 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "copy normalized genotype preprocessing block from CUDA device");
         if(timings) timings->download_ms += elapsed_ms(transfer_start);
       }
-      resident_host_data_ = genotypes.data();
-      resident_rows_ = genotypes.rows();
-      resident_columns_ = genotypes.cols();
-      resident_valid_ = true;
+      resident_genotypes_.activate(
+        genotypes.data(), genotypes.rows(), genotypes.cols());
       return true;
+    }
+
+    bool register_packed_hardcall_buffer(
+      unsigned char* buffer, size_t bytes) override {
+      if(!register_packed_hardcalls_enabled_ || !buffer || bytes == 0)
+        return false;
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      for(const auto& registration : registered_packed_hardcall_buffers_)
+        if(registration.first == buffer && registration.second >= bytes)
+          return true;
+      const cudaError_t status = cudaHostRegister(
+        buffer, bytes, cudaHostRegisterPortable);
+      if(status == cudaSuccess) {
+        registered_packed_hardcall_buffers_.push_back(
+          std::make_pair(buffer, bytes));
+        return true;
+      }
+      if(status == cudaErrorHostMemoryAlreadyRegistered) {
+        cudaGetLastError();
+        return true;
+      }
+      cudaGetLastError();
+      return false;
+    }
+
+    void release_packed_hardcall_buffers() override {
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      for(const auto& registration : registered_packed_hardcall_buffers_)
+        check_cuda(cudaHostUnregister(registration.first),
+          "cudaHostUnregister(packed hardcall buffer)");
+      registered_packed_hardcall_buffers_.clear();
     }
 
     void release_preprocessed_genotypes() override {
@@ -1033,14 +1347,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
       (void)total_bytes;
       const size_t resident_growth = required_elements >
-        static_cast<Eigen::Index>(resident_genotypes_capacity_) ?
+        static_cast<Eigen::Index>(d_resident_genotypes_.capacity()) ?
         static_cast<size_t>(required_elements -
-          static_cast<Eigen::Index>(resident_genotypes_capacity_)) *
+          static_cast<Eigen::Index>(d_resident_genotypes_.capacity())) *
             sizeof(double) : 0;
       const size_t workspace_growth = required_elements >
-        static_cast<Eigen::Index>(projected_capacity_) ?
+        static_cast<Eigen::Index>(d_projected_.capacity()) ?
         static_cast<size_t>(required_elements -
-          static_cast<Eigen::Index>(projected_capacity_)) *
+          static_cast<Eigen::Index>(d_projected_.capacity())) *
             sizeof(double) : 0;
       const size_t reserve_bytes = size_t(512) * 1000000;
       if(resident_growth > free_bytes ||
@@ -1048,9 +1362,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
          reserve_bytes > free_bytes - resident_growth - workspace_growth)
         return false;
 
-      ensure_capacity(d_resident_genotypes_, resident_genotypes_capacity_,
+      ensure_capacity(d_resident_genotypes_,
         required_elements, "cudaMalloc(resident Level 1 design)");
-      ensure_capacity(d_projected_, projected_capacity_, required_elements,
+      ensure_capacity(d_projected_, required_elements,
         "cudaMalloc(resident Level 1 weighted-design workspace)");
 
       ComputeClock::time_point transfer_start;
@@ -1077,10 +1391,149 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         timings->resident_design_upload_bytes +=
           static_cast<uint64_t>(required_elements) * sizeof(double);
       }
-      resident_design_rows_ = rows;
-      resident_design_columns_ = columns;
-      resident_design_valid_ = true;
+      resident_design_.activate(rows, columns);
       return true;
+    }
+
+    bool cache_design_matrix(
+      const Eigen::Ref<const Eigen::MatrixXd>& design,
+      Step1ComputeTimings* timings) override {
+
+      invalidate_resident_design();
+      invalidate_resident_genotypes();
+      const Eigen::Index rows = design.rows();
+      const Eigen::Index columns = design.cols();
+      const long long required_elements_long =
+        static_cast<long long>(rows) * columns;
+      if(required_elements_long < 0 || required_elements_long > INT_MAX ||
+         required_elements_long > level1_resident_max_elements_)
+        return false;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const Eigen::Index required_elements =
+        static_cast<Eigen::Index>(required_elements_long);
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+      (void)total_bytes;
+      const size_t resident_growth = required_elements >
+        static_cast<Eigen::Index>(d_resident_genotypes_.capacity()) ?
+        static_cast<size_t>(required_elements -
+          static_cast<Eigen::Index>(d_resident_genotypes_.capacity())) *
+            sizeof(double) : 0;
+      const size_t workspace_growth = required_elements >
+        static_cast<Eigen::Index>(d_projected_.capacity()) ?
+        static_cast<size_t>(required_elements -
+          static_cast<Eigen::Index>(d_projected_.capacity())) *
+            sizeof(double) : 0;
+      const size_t reserve_bytes = size_t(512) * 1000000;
+      if(resident_growth > free_bytes ||
+         workspace_growth > free_bytes - resident_growth ||
+         reserve_bytes > free_bytes - resident_growth - workspace_growth)
+        return false;
+
+      ensure_capacity(d_resident_genotypes_,
+        required_elements, "cudaMalloc(resident Level 1 design)");
+      ensure_capacity(d_projected_, required_elements,
+        "cudaMalloc(resident Level 1 weighted-design workspace)");
+
+      const Eigen::MatrixXd packed_design =
+        contiguous_copy_if_needed(design);
+      const double* design_data = packed_design.size() ?
+        packed_design.data() : design.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      if(required_elements > 0)
+        copy_host_to_device_staged(d_resident_genotypes_, design_data,
+          static_cast<size_t>(required_elements) * sizeof(double),
+          "copy Level 1 design matrix to CUDA device", timings);
+      if(timings) {
+        timings->upload_ms += elapsed_ms(transfer_start);
+        timings->resident_design_upload_count++;
+        timings->resident_design_upload_bytes +=
+          static_cast<uint64_t>(required_elements) * sizeof(double);
+      }
+      resident_design_.activate(rows, columns);
+      return true;
+    }
+
+    bool initialize_level1_design_cache(
+      Eigen::Index rows, Eigen::Index columns) override {
+
+      release_level1_design_cache();
+      if(rows <= 0 || columns <= 0) return false;
+      const long long required_elements_long =
+        static_cast<long long>(rows) * columns;
+      if(required_elements_long <= 0 ||
+         required_elements_long > INT_MAX ||
+         required_elements_long > level1_resident_max_elements_)
+        return false;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+      (void)total_bytes;
+      const size_t required_bytes =
+        static_cast<size_t>(required_elements_long) * sizeof(double);
+      const size_t reserve_bytes = size_t(6000) * 1000000;
+      if(required_bytes > free_bytes ||
+         reserve_bytes > free_bytes - required_bytes)
+        return false;
+
+      level1_design_.allocate(rows, columns,
+        static_cast<Eigen::Index>(required_elements_long),
+        "cudaMalloc(persistent Level 1 design)");
+      return true;
+    }
+
+    void append_level1_design_cache(
+      Eigen::Index start_column,
+      const Eigen::Ref<const Eigen::MatrixXd>& columns,
+      Step1ComputeTimings* timings) override {
+
+      if(!level1_design_.accepts_append(
+           start_column, columns.rows(), columns.cols()))
+        throw std::invalid_argument(
+          "Step 1 persistent Level 1 design append is out of order or has incompatible dimensions");
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      if(columns.size() > 0)
+        check_cuda(cudaMemcpy(
+          level1_design_.column_data(start_column),
+          columns.data(),
+          static_cast<size_t>(columns.size()) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "append persistent Level 1 design columns to CUDA device");
+      level1_design_.record_append(columns.cols());
+      if(timings) {
+        timings->upload_ms += elapsed_ms(transfer_start);
+        timings->resident_design_upload_count++;
+        timings->resident_design_upload_bytes +=
+          static_cast<uint64_t>(columns.size()) * sizeof(double);
+      }
+    }
+
+    bool activate_level1_design_cache(
+      Eigen::Index rows, Eigen::Index columns) override {
+
+      if(!level1_design_.complete(rows, columns))
+        return false;
+      invalidate_resident_design();
+      invalidate_resident_genotypes();
+      resident_design_.activate(
+        rows, columns, CudaResidentDesignStorage::level1_cache);
+      return true;
+    }
+
+    void release_level1_design_cache() override {
+      if(resident_design_.uses_level1_cache())
+        invalidate_resident_design();
+      if(level1_design_.allocated())
+        check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      level1_design_.release(
+        "cudaFree(persistent Level 1 design)");
     }
 
     void predict_cached_design(
@@ -1088,24 +1541,24 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::VectorXd& predictions,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ ||
-         coefficients.size() != resident_design_columns_)
+      if(!resident_design_.valid ||
+         coefficients.size() != resident_design_.columns)
         throw std::invalid_argument(
           "Step 1 cached design prediction received incompatible dimensions");
       if(!coefficients.allFinite())
         throw std::invalid_argument(
           "Step 1 cached design prediction requires finite coefficients");
-      predictions.resize(resident_design_rows_);
-      if(resident_design_rows_ == 0) return;
+      predictions.resize(resident_design_.rows);
+      if(resident_design_.rows == 0) return;
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached design prediction row count");
+        resident_design_.rows, "cached design prediction row count");
       const int columns = checked_int(
-        resident_design_columns_, "cached design prediction column count");
-      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+        resident_design_.columns, "cached design prediction column count");
+      ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(cached design coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_, predictions.size(),
+      ensure_capacity(d_predictions_, predictions.size(),
         "cudaMalloc(cached design predictions)");
 
       ComputeClock::time_point transfer_start;
@@ -1126,7 +1579,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const double alpha = 1.0;
         const double beta = 0.0;
         check_cublas(cublasDgemv(handle_, CUBLAS_OP_N,
-          rows, columns, &alpha, d_resident_genotypes_, rows,
+          rows, columns, &alpha, resident_design_data(), rows,
           d_inverse_, 1, &beta, d_predictions_, 1),
           "cublasDgemv(cached design prediction)");
       } else {
@@ -1149,6 +1602,126 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
     }
 
+    bool grouped_predict_cached_design_partitions(
+      const Eigen::Ref<const Eigen::MatrixXd>& coefficients,
+      const Eigen::Ref<const Eigen::VectorXi>& row_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+      const Eigen::Ref<const Eigen::VectorXi>& group_offsets,
+      const Eigen::Ref<const Eigen::VectorXi>& group_sizes,
+      Eigen::MatrixXd& predictions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid) return false;
+      if(coefficients.rows() != resident_design_.columns ||
+         coefficients.cols() != row_offsets.size() ||
+         row_offsets.size() != row_counts.size() ||
+         group_offsets.size() != group_sizes.size())
+        throw std::invalid_argument(
+          "Step 1 cached grouped prediction received incompatible dimensions");
+      if(!coefficients.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached grouped prediction requires finite coefficients");
+      for(Eigen::Index partition = 0;
+          partition < row_offsets.size(); ++partition)
+        if(row_offsets(partition) < 0 || row_counts(partition) < 0 ||
+           row_offsets(partition) >
+             resident_design_.rows - row_counts(partition))
+          throw std::invalid_argument(
+            "Step 1 cached grouped prediction received an invalid row partition");
+      for(Eigen::Index group = 0; group < group_offsets.size(); ++group)
+        if(group_offsets(group) < 0 || group_sizes(group) < 0 ||
+           group_offsets(group) >
+             resident_design_.columns - group_sizes(group))
+          throw std::invalid_argument(
+            "Step 1 cached grouped prediction received an invalid feature group");
+
+      predictions.resize(resident_design_.rows, group_offsets.size());
+      predictions.setZero();
+      if(resident_design_.rows == 0 || group_offsets.size() == 0)
+        return true;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int group_count = checked_int(
+        group_offsets.size(), "cached grouped prediction group count");
+      const int design_rows = checked_int(
+        resident_design_.rows, "cached grouped prediction design rows");
+      const int design_columns = checked_int(
+        resident_design_.columns,
+        "cached grouped prediction design columns");
+      Eigen::Index maximum_rows = 0;
+      for(Eigen::Index partition = 0;
+          partition < row_counts.size(); ++partition)
+        maximum_rows = std::max<Eigen::Index>(
+          maximum_rows, row_counts(partition));
+      ensure_capacity(d_inverse_, design_columns,
+        "cudaMalloc(cached grouped prediction coefficients)");
+      ensure_capacity(d_predictions_,
+        maximum_rows * group_count,
+        "cudaMalloc(cached grouped predictions)");
+
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      for(Eigen::Index partition = 0;
+          partition < row_offsets.size(); ++partition) {
+        const Eigen::Index start_index = row_offsets(partition);
+        const Eigen::Index count_index = row_counts(partition);
+        const int start = checked_int(
+          start_index, "cached grouped prediction row offset");
+        const int count = checked_int(
+          count_index, "cached grouped prediction row count");
+        if(count == 0) continue;
+
+        ComputeClock::time_point transfer_start;
+        if(timings) transfer_start = ComputeClock::now();
+        if(design_columns > 0)
+          check_cuda(cudaMemcpy(d_inverse_, coefficients.col(partition).data(),
+            static_cast<size_t>(design_columns) * sizeof(double),
+            cudaMemcpyHostToDevice),
+            "copy cached grouped prediction coefficients to CUDA device");
+        if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+        std::unique_ptr<CudaEventPair> prediction_events;
+        if(timings) {
+          prediction_events.reset(new CudaEventPair());
+          prediction_events->record_start();
+        }
+        for(int group = 0; group < group_count; ++group) {
+          const int group_size = group_sizes(group);
+          double* group_predictions = d_predictions_ + group * count;
+          if(group_size > 0)
+            check_cublas(cublasDgemv(handle_, CUBLAS_OP_N,
+              count, group_size, &alpha,
+              resident_design_data() + start +
+                static_cast<Eigen::Index>(group_offsets(group)) *
+                  design_rows,
+              design_rows, d_inverse_ + group_offsets(group), 1,
+              &beta, group_predictions, 1),
+              "cublasDgemv(cached grouped prediction partition)");
+          else
+            check_cuda(cudaMemset(group_predictions, 0,
+              static_cast<size_t>(count) * sizeof(double)),
+              "clear empty cached grouped prediction partition");
+        }
+        if(timings)
+          timings->ridge_ms +=
+            prediction_events->record_stop_and_elapsed_ms();
+
+        if(timings) transfer_start = ComputeClock::now();
+        for(int group = 0; group < group_count; ++group)
+          check_cuda(cudaMemcpy(
+            predictions.col(group).segment(start_index, count_index).data(),
+            d_predictions_ + group * count,
+            static_cast<size_t>(count) * sizeof(double),
+            cudaMemcpyDeviceToHost),
+            "copy cached grouped prediction partition from CUDA device");
+        if(timings) {
+          timings->download_ms += elapsed_ms(transfer_start);
+          timings->resident_design_reuse_count++;
+        }
+      }
+      return true;
+    }
+
     void compute_cached_weighted_design_products(
       const Eigen::Ref<const Eigen::VectorXd>& weights,
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
@@ -1156,8 +1729,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& crossproduct,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ || weights.size() != resident_design_rows_ ||
-         outcomes.rows() != resident_design_rows_)
+      if(!resident_design_.valid || weights.size() != resident_design_.rows ||
+         outcomes.rows() != resident_design_.rows)
         throw std::invalid_argument(
           "Step 1 cached weighted design products received incompatible dimensions");
       if(!weights.allFinite() || (weights.array() < 0).any() ||
@@ -1167,9 +1740,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached weighted design row count");
+        resident_design_.rows, "cached weighted design row count");
       const int features = checked_int(
-        resident_design_columns_, "cached weighted design feature count");
+        resident_design_.columns, "cached weighted design feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "cached weighted design outcome count");
       gram.resize(features, features);
@@ -1180,88 +1753,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      const int design_count = checked_element_count(
-        rows, features, "cached weighted design matrix");
-      ensure_capacity(d_projected_, projected_capacity_, design_count,
-        "cudaMalloc(cached weighted design matrix)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, rows,
-        "cudaMalloc(cached design weights)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
-        "cudaMalloc(cached weighted Gram matrix)");
-      if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
-          "cudaMalloc(cached weighted outcomes)");
-        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, outcomes.size(),
-          "cudaMalloc(cached weighted outcome matrix)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
-          crossproduct.size(), "cudaMalloc(cached weighted crossproduct)");
-      }
-
-      const Eigen::MatrixXd packed_outcomes = outcome_count > 0 ?
-        contiguous_copy_if_needed(outcomes) : Eigen::MatrixXd();
-      const double* outcome_data = packed_outcomes.size() ?
-        packed_outcomes.data() : outcomes.data();
+      compute_cached_weighted_design_products_device(
+        weights, outcomes, timings);
       ComputeClock::time_point transfer_start;
-      if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
-        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
-        "copy cached design weights to CUDA device");
-      if(outcome_count > 0)
-        check_cuda(cudaMemcpy(d_phenotypes_, outcome_data,
-          static_cast<size_t>(outcomes.size()) * sizeof(double),
-          cudaMemcpyHostToDevice),
-          "copy cached weighted outcomes to CUDA device");
-      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
-
-      const int threads = 256;
-      scale_matrix_rows<<<
-        (design_count + threads - 1) / threads, threads>>>(
-        d_resident_genotypes_, d_ridge_parameters_, d_projected_, rows,
-        design_count);
-      check_cuda(cudaGetLastError(),
-        "scale cached weighted design rows kernel");
-      if(outcome_count > 0) {
-        const int outcome_elements = checked_element_count(
-          rows, outcome_count, "cached weighted outcomes");
-        scale_matrix_rows<<<
-          (outcome_elements + threads - 1) / threads, threads>>>(
-          d_phenotypes_, d_ridge_parameters_, d_scaled_rhs_, rows,
-          outcome_elements);
-        check_cuda(cudaGetLastError(),
-          "scale cached weighted outcomes kernel");
-      }
-
-      const double alpha = 1.0;
-      const double beta = 0.0;
-      if(outcome_count > 0) {
-        std::unique_ptr<CudaEventPair> crossproduct_events;
-        if(timings) {
-          crossproduct_events.reset(new CudaEventPair());
-          crossproduct_events->record_start();
-        }
-        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-          features, outcome_count, rows, &alpha,
-          d_resident_genotypes_, rows, d_scaled_rhs_, rows, &beta,
-          d_crossproduct_, features),
-          "cublasDgemm(cached weighted crossproduct)");
-        if(timings)
-          timings->crossproduct_ms +=
-            crossproduct_events->record_stop_and_elapsed_ms();
-      }
-
-      std::unique_ptr<CudaEventPair> gram_events;
-      if(timings) {
-        gram_events.reset(new CudaEventPair());
-        gram_events->record_start();
-      }
-      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-        features, features, rows, &alpha,
-        d_resident_genotypes_, rows, d_projected_, rows, &beta,
-        d_gram_, features),
-        "cublasDgemm(cached weighted Gram matrix)");
-      if(timings)
-        timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
-
       if(timings) transfer_start = ComputeClock::now();
       if(outcome_count > 0)
         check_cuda(cudaMemcpy(crossproduct.data(), d_crossproduct_,
@@ -1274,8 +1768,380 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "copy cached weighted Gram matrix from CUDA device");
       if(timings) {
         timings->download_ms += elapsed_ms(transfer_start);
+      }
+    }
+
+    bool solve_cached_weighted_design(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid || weights.size() != resident_design_.rows ||
+         outcomes.rows() != resident_design_.rows ||
+         penalty_multipliers.size() != resident_design_.columns)
+        throw std::invalid_argument(
+          "Step 1 cached weighted solve received incompatible dimensions");
+      if(!weights.allFinite() || (weights.array() < 0).any() ||
+         !outcomes.allFinite() || !ridge_parameters.allFinite() ||
+         (ridge_parameters.array() < 0).any() ||
+         !penalty_multipliers.allFinite() ||
+         (penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 cached weighted solve requires finite inputs and non-negative weights and penalties");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_.rows, "cached weighted solve row count");
+      const int features = checked_int(
+        resident_design_.columns, "cached weighted solve feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "cached weighted solve outcome count");
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "cached weighted solve parameter count");
+      const long long solution_column_count_long =
+        static_cast<long long>(outcome_count) * parameter_count;
+      if(solution_column_count_long > INT_MAX)
+        throw std::runtime_error(
+          "CUDA cached weighted solution column count exceeds integer limits");
+      solutions.resize(features,
+        static_cast<Eigen::Index>(solution_column_count_long));
+      if(features == 0 || outcome_count == 0 || parameter_count == 0) {
+        solutions.setZero();
+        return true;
+      }
+      if(rows == 0) return false;
+
+      compute_cached_weighted_design_products_device(
+        weights, outcomes, timings);
+      diagonal_penalty_solve_device(features, outcome_count,
+        ridge_parameters, penalty_multipliers, solutions, timings);
+      return true;
+    }
+
+    bool solve_cached_weighted_gram(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid || !resident_design_.weighted_gram_valid ||
+         right_hand_sides.rows() != resident_design_.columns ||
+         penalty_multipliers.size() != resident_design_.columns)
+        return false;
+      if(!right_hand_sides.allFinite() ||
+         !ridge_parameters.allFinite() ||
+         (ridge_parameters.array() < 0).any() ||
+         !penalty_multipliers.allFinite() ||
+         (penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 cached weighted Gram solve requires finite inputs and non-negative penalties");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int features = checked_int(
+        resident_design_.columns, "cached weighted Gram feature count");
+      const int right_hand_side_count = checked_int(
+        right_hand_sides.cols(), "cached weighted Gram outcome count");
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "cached weighted Gram parameter count");
+      const long long solution_column_count_long =
+        static_cast<long long>(right_hand_side_count) * parameter_count;
+      if(solution_column_count_long > INT_MAX)
+        throw std::runtime_error(
+          "CUDA cached weighted Gram solution column count exceeds integer limits");
+      solutions.resize(features,
+        static_cast<Eigen::Index>(solution_column_count_long));
+      if(features == 0 || right_hand_side_count == 0 ||
+         parameter_count == 0) {
+        solutions.setZero();
+        return true;
+      }
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(features) * features;
+      if(d_gram_.capacity() < gram_elements) return false;
+
+      ensure_capacity(d_crossproduct_,
+        right_hand_sides.size(),
+        "cudaMalloc(cached weighted Gram right hand sides)");
+      const Eigen::MatrixXd packed_right_hand_sides =
+        contiguous_copy_if_needed(right_hand_sides);
+      const double* right_hand_side_data =
+        packed_right_hand_sides.size() ?
+          packed_right_hand_sides.data() : right_hand_sides.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_crossproduct_, right_hand_side_data,
+        static_cast<size_t>(right_hand_sides.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached weighted Gram right hand sides to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      diagonal_penalty_solve_device(features, right_hand_side_count,
+        ridge_parameters, penalty_multipliers, solutions, timings);
+      return true;
+    }
+
+    bool factorize_cached_weighted_gram(
+      double ridge_parameter,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Step1ComputeTimings* timings) override {
+
+      resident_design_.weighted_gram_factor_valid = false;
+      if(!resident_design_.valid || !resident_design_.weighted_gram_valid ||
+         penalty_multipliers.size() != resident_design_.columns)
+        return false;
+      if(!std::isfinite(ridge_parameter) || ridge_parameter < 0 ||
+         !penalty_multipliers.allFinite() ||
+         (penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 cached weighted Gram factorization requires finite non-negative penalties");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int features = checked_int(
+        resident_design_.columns,
+        "cached weighted Gram factorization feature count");
+      if(features == 0) {
+        resident_design_.weighted_gram_factor_valid = true;
+        return true;
+      }
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(features) * features;
+      if(d_gram_.capacity() < gram_elements) return false;
+
+      ensure_capacity(d_cached_weighted_gram_factor_, gram_elements,
+        "cudaMalloc(cached weighted Gram factor)");
+      ensure_capacity(d_ridge_parameters_, penalty_multipliers.size(),
+        "cudaMalloc(cached weighted Gram penalty multipliers)");
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, penalty_multipliers.data(),
+        static_cast<size_t>(penalty_multipliers.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached weighted Gram penalty multipliers to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      int workspace_size = 0;
+      check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, features,
+        d_cached_weighted_gram_factor_, features, &workspace_size),
+        "cusolverDnDpotrf_bufferSize(cached weighted Gram)");
+      ensure_capacity(d_solver_workspace_, workspace_size,
+        "cudaMalloc(cached weighted Gram Cholesky workspace)");
+
+      std::unique_ptr<CudaEventPair> factor_events;
+      if(timings) {
+        factor_events.reset(new CudaEventPair());
+        factor_events->record_start();
+      }
+      check_cuda(cudaMemcpy(d_cached_weighted_gram_factor_, d_gram_,
+        static_cast<size_t>(gram_elements) * sizeof(double),
+        cudaMemcpyDeviceToDevice),
+        "copy cached weighted Gram factorization matrix");
+      const int threads = 256;
+      add_diagonal_penalty<<<
+        (features + threads - 1) / threads, threads>>>(
+        d_cached_weighted_gram_factor_, d_ridge_parameters_,
+        ridge_parameter, features);
+      check_cuda(cudaGetLastError(),
+        "add cached weighted Gram diagonal penalty kernel");
+      check_cusolver(cusolverDnDpotrf(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, features,
+        d_cached_weighted_gram_factor_, features,
+        d_solver_workspace_, workspace_size, d_solver_info_),
+        "cusolverDnDpotrf(cached weighted Gram)");
+      int solver_info = 0;
+      check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "copy cached weighted Gram factorization status to host");
+      if(solver_info != 0) {
+        std::ostringstream message;
+        message << "cached weighted Gram Cholesky factorization failed with info="
+                << solver_info;
+        throw std::runtime_error(message.str());
+      }
+      if(timings)
+        timings->ridge_ms +=
+          factor_events->record_stop_and_elapsed_ms();
+      resident_design_.weighted_gram_factor_valid = true;
+      return true;
+    }
+
+    bool solve_factorized_cached_weighted_gram(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid ||
+         !resident_design_.weighted_gram_factor_valid)
+        return false;
+      if(right_hand_sides.rows() != resident_design_.columns)
+        throw std::invalid_argument(
+          "Step 1 factorized cached weighted Gram solve received incompatible dimensions");
+      if(!right_hand_sides.allFinite())
+        throw std::invalid_argument(
+          "Step 1 factorized cached weighted Gram solve requires finite right-hand sides");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int features = checked_int(
+        resident_design_.columns,
+        "factorized cached weighted Gram feature count");
+      const int right_hand_side_count = checked_int(
+        right_hand_sides.cols(),
+        "factorized cached weighted Gram right-hand side count");
+      solutions.resize(features, right_hand_side_count);
+      if(features == 0 || right_hand_side_count == 0) {
+        solutions.setZero();
+        return true;
+      }
+
+      ensure_capacity(d_scaled_rhs_, right_hand_sides.size(),
+        "cudaMalloc(factorized cached weighted Gram right-hand sides)");
+      const Eigen::MatrixXd packed_right_hand_sides =
+        contiguous_copy_if_needed(right_hand_sides);
+      const double* right_hand_side_data =
+        packed_right_hand_sides.size() ?
+          packed_right_hand_sides.data() : right_hand_sides.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_scaled_rhs_, right_hand_side_data,
+        static_cast<size_t>(right_hand_sides.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy factorized cached weighted Gram right-hand sides to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> solve_events;
+      if(timings) {
+        solve_events.reset(new CudaEventPair());
+        solve_events->record_start();
+      }
+      check_cusolver(cusolverDnDpotrs(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, features, right_hand_side_count,
+        d_cached_weighted_gram_factor_, features, d_scaled_rhs_, features,
+        d_solver_info_),
+        "cusolverDnDpotrs(cached weighted Gram)");
+      int solver_info = 0;
+      check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "copy factorized cached weighted Gram solve status to host");
+      if(solver_info != 0) {
+        std::ostringstream message;
+        message << "cached weighted Gram Cholesky solve failed with info="
+                << solver_info;
+        throw std::runtime_error(message.str());
+      }
+      if(timings)
+        timings->ridge_ms +=
+          solve_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(solutions.data(), d_scaled_rhs_,
+        static_cast<size_t>(solutions.size()) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy factorized cached weighted Gram solutions from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      return true;
+    }
+
+    bool compute_cached_weighted_design_hessian_product(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& vectors,
+      Eigen::MatrixXd& products,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid) return false;
+      if(weights.size() != resident_design_.rows ||
+         vectors.rows() != resident_design_.columns)
+        throw std::invalid_argument(
+          "Step 1 cached Hessian product received incompatible dimensions");
+      if(!weights.allFinite() || (weights.array() < 0).any() ||
+         !vectors.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached Hessian product requires finite vectors and finite non-negative weights");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_.rows, "cached Hessian product row count");
+      const int features = checked_int(
+        resident_design_.columns, "cached Hessian product feature count");
+      const int vector_count = checked_int(
+        vectors.cols(), "cached Hessian product vector count");
+      products.resize(features, vector_count);
+      if(features == 0 || vector_count == 0 || rows == 0) {
+        products.setZero();
+        return true;
+      }
+
+      const Eigen::Index prediction_elements =
+        static_cast<Eigen::Index>(rows) * vector_count;
+      ensure_capacity(d_ridge_parameters_, rows,
+        "cudaMalloc(cached Hessian weights)");
+      ensure_capacity(d_inverse_, vectors.size(),
+        "cudaMalloc(cached Hessian vectors)");
+      ensure_capacity(d_predictions_, prediction_elements,
+        "cudaMalloc(cached Hessian predictions)");
+      ensure_capacity(d_scaled_rhs_, prediction_elements,
+        "cudaMalloc(cached weighted Hessian predictions)");
+      ensure_capacity(d_crossproduct_, products.size(),
+        "cudaMalloc(cached Hessian products)");
+
+      const Eigen::MatrixXd packed_vectors =
+        contiguous_copy_if_needed(vectors);
+      const double* vector_data =
+        packed_vectors.size() ? packed_vectors.data() : vectors.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
+        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
+        "copy cached Hessian weights to CUDA device");
+      check_cuda(cudaMemcpy(d_inverse_, vector_data,
+        static_cast<size_t>(vectors.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached Hessian vectors to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> product_events;
+      if(timings) {
+        product_events.reset(new CudaEventPair());
+        product_events->record_start();
+      }
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+        rows, vector_count, features, &alpha,
+        resident_design_data(), rows, d_inverse_, features, &beta,
+        d_predictions_, rows),
+        "cublasDgemm(cached Hessian design product)");
+      const int prediction_count = checked_element_count(
+        rows, vector_count, "cached Hessian prediction matrix");
+      const int threads = 256;
+      scale_matrix_rows<<<
+        (prediction_count + threads - 1) / threads, threads>>>(
+        d_predictions_, d_ridge_parameters_, d_scaled_rhs_, rows,
+        prediction_count);
+      check_cuda(cudaGetLastError(),
+        "scale cached Hessian predictions kernel");
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        features, vector_count, rows, &alpha,
+        resident_design_data(), rows, d_scaled_rhs_, rows, &beta,
+        d_crossproduct_, features),
+        "cublasDgemm(cached Hessian transpose product)");
+      if(timings)
+        timings->gram_ms +=
+          product_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(products.data(), d_crossproduct_,
+        static_cast<size_t>(products.size()) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy cached Hessian products from CUDA device");
+      if(timings) {
+        timings->download_ms += elapsed_ms(transfer_start);
         timings->resident_design_reuse_count++;
       }
+      return true;
     }
 
     void compute_cached_design_crossproduct(
@@ -1283,8 +2149,8 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Eigen::MatrixXd& crossproduct,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_design_valid_ ||
-         outcomes.rows() != resident_design_rows_)
+      if(!resident_design_.valid ||
+         outcomes.rows() != resident_design_.rows)
         throw std::invalid_argument(
           "Step 1 cached design crossproduct received incompatible dimensions");
       if(!outcomes.allFinite())
@@ -1293,9 +2159,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_design_rows_, "cached crossproduct row count");
+        resident_design_.rows, "cached crossproduct row count");
       const int features = checked_int(
-        resident_design_columns_, "cached crossproduct feature count");
+        resident_design_.columns, "cached crossproduct feature count");
       const int outcome_count = checked_int(
         outcomes.cols(), "cached crossproduct outcome count");
       crossproduct.resize(features, outcome_count);
@@ -1304,9 +2170,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_, outcomes.size(),
+      ensure_capacity(d_phenotypes_, outcomes.size(),
         "cudaMalloc(cached crossproduct outcomes)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+      ensure_capacity(d_crossproduct_,
         crossproduct.size(), "cudaMalloc(cached design crossproduct)");
       const Eigen::MatrixXd packed_outcomes =
         contiguous_copy_if_needed(outcomes);
@@ -1329,7 +2195,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const double beta = 0.0;
       check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
         features, outcome_count, rows, &alpha,
-        d_resident_genotypes_, rows, d_phenotypes_, rows, &beta,
+        resident_design_data(), rows, d_phenotypes_, rows, &beta,
         d_crossproduct_, features),
         "cublasDgemm(cached design crossproduct)");
       if(timings)
@@ -1360,14 +2226,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1GramMode mode,
       Step1ComputeTimings* timings) override {
 
-      if(!resident_valid_ || start_column < 0 || column_count < 0 ||
-         start_column > resident_columns_ - column_count ||
+      if(!resident_genotypes_.valid || start_column < 0 || column_count < 0 ||
+         start_column > resident_genotypes_.columns - column_count ||
          phenotypes.rows() != column_count)
         throw std::invalid_argument(
           "Step 1 resident genotype products received incompatible dimensions");
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
       const int rows = checked_int(
-        resident_rows_, "resident genotype product row count");
+        resident_genotypes_.rows, "resident genotype product row count");
       const int columns = checked_int(
         column_count, "resident genotype product sample count");
       const int phenotype_count = checked_int(
@@ -1380,13 +2246,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+      ensure_capacity(d_gram_, gram.size(),
         "cudaMalloc(resident genotype Gram matrix)");
       if(phenotype_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           phenotypes.size(),
           "cudaMalloc(resident genotype phenotype block)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        ensure_capacity(d_crossproduct_,
           crossproduct.size(),
           "cudaMalloc(resident genotype crossproduct)");
       }
@@ -1407,7 +2273,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
 
       const double* device_genotypes = d_resident_genotypes_ +
-        start_column * resident_rows_;
+        start_column * resident_genotypes_.rows;
       const double alpha = 1.0;
       const double beta = 0.0;
       if(phenotype_count > 0) {
@@ -1464,6 +2330,413 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(timings) timings->download_ms += elapsed_ms(transfer_start);
     }
 
+    bool cache_preprocessed_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      Step1ComputeTimings* timings) override {
+
+      const Eigen::Array<bool, Eigen::Dynamic, 1> active_phenotypes =
+        Eigen::Array<bool, Eigen::Dynamic, 1>::Constant(
+          phenotypes.cols(), true);
+      return cache_preprocessed_fold_systems(
+        start_columns, column_counts, phenotypes, active_phenotypes,
+        timings);
+    }
+
+    bool cache_preprocessed_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
+      const Eigen::Ref<const Eigen::Array<bool, Eigen::Dynamic, 1>>&
+        active_phenotypes,
+      Step1ComputeTimings* timings) override {
+
+      invalidate_resident_fold_systems();
+      const Eigen::Index system_count_index = start_columns.size();
+      if(!level0_resident_folds_enabled_ || !level0_cholesky_enabled_ ||
+         !level0_fold_batch_enabled_ || system_count_index < 2)
+        return false;
+      if(!resident_genotypes_.valid || column_counts.size() != system_count_index ||
+         phenotypes.rows() != resident_genotypes_.columns ||
+         active_phenotypes.size() != phenotypes.cols() ||
+         active_phenotypes.count() == 0)
+        throw std::invalid_argument(
+          "Step 1 resident fold products received incompatible dimensions");
+      for(Eigen::Index system = 0; system < system_count_index; ++system) {
+        if(start_columns(system) < 0 || column_counts(system) < 0 ||
+           start_columns(system) > resident_genotypes_.columns - column_counts(system))
+          throw std::invalid_argument(
+            "Step 1 resident fold products received an invalid fold");
+      }
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const size_t system_count = static_cast<size_t>(system_count_index);
+      const int rows = checked_int(
+        resident_genotypes_.rows, "resident fold product row count");
+      const int phenotype_count = checked_int(
+        phenotypes.cols(), "resident fold product phenotype count");
+      std::vector<int> active_phenotype_indices;
+      active_phenotype_indices.reserve(active_phenotypes.count());
+      for(Eigen::Index phenotype = 0;
+          phenotype < active_phenotypes.size(); ++phenotype)
+        if(active_phenotypes(phenotype))
+          active_phenotype_indices.push_back(
+            static_cast<int>(phenotype));
+      const Eigen::Index gram_elements = resident_genotypes_.rows * resident_genotypes_.rows;
+      const Eigen::Index rhs_elements = resident_genotypes_.rows * phenotypes.cols();
+      ensure_level0_cholesky_lane_count(system_count);
+      ensure_capacity(d_gram_, gram_elements,
+        "cudaMalloc(resident fold total Gram matrix)");
+      if(rhs_elements > 0)
+        ensure_capacity(d_crossproduct_, rhs_elements,
+          "cudaMalloc(resident fold total right-hand sides)");
+
+      const bool cache_full_phenotypes = phenotypes.innerStride() == 1 &&
+        phenotypes.outerStride() == phenotypes.rows();
+      const bool reuse_cached_phenotypes = cache_full_phenotypes &&
+        level0_phenotypes_.matches(level0_static_input_cache_key(),
+          phenotypes.rows(), phenotypes.cols());
+      if(cache_full_phenotypes && !reuse_cached_phenotypes)
+        ensure_capacity(d_level0_phenotypes_,
+          phenotypes.size(), "cudaMalloc(static Level 0 phenotypes)");
+      std::vector<Eigen::MatrixXd> packed_phenotypes(
+        cache_full_phenotypes ? 0 : system_count);
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        const Eigen::Index fold = static_cast<Eigen::Index>(system);
+        const Eigen::Index sample_count = column_counts(fold);
+        ensure_capacity(lane.gram, gram_elements,
+          "cudaMalloc(resident fold Gram matrix)");
+        ensure_capacity(lane.right_hand_sides, rhs_elements,
+          "cudaMalloc(resident fold right-hand sides)");
+        if(phenotype_count > 0 && !cache_full_phenotypes) {
+          packed_phenotypes[system] = phenotypes.middleRows(
+            start_columns(fold), sample_count);
+          ensure_capacity(lane.predictions,
+            packed_phenotypes[system].size(),
+            "cudaMalloc(resident fold phenotype staging)");
+        }
+      }
+
+      ComputeClock::time_point phase_start;
+      if(timings) phase_start = ComputeClock::now();
+      if(cache_full_phenotypes && !reuse_cached_phenotypes &&
+         phenotypes.size() > 0) {
+        check_cuda(cudaMemcpy(d_level0_phenotypes_, phenotypes.data(),
+          static_cast<size_t>(phenotypes.size()) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "copy static Level 0 phenotypes to CUDA device");
+        level0_phenotypes_.record(level0_static_input_cache_key(),
+          phenotypes.rows(), phenotypes.cols());
+      } else if(!cache_full_phenotypes) {
+        for(size_t system = 0; system < system_count; ++system) {
+          if(phenotype_count == 0) continue;
+          CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+          check_cuda(cudaMemcpyAsync(lane.predictions,
+            packed_phenotypes[system].data(),
+            packed_phenotypes[system].size() * sizeof(double),
+            cudaMemcpyHostToDevice, lane.stream),
+            "copy resident fold phenotypes to CUDA device");
+        }
+        synchronize_level0_cholesky_lanes(system_count);
+      }
+      if(timings) timings->upload_ms += elapsed_ms(phase_start);
+
+      if(timings) phase_start = ComputeClock::now();
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        const Eigen::Index fold = static_cast<Eigen::Index>(system);
+        const int start = checked_int(start_columns(fold),
+          "resident fold product start column");
+        const int samples = checked_int(column_counts(fold),
+          "resident fold product sample count");
+        const double* device_genotypes = d_resident_genotypes_ +
+          static_cast<Eigen::Index>(start) * resident_genotypes_.rows;
+        const double* device_fold_phenotypes = phenotype_count == 0 ?
+          nullptr : (cache_full_phenotypes ?
+            d_level0_phenotypes_ + start : lane.predictions);
+        const int phenotype_leading_dimension = cache_full_phenotypes ?
+          checked_int(phenotypes.rows(),
+            "static Level 0 phenotype leading dimension") : samples;
+        if(phenotype_count > 0)
+          check_cublas(cublasDgemm(lane.blas, CUBLAS_OP_N, CUBLAS_OP_N,
+            rows, phenotype_count, samples, &alpha,
+            device_genotypes, rows, device_fold_phenotypes,
+            phenotype_leading_dimension, &beta,
+            lane.right_hand_sides, rows),
+            "cublasDgemm(resident fold crossproduct)");
+        check_cublas(cublasDgemm(lane.blas, CUBLAS_OP_N, CUBLAS_OP_T,
+          rows, rows, samples, &alpha, device_genotypes, rows,
+          device_genotypes, rows, &beta, lane.gram, rows),
+          "cublasDgemm(resident fold Gram product)");
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+
+      check_cuda(cudaMemset(d_gram_, 0,
+        static_cast<size_t>(gram_elements) * sizeof(double)),
+        "clear resident fold total Gram matrix");
+      if(rhs_elements > 0)
+        check_cuda(cudaMemset(d_crossproduct_, 0,
+          static_cast<size_t>(rhs_elements) * sizeof(double)),
+          "clear resident fold total right-hand sides");
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cublas(cublasDaxpy(handle_, checked_int(gram_elements,
+          "resident fold Gram element count"), &alpha, lane.gram, 1,
+          d_gram_, 1), "sum resident fold Gram matrix");
+        if(rhs_elements > 0)
+          check_cublas(cublasDaxpy(handle_, checked_int(rhs_elements,
+            "resident fold right-hand-side element count"), &alpha,
+            lane.right_hand_sides, 1, d_crossproduct_, 1),
+            "sum resident fold right-hand sides");
+      }
+      const double minus_one = -1.0;
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cublas(cublasDscal(handle_, checked_int(gram_elements,
+          "resident fold Gram element count"), &minus_one,
+          lane.gram, 1), "negate resident fold Gram matrix");
+        check_cublas(cublasDaxpy(handle_, checked_int(gram_elements,
+          "resident fold Gram element count"), &alpha, d_gram_, 1,
+          lane.gram, 1), "form resident training Gram matrix");
+        if(rhs_elements > 0) {
+          check_cublas(cublasDscal(handle_, checked_int(rhs_elements,
+            "resident fold right-hand-side element count"), &minus_one,
+            lane.right_hand_sides, 1),
+            "negate resident fold right-hand sides");
+          check_cublas(cublasDaxpy(handle_, checked_int(rhs_elements,
+            "resident fold right-hand-side element count"), &alpha,
+            d_crossproduct_, 1, lane.right_hand_sides, 1),
+            "form resident training right-hand sides");
+        }
+      }
+      check_cuda(cudaDeviceSynchronize(),
+        "synchronize resident fold system preparation");
+      if(timings) {
+        timings->gram_ms += elapsed_ms(phase_start);
+        timings->resident_reuse_count += system_count;
+      }
+      // Keep every RHS in cuBLAS/cuSOLVER so active outcomes retain the
+      // validated arithmetic; only their device-to-host results are compacted.
+      if(active_phenotype_indices.size() ==
+           static_cast<size_t>(phenotypes.cols()))
+        active_phenotype_indices.clear();
+      resident_fold_systems_.output_indices.swap(active_phenotype_indices);
+      resident_fold_systems_.activate(
+        system_count_index, phenotypes.cols(),
+        CudaFoldSystemOrientation::genotype);
+      return true;
+    }
+
+    bool cache_resident_design_fold_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_rows,
+      const Eigen::Ref<const Eigen::VectorXi>& row_counts,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Step1ComputeTimings* timings) override {
+
+      invalidate_resident_fold_systems();
+      const Eigen::Index system_count_index = start_rows.size();
+      if(!level0_cholesky_enabled_ || !level0_fold_batch_enabled_ ||
+         system_count_index < 2)
+        return false;
+      if(!resident_design_.valid ||
+         row_counts.size() != system_count_index ||
+         outcomes.rows() != resident_design_.rows)
+        throw std::invalid_argument(
+          "Step 1 resident design fold products received incompatible dimensions");
+      for(Eigen::Index system = 0; system < system_count_index; ++system) {
+        if(start_rows(system) < 0 || row_counts(system) < 0 ||
+           start_rows(system) > resident_design_.rows - row_counts(system))
+          throw std::invalid_argument(
+            "Step 1 resident design fold products received an invalid fold");
+      }
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const size_t system_count = static_cast<size_t>(system_count_index);
+      const int features = checked_int(
+        resident_design_.columns, "resident design fold feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "resident design fold outcome count");
+      if(features == 0) return false;
+      const Eigen::Index gram_elements =
+        resident_design_.columns * resident_design_.columns;
+      const Eigen::Index rhs_elements =
+        resident_design_.columns * outcomes.cols();
+      const Eigen::Index resident_design_elements =
+        resident_design_.rows * resident_design_.columns;
+      if(!resident_design_.uses_level1_cache() && d_projected_.capacity() <
+           static_cast<size_t>(resident_design_elements))
+        throw std::runtime_error(
+          "Step 1 resident design fold staging workspace is unavailable");
+      ensure_level0_cholesky_lane_count(system_count);
+      ensure_capacity(d_gram_, gram_elements,
+        "cudaMalloc(resident design fold total Gram matrix)");
+      if(rhs_elements > 0)
+        ensure_capacity(d_crossproduct_, rhs_elements,
+          "cudaMalloc(resident design fold total right-hand sides)");
+
+      std::vector<Eigen::MatrixXd> packed_outcomes(system_count);
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        const Eigen::Index fold = static_cast<Eigen::Index>(system);
+        const Eigen::Index sample_count = row_counts(fold);
+        ensure_capacity(lane.gram, gram_elements,
+          "cudaMalloc(resident design fold Gram matrix)");
+        ensure_capacity(lane.right_hand_sides, rhs_elements,
+          "cudaMalloc(resident design fold right-hand sides)");
+        if(outcome_count > 0) {
+          packed_outcomes[system] = outcomes.middleRows(
+            start_rows(fold), sample_count);
+          ensure_capacity(lane.predictions,
+            packed_outcomes[system].size(),
+            "cudaMalloc(resident design fold outcome staging)");
+        }
+      }
+
+      ComputeClock::time_point phase_start;
+      if(timings) phase_start = ComputeClock::now();
+      for(size_t system = 0; system < system_count; ++system) {
+        if(outcome_count == 0) continue;
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cuda(cudaMemcpyAsync(lane.predictions,
+          packed_outcomes[system].data(),
+          packed_outcomes[system].size() * sizeof(double),
+          cudaMemcpyHostToDevice, lane.stream),
+          "copy resident design fold outcomes to CUDA device");
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+      if(timings) timings->upload_ms += elapsed_ms(phase_start);
+
+      if(timings) phase_start = ComputeClock::now();
+      const double alpha = 1.0;
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        const Eigen::Index fold = static_cast<Eigen::Index>(system);
+        const Eigen::Index fold_rows = row_counts(fold);
+        if(fold_rows == 0) {
+          check_cuda(cudaMemsetAsync(lane.gram, 0,
+            static_cast<size_t>(gram_elements) * sizeof(double),
+            lane.stream),
+            "clear empty resident design fold Gram matrix");
+          if(rhs_elements > 0)
+            check_cuda(cudaMemsetAsync(lane.right_hand_sides, 0,
+              static_cast<size_t>(rhs_elements) * sizeof(double),
+              lane.stream),
+              "clear empty resident design fold right-hand sides");
+          continue;
+        }
+        const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
+          fold_rows, resident_design_.columns);
+        for(Eigen::Index start = 0; start < fold_rows;
+            start += chunk_rows) {
+          const Eigen::Index count_index = std::min(
+            chunk_rows, fold_rows - start);
+          const int count = checked_int(count_index,
+            "resident design fold product chunk row count");
+          const double beta = start == 0 ? 0.0 : 1.0;
+          const double* design_chunk = nullptr;
+          int design_leading_dimension = 0;
+          if(resident_design_.uses_level1_cache()) {
+            design_chunk =
+              level1_design_.column_data(0) + start_rows(fold) + start;
+            design_leading_dimension = checked_int(
+              resident_design_.rows,
+              "persistent Level 1 design leading dimension");
+          } else {
+            double* staged_design_chunk = d_projected_ +
+              start_rows(fold) * resident_design_.columns;
+            check_cuda(cudaMemcpy2DAsync(staged_design_chunk,
+              static_cast<size_t>(count) * sizeof(double),
+              d_resident_genotypes_ + start_rows(fold) + start,
+              static_cast<size_t>(resident_design_.rows) * sizeof(double),
+              static_cast<size_t>(count) * sizeof(double),
+              static_cast<size_t>(features), cudaMemcpyDeviceToDevice,
+              lane.stream),
+              "stage resident design fold product chunk on CUDA device");
+            design_chunk = staged_design_chunk;
+            design_leading_dimension = count;
+          }
+          if(outcome_count > 0)
+            check_cublas(cublasDgemm(lane.blas,
+              CUBLAS_OP_T, CUBLAS_OP_N,
+              features, outcome_count, count, &alpha,
+              design_chunk, design_leading_dimension,
+              lane.predictions + start,
+              checked_int(fold_rows,
+                "resident design fold outcome leading dimension"),
+              &beta, lane.right_hand_sides, features),
+              "cublasDgemm(resident design fold crossproduct)");
+          check_cublas(cublasDsyrk(lane.blas, CUBLAS_FILL_MODE_LOWER,
+            CUBLAS_OP_T, features, count, &alpha,
+            design_chunk, design_leading_dimension,
+            &beta, lane.gram, features),
+            "cublasDsyrk(resident design fold Gram product)");
+        }
+        const dim3 threads(16, 16);
+        const dim3 grid((features + threads.x - 1) / threads.x,
+          (features + threads.y - 1) / threads.y);
+        mirror_lower_triangle<<<grid, threads, 0, lane.stream>>>(
+          lane.gram, features);
+        check_cuda(cudaGetLastError(),
+          "mirror resident design fold Gram triangle kernel");
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+
+      check_cuda(cudaMemset(d_gram_, 0,
+        static_cast<size_t>(gram_elements) * sizeof(double)),
+        "clear resident design fold total Gram matrix");
+      if(rhs_elements > 0)
+        check_cuda(cudaMemset(d_crossproduct_, 0,
+          static_cast<size_t>(rhs_elements) * sizeof(double)),
+          "clear resident design fold total right-hand sides");
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cublas(cublasDaxpy(handle_, checked_int(gram_elements,
+          "resident design fold Gram element count"), &alpha,
+          lane.gram, 1, d_gram_, 1),
+          "sum resident design fold Gram matrix");
+        if(rhs_elements > 0)
+          check_cublas(cublasDaxpy(handle_, checked_int(rhs_elements,
+            "resident design fold right-hand-side element count"), &alpha,
+            lane.right_hand_sides, 1, d_crossproduct_, 1),
+            "sum resident design fold right-hand sides");
+      }
+      const double minus_one = -1.0;
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        check_cublas(cublasDscal(handle_, checked_int(gram_elements,
+          "resident design fold Gram element count"), &minus_one,
+          lane.gram, 1), "negate resident design fold Gram matrix");
+        check_cublas(cublasDaxpy(handle_, checked_int(gram_elements,
+          "resident design fold Gram element count"), &alpha,
+          d_gram_, 1, lane.gram, 1),
+          "form resident design training Gram matrix");
+        if(rhs_elements > 0) {
+          check_cublas(cublasDscal(handle_, checked_int(rhs_elements,
+            "resident design fold right-hand-side element count"),
+            &minus_one, lane.right_hand_sides, 1),
+            "negate resident design fold right-hand sides");
+          check_cublas(cublasDaxpy(handle_, checked_int(rhs_elements,
+            "resident design fold right-hand-side element count"), &alpha,
+            d_crossproduct_, 1, lane.right_hand_sides, 1),
+            "form resident design training right-hand sides");
+        }
+      }
+      check_cuda(cudaDeviceSynchronize(),
+        "synchronize resident design fold system preparation");
+      if(timings) {
+        timings->gram_ms += elapsed_ms(phase_start);
+        timings->resident_design_reuse_count += system_count;
+      }
+      resident_fold_systems_.activate(
+        system_count_index, outcomes.cols(),
+        CudaFoldSystemOrientation::design);
+      return true;
+    }
+
     void ridge_predict_preprocessed(
       Eigen::Index start_column,
       Eigen::Index column_count,
@@ -1475,9 +2748,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(ridge_factorized_size_ < 0)
         throw std::runtime_error(
           "Step 1 resident ridge prediction requested before factorization");
-      if(!resident_valid_ || resident_rows_ != ridge_factorized_size_ ||
+      if(!resident_genotypes_.valid || resident_genotypes_.rows != ridge_factorized_size_ ||
          start_column < 0 || column_count < 0 ||
-         start_column > resident_columns_ - column_count)
+         start_column > resident_genotypes_.columns - column_count)
         throw std::invalid_argument(
           "Step 1 resident ridge prediction received incompatible dimensions");
       if((ridge_parameters.array() < 0).any())
@@ -1508,18 +2781,18 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
         column_count, combination_count);
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         ridge_parameters.size(),
         "cudaMalloc(resident ridge parameters)");
-      ensure_capacity(d_inverse_, inverse_capacity_,
+      ensure_capacity(d_inverse_,
         static_cast<Eigen::Index>(size) * parameter_count,
         "cudaMalloc(resident ridge inverse)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         static_cast<Eigen::Index>(size) * combination_count,
         "cudaMalloc(resident ridge scaled right-hand sides)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+      ensure_capacity(d_phenotypes_,
         coefficients.size(), "cudaMalloc(resident ridge coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_samples * combination_count,
         "cudaMalloc(resident ridge prediction chunk)");
 
@@ -1577,7 +2850,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         const int count = checked_int(
           count_index, "resident ridge prediction chunk sample count");
         const double* device_prediction_chunk = d_resident_genotypes_ +
-          (start_column + start) * resident_rows_;
+          (start_column + start) * resident_genotypes_.rows;
         if(timings) timings->resident_reuse_count++;
 
         std::unique_ptr<CudaEventPair> prediction_events;
@@ -1618,11 +2891,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeTimings* timings) override {
 
       if(!level0_cholesky_enabled_) return false;
-      if(!resident_valid_ || gram.rows() != gram.cols() ||
-         gram.rows() != resident_rows_ ||
-         right_hand_sides.rows() != resident_rows_ ||
+      if(!resident_genotypes_.valid || gram.rows() != gram.cols() ||
+         gram.rows() != resident_genotypes_.rows ||
+         right_hand_sides.rows() != resident_genotypes_.rows ||
          start_column < 0 || column_count < 0 ||
-         start_column > resident_columns_ - column_count)
+         start_column > resident_genotypes_.columns - column_count)
         throw std::invalid_argument(
           "Step 1 resident Cholesky ridge prediction received incompatible dimensions");
       if((ridge_parameters.array() < 0).any())
@@ -1636,7 +2909,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         penalty_multipliers, coefficients, timings);
 
       const int size = checked_int(
-        resident_rows_, "resident Cholesky ridge system size");
+        resident_genotypes_.rows, "resident Cholesky ridge system size");
       const int sample_count = checked_int(
         column_count, "resident Cholesky ridge sample count");
       const int combination_count = checked_int(
@@ -1648,10 +2921,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       }
 
       check_cuda(cudaSetDevice(device_), "cudaSetDevice");
-      ensure_capacity(d_inverse_, inverse_capacity_, predictions.size(),
+      ensure_capacity(d_inverse_, predictions.size(),
         "cudaMalloc(resident Cholesky ridge predictions)");
       const double* device_prediction_matrix = d_resident_genotypes_ +
-        start_column * resident_rows_;
+        start_column * resident_genotypes_.rows;
       const double alpha = 1.0;
       const double beta = 0.0;
       std::unique_ptr<CudaEventPair> prediction_events;
@@ -1693,7 +2966,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       if(!level0_cholesky_enabled_ || !level0_fold_batch_enabled_ ||
          system_count < 2)
         return false;
-      if(!resident_valid_ || right_hand_sides.size() != system_count ||
+      if(!resident_genotypes_.valid || right_hand_sides.size() != system_count ||
          start_columns.size() != static_cast<Eigen::Index>(system_count) ||
          column_counts.size() != static_cast<Eigen::Index>(system_count))
         throw std::invalid_argument(
@@ -1703,7 +2976,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           "Step 1 resident batched Cholesky ridge parameters must be non-negative");
       if((ridge_parameters.array() == 0).any()) return false;
 
-      const Eigen::Index size_index = resident_rows_;
+      const Eigen::Index size_index = resident_genotypes_.rows;
       const Eigen::Index right_hand_side_count_index =
         right_hand_sides.empty() ? 0 : right_hand_sides.front().cols();
       for(size_t system = 0; system < system_count; ++system) {
@@ -1714,7 +2987,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
            start_columns(static_cast<Eigen::Index>(system)) < 0 ||
            column_counts(static_cast<Eigen::Index>(system)) < 0 ||
            start_columns(static_cast<Eigen::Index>(system)) >
-             resident_columns_ -
+             resident_genotypes_.columns -
                column_counts(static_cast<Eigen::Index>(system)))
           throw std::invalid_argument(
             "Step 1 resident batched Cholesky ridge prediction received incompatible dimensions");
@@ -1763,31 +3036,38 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       std::vector<int> workspace_sizes(system_count, 0);
       for(size_t system = 0; system < system_count; ++system) {
         CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
-        ensure_capacity(lane.gram, lane.gram_capacity, gram_elements,
+        ensure_capacity(lane.gram, gram_elements,
           "cudaMalloc(batched Cholesky Gram matrix)");
-        ensure_capacity(lane.factor, lane.factor_capacity, gram_elements,
+        const bool factor_grew = static_cast<size_t>(gram_elements) >
+          lane.factor.capacity();
+        ensure_capacity(lane.factor, gram_elements,
           "cudaMalloc(batched Cholesky factorization matrix)");
-        ensure_capacity(lane.right_hand_sides,
-          lane.right_hand_sides_capacity, rhs_elements,
+        ensure_capacity(lane.right_hand_sides, rhs_elements,
           "cudaMalloc(batched Cholesky right-hand sides)");
-        ensure_capacity(lane.solve, lane.solve_capacity, rhs_elements,
+        ensure_capacity(lane.solve, rhs_elements,
           "cudaMalloc(batched Cholesky solve workspace)");
-        ensure_capacity(lane.coefficients, lane.coefficients_capacity,
+        ensure_capacity(lane.coefficients,
           coefficient_elements,
           "cudaMalloc(batched Cholesky coefficients)");
-        ensure_capacity(lane.predictions, lane.predictions_capacity,
+        ensure_capacity(lane.predictions,
           predictions[system].size(),
           "cudaMalloc(batched Cholesky predictions)");
-        ensure_capacity(lane.info, lane.info_capacity,
+        ensure_capacity(lane.info,
           2 * parameter_count,
           "cudaMalloc(batched Cholesky solver status)");
-        check_cusolver(cusolverDnDpotrf_bufferSize(lane.solver,
-          CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
-          &workspace_sizes[system]),
-          "cusolverDnDpotrf_bufferSize(batched resident ridge)");
-        ensure_capacity(lane.workspace, lane.workspace_capacity,
-          workspace_sizes[system],
-          "cudaMalloc(batched Cholesky solver workspace)");
+        if(factor_grew || lane.workspace.capacity() == 0) {
+          check_cusolver(cusolverDnDpotrf_bufferSize(lane.solver,
+            CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
+            &workspace_sizes[system]),
+            "cusolverDnDpotrf_bufferSize(batched resident ridge)");
+          ensure_capacity(lane.workspace,
+            workspace_sizes[system],
+            "cudaMalloc(batched Cholesky solver workspace)");
+        } else {
+          workspace_sizes[system] = checked_int(
+            static_cast<Eigen::Index>(lane.workspace.capacity()),
+            "batched Cholesky solver workspace size");
+        }
       }
 
       ComputeClock::time_point phase_start;
@@ -1851,7 +3131,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           const double* prediction_matrix = d_resident_genotypes_ +
             static_cast<Eigen::Index>(
               start_columns(static_cast<Eigen::Index>(system))) *
-              resident_rows_;
+              resident_genotypes_.rows;
           check_cublas(cublasDgemm(lane.blas, CUBLAS_OP_T, CUBLAS_OP_N,
             sample_count, combination_count, size, &alpha,
             prediction_matrix, size, lane.coefficients, size, &beta,
@@ -1904,6 +3184,562 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       return true;
     }
 
+    bool ridge_predict_cached_preprocessed_systems(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      std::vector<Eigen::MatrixXd>& predictions,
+      std::vector<Eigen::MatrixXd>& coefficients,
+      Step1ComputeTimings* timings) override {
+
+      return ridge_predict_cached_preprocessed_systems_impl(
+        start_columns, column_counts, ridge_parameters,
+        predictions, coefficients, true, timings);
+    }
+
+    bool ridge_predict_cached_preprocessed_systems_normalized(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      double effective_sample_count,
+      Eigen::Index level1_start_column,
+      Eigen::MatrixXd& normalized_predictions,
+      Step1ComputeTimings* timings) override {
+
+      const bool cache_level1_design = level1_start_column >= 0;
+      if(!resident_fold_systems_.valid ||
+         resident_fold_systems_.uses_design() ||
+         resident_fold_systems_.rhs_count <= 0 ||
+         effective_sample_count != resident_genotypes_.columns)
+        return false;
+      if(cache_level1_design &&
+         (resident_fold_systems_.rhs_count != 1 ||
+          !level1_design_.accepts_append(level1_start_column,
+            effective_sample_count,
+            ridge_parameters.size())))
+        return false;
+      Eigen::Index covered_rows = 0;
+      for(Eigen::Index fold = 0; fold < start_columns.size(); ++fold) {
+        if(start_columns(fold) != covered_rows) return false;
+        covered_rows += column_counts(fold);
+      }
+      if(covered_rows != resident_genotypes_.columns) return false;
+
+      std::vector<Eigen::MatrixXd> unused_predictions;
+      std::vector<Eigen::MatrixXd> unused_coefficients;
+      if(!ridge_predict_cached_preprocessed_systems_impl(
+           start_columns, column_counts, ridge_parameters,
+           unused_predictions, unused_coefficients, false, timings))
+        return false;
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_genotypes_.columns, "normalized Level 0 prediction row count");
+      const int parameter_count = checked_int(ridge_parameters.size(),
+        "normalized Level 0 prediction parameter count");
+      const int outcome_count = checked_int(resident_fold_systems_.rhs_count,
+        "normalized Level 0 prediction outcome count");
+      const int output_outcome_count =
+        resident_fold_systems_.output_indices.empty() ? outcome_count :
+          checked_int(resident_fold_systems_.output_indices.size(),
+            "normalized Level 0 prediction output count");
+      const int columns = checked_int(
+        ridge_parameters.size() * resident_fold_systems_.rhs_count,
+        "normalized Level 0 prediction column count");
+      const int output_columns = checked_int(
+        static_cast<Eigen::Index>(parameter_count) * output_outcome_count,
+        "normalized Level 0 output column count");
+      const int element_count = checked_element_count(
+        rows, columns, "normalized Level 0 predictions");
+      normalized_predictions.resize(rows, output_columns);
+      if(rows == 0 || columns == 0) {
+        normalized_predictions.setZero();
+        return true;
+      }
+
+      ComputeClock::time_point phase_start;
+      if(timings) phase_start = ComputeClock::now();
+      double* assembled_predictions = nullptr;
+      if(cache_level1_design) {
+        assembled_predictions =
+          level1_design_.column_data(level1_start_column);
+      } else {
+        ensure_capacity(d_level0_prediction_block_, element_count,
+          "cudaMalloc(Level 0 prediction block)");
+        assembled_predictions = d_level0_prediction_block_;
+      }
+      for(Eigen::Index fold = 0; fold < start_columns.size(); ++fold) {
+        const int fold_rows = checked_int(column_counts(fold),
+          "normalized Level 0 fold row count");
+        if(fold_rows == 0) continue;
+        CudaLevel0CholeskyLane& lane =
+          level0_cholesky_lanes_[static_cast<size_t>(fold)];
+        check_cuda(cudaMemcpy2DAsync(
+          assembled_predictions + start_columns(fold),
+          static_cast<size_t>(rows) * sizeof(double),
+          lane.predictions,
+          static_cast<size_t>(fold_rows) * sizeof(double),
+          static_cast<size_t>(fold_rows) * sizeof(double),
+          static_cast<size_t>(columns), cudaMemcpyDeviceToDevice,
+          lane.stream),
+          "assemble normalized Level 0 predictions on CUDA device");
+      }
+      synchronize_level0_cholesky_lanes(
+        static_cast<size_t>(start_columns.size()));
+
+      ensure_capacity(d_level1_ones_, rows,
+        "cudaMalloc(Level 0 normalization ones)");
+      const int threads = 256;
+      fill_constant<<<(rows + threads - 1) / threads, threads>>>(
+        d_level1_ones_, 1.0, rows);
+      check_cuda(cudaGetLastError(),
+        "fill Level 0 normalization ones kernel");
+      std::vector<double> means(columns);
+      std::vector<double> inverse_standard_deviations(columns);
+      for(int column = 0; column < columns; ++column) {
+        const double* values = assembled_predictions +
+          static_cast<Eigen::Index>(column) * rows;
+        double sum = 0.0;
+        double sum_of_squares = 0.0;
+        check_cublas(cublasDdot(handle_, rows, values, 1,
+          d_level1_ones_, 1, &sum),
+          "cublasDdot(Level 0 prediction sum)");
+        check_cublas(cublasDdot(handle_, rows, values, 1,
+          values, 1, &sum_of_squares),
+          "cublasDdot(Level 0 prediction sum of squares)");
+        means[column] = sum / effective_sample_count;
+        const double centered_sum_of_squares = sum_of_squares -
+          effective_sample_count * means[column] * means[column];
+        if(!(centered_sum_of_squares > 0) ||
+           !std::isfinite(centered_sum_of_squares))
+          throw std::runtime_error(
+            "CUDA Level 0 predictions have invalid variance");
+        inverse_standard_deviations[column] = std::sqrt(
+          (effective_sample_count - 1.0) / centered_sum_of_squares);
+      }
+      ensure_capacity(d_inverse_, columns,
+        "cudaMalloc(Level 0 prediction means)");
+      ensure_capacity(d_eigenvalues_, columns,
+        "cudaMalloc(Level 0 prediction inverse standard deviations)");
+      check_cuda(cudaMemcpy(d_inverse_, means.data(),
+        static_cast<size_t>(columns) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy Level 0 prediction means to CUDA device");
+      check_cuda(cudaMemcpy(d_eigenvalues_,
+        inverse_standard_deviations.data(),
+        static_cast<size_t>(columns) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy Level 0 prediction inverse standard deviations to CUDA device");
+      double* normalized_destination = assembled_predictions;
+      if(outcome_count == 1) {
+        normalize_design_columns<<<
+          (element_count + threads - 1) / threads, threads>>>(
+            assembled_predictions, rows, element_count,
+            d_inverse_, d_eigenvalues_);
+        check_cuda(cudaGetLastError(),
+          "normalize Level 0 prediction columns kernel");
+      } else {
+        ensure_capacity(d_level0_normalized_predictions_, element_count,
+          "cudaMalloc(normalized Level 0 prediction block)");
+        normalized_destination = d_level0_normalized_predictions_;
+        normalize_and_reorder_design_columns<<<
+          (element_count + threads - 1) / threads, threads>>>(
+            assembled_predictions, normalized_destination, rows,
+            element_count, outcome_count, parameter_count,
+            d_inverse_, d_eigenvalues_);
+        check_cuda(cudaGetLastError(),
+          "normalize and reorder Level 0 prediction columns kernel");
+      }
+      check_cuda(cudaDeviceSynchronize(),
+        "finish Level 0 prediction normalization");
+      if(timings) timings->ridge_ms += elapsed_ms(phase_start);
+
+      if(timings) phase_start = ComputeClock::now();
+      const size_t normalized_bytes =
+        static_cast<size_t>(normalized_predictions.size()) * sizeof(double);
+      bool unregister_normalized_predictions = false;
+      const cudaError_t registration_status = cudaHostRegister(
+        normalized_predictions.data(), normalized_bytes,
+        cudaHostRegisterPortable);
+      if(registration_status == cudaSuccess) {
+        unregister_normalized_predictions = true;
+      } else {
+        cudaGetLastError();
+      }
+      if(resident_fold_systems_.output_indices.empty()) {
+        check_cuda(cudaMemcpy(normalized_predictions.data(),
+          normalized_destination, normalized_bytes,
+          cudaMemcpyDeviceToHost),
+          "copy normalized Level 0 predictions from CUDA device");
+      } else {
+        const size_t outcome_bytes = static_cast<size_t>(rows) *
+          parameter_count * sizeof(double);
+        for(int output = 0; output < output_outcome_count; ++output) {
+          const int source_outcome = resident_fold_systems_.output_indices[output];
+          check_cuda(cudaMemcpy(
+            normalized_predictions.data() +
+              static_cast<Eigen::Index>(output) * parameter_count * rows,
+            normalized_destination +
+              static_cast<Eigen::Index>(source_outcome) * parameter_count *
+                rows,
+            outcome_bytes, cudaMemcpyDeviceToHost),
+            "copy selected normalized Level 0 predictions from CUDA device");
+        }
+      }
+      if(unregister_normalized_predictions)
+        check_cuda(cudaHostUnregister(normalized_predictions.data()),
+          "cudaHostUnregister(normalized Level 0 predictions)");
+      if(timings) timings->download_ms += elapsed_ms(phase_start);
+      if(cache_level1_design)
+        level1_design_.record_append(parameter_count);
+      return true;
+    }
+
+    bool ridge_predict_cached_preprocessed_systems_impl(
+      const Eigen::Ref<const Eigen::VectorXi>& start_columns,
+      const Eigen::Ref<const Eigen::VectorXi>& column_counts,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      std::vector<Eigen::MatrixXd>& predictions,
+      std::vector<Eigen::MatrixXd>& coefficients,
+      bool copy_results_to_host,
+      Step1ComputeTimings* timings) {
+
+      if(!resident_fold_systems_.valid) return false;
+      const size_t system_count = static_cast<size_t>(
+        resident_fold_systems_.system_count);
+      const bool design_orientation =
+        resident_fold_systems_.uses_design();
+      if((design_orientation ? !resident_design_.valid : !resident_genotypes_.valid) ||
+         system_count < 2 ||
+         start_columns.size() != resident_fold_systems_.system_count ||
+         column_counts.size() != resident_fold_systems_.system_count)
+        throw std::invalid_argument(
+          "Step 1 cached fold ridge prediction received incompatible systems");
+      if((ridge_parameters.array() < 0).any()) return false;
+      if((ridge_parameters.array() == 0).any()) return false;
+      for(size_t system = 0; system < system_count; ++system) {
+        const Eigen::Index fold = static_cast<Eigen::Index>(system);
+        if(start_columns(fold) < 0 || column_counts(fold) < 0 ||
+           start_columns(fold) >
+             (design_orientation ? resident_design_.rows :
+               resident_genotypes_.columns) - column_counts(fold))
+          throw std::invalid_argument(
+            "Step 1 cached fold ridge prediction received invalid dimensions");
+      }
+
+      const Eigen::Index size_index = design_orientation ?
+        resident_design_.columns : resident_genotypes_.rows;
+      const Eigen::Index right_hand_side_count_index =
+        resident_fold_systems_.rhs_count;
+      const int size = checked_int(
+        size_index, "cached fold Cholesky ridge system size");
+      const int right_hand_side_count = checked_int(
+        right_hand_side_count_index,
+        "cached fold Cholesky ridge right-hand-side count");
+      const int parameter_count = checked_int(
+        ridge_parameters.size(),
+        "cached fold Cholesky ridge parameter count");
+      const int output_right_hand_side_count =
+        resident_fold_systems_.output_indices.empty() ? right_hand_side_count :
+          checked_int(resident_fold_systems_.output_indices.size(),
+            "cached fold Cholesky output count");
+      const long long combination_count_long =
+        static_cast<long long>(right_hand_side_count) * parameter_count;
+      if(combination_count_long > INT_MAX)
+        throw std::runtime_error(
+          "cached fold Cholesky ridge combination count exceeds integer limits");
+      const int combination_count =
+        static_cast<int>(combination_count_long);
+      const int output_combination_count = checked_int(
+        static_cast<Eigen::Index>(output_right_hand_side_count) *
+          parameter_count,
+        "cached fold Cholesky output combination count");
+
+      predictions.resize(system_count);
+      coefficients.resize(system_count);
+      for(size_t system = 0; system < system_count; ++system) {
+        const Eigen::Index sample_count = column_counts(
+          static_cast<Eigen::Index>(system));
+        if(copy_results_to_host) {
+          predictions[system].resize(sample_count, output_combination_count);
+          coefficients[system].resize(
+            size_index, output_combination_count);
+        }
+      }
+      if(size == 0 || right_hand_side_count == 0 ||
+         parameter_count == 0) {
+        for(size_t system = 0; system < system_count; ++system) {
+          predictions[system].setZero();
+          coefficients[system].setZero();
+        }
+        return true;
+      }
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      ensure_level0_cholesky_lane_count(system_count);
+      const Eigen::Index gram_elements = size_index * size_index;
+      const Eigen::Index rhs_elements =
+        size_index * right_hand_side_count_index;
+      const Eigen::Index coefficient_elements =
+        size_index * combination_count;
+      std::vector<int> workspace_sizes(system_count, 0);
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        if(lane.gram.capacity() < static_cast<size_t>(gram_elements) ||
+           lane.right_hand_sides.capacity() <
+             static_cast<size_t>(rhs_elements))
+          throw std::runtime_error(
+            "Step 1 cached fold systems were released before ridge prediction");
+        const bool factor_grew = static_cast<size_t>(gram_elements) >
+          lane.factor.capacity();
+        ensure_capacity(lane.factor, gram_elements,
+          "cudaMalloc(cached fold Cholesky factorization matrix)");
+        ensure_capacity(lane.solve, rhs_elements,
+          "cudaMalloc(cached fold Cholesky solve workspace)");
+        ensure_capacity(lane.coefficients,
+          coefficient_elements,
+          "cudaMalloc(cached fold Cholesky coefficients)");
+        ensure_capacity(lane.predictions,
+          column_counts(static_cast<Eigen::Index>(system)) *
+            combination_count,
+          "cudaMalloc(cached fold Cholesky predictions)");
+        ensure_capacity(lane.info,
+          2 * parameter_count,
+          "cudaMalloc(cached fold Cholesky solver status)");
+        if(factor_grew || lane.workspace.capacity() == 0) {
+          check_cusolver(cusolverDnDpotrf_bufferSize(lane.solver,
+            CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
+            &workspace_sizes[system]),
+            "cusolverDnDpotrf_bufferSize(cached fold ridge)");
+          ensure_capacity(lane.workspace,
+            workspace_sizes[system],
+            "cudaMalloc(cached fold Cholesky solver workspace)");
+        } else {
+          workspace_sizes[system] = checked_int(
+            static_cast<Eigen::Index>(lane.workspace.capacity()),
+            "cached fold Cholesky solver workspace size");
+        }
+      }
+
+      std::vector<std::vector<int>> solver_status(
+        system_count, std::vector<int>(2 * parameter_count));
+      ComputeClock::time_point phase_start;
+      if(timings) phase_start = ComputeClock::now();
+      const int threads = 256;
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      for(size_t system = 0; system < system_count; ++system) {
+        CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+        for(int parameter = 0; parameter < parameter_count; ++parameter) {
+          check_cuda(cudaMemcpyAsync(lane.factor, lane.gram,
+            gram_elements * sizeof(double), cudaMemcpyDeviceToDevice,
+            lane.stream),
+            "copy cached fold Cholesky factorization matrix");
+          check_cuda(cudaMemcpyAsync(lane.solve, lane.right_hand_sides,
+            rhs_elements * sizeof(double), cudaMemcpyDeviceToDevice,
+            lane.stream), "copy cached fold Cholesky right-hand sides");
+          add_uniform_diagonal_penalty<<<
+            (size + threads - 1) / threads, threads, 0, lane.stream>>>(
+              lane.factor, ridge_parameters(parameter), size);
+          check_cuda(cudaGetLastError(),
+            "add cached fold uniform diagonal penalty kernel");
+          check_cusolver(cusolverDnDpotrf(lane.solver,
+            CUBLAS_FILL_MODE_LOWER, size, lane.factor, size,
+            lane.workspace, workspace_sizes[system],
+            lane.info + 2 * parameter),
+            "cusolverDnDpotrf(cached fold ridge)");
+          check_cusolver(cusolverDnDpotrs(lane.solver,
+            CUBLAS_FILL_MODE_LOWER, size, right_hand_side_count,
+            lane.factor, size, lane.solve, size,
+            lane.info + 2 * parameter + 1),
+            "cusolverDnDpotrs(cached fold ridge)");
+          check_cuda(cudaMemcpyAsync(
+            lane.coefficients +
+              static_cast<Eigen::Index>(parameter) * rhs_elements,
+            lane.solve, rhs_elements * sizeof(double),
+            cudaMemcpyDeviceToDevice, lane.stream),
+            "store cached fold Cholesky coefficients");
+        }
+
+        const int sample_count = checked_int(
+          column_counts(static_cast<Eigen::Index>(system)),
+          "cached fold Cholesky ridge sample count");
+        if(sample_count > 0) {
+          const Eigen::Index start =
+            start_columns(static_cast<Eigen::Index>(system));
+          if(design_orientation) {
+            const Eigen::Index sample_count_index =
+              column_counts(static_cast<Eigen::Index>(system));
+            if(resident_design_.uses_level1_cache()) {
+              check_cublas(cublasDgemm(lane.blas,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                sample_count, combination_count, size, &alpha,
+                level1_design_.column_data(0) + start,
+                checked_int(resident_design_.rows,
+                  "persistent Level 1 design leading dimension"),
+                lane.coefficients, size, &beta,
+                lane.predictions, sample_count),
+                "cublasDgemm(persistent Level 1 fold predictions)");
+            } else {
+              const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
+                sample_count_index, size_index);
+              double* prediction_chunk = d_projected_ +
+                start * resident_design_.columns;
+              for(Eigen::Index chunk_start = 0;
+                  chunk_start < sample_count_index;
+                  chunk_start += chunk_rows) {
+                const Eigen::Index count_index = std::min(
+                  chunk_rows, sample_count_index - chunk_start);
+                const int count = checked_int(count_index,
+                  "cached design prediction chunk sample count");
+                check_cuda(cudaMemcpy2DAsync(prediction_chunk,
+                  static_cast<size_t>(count) * sizeof(double),
+                  d_resident_genotypes_ + start + chunk_start,
+                  static_cast<size_t>(resident_design_.rows) * sizeof(double),
+                  static_cast<size_t>(count) * sizeof(double),
+                  static_cast<size_t>(size), cudaMemcpyDeviceToDevice,
+                  lane.stream),
+                  "stage cached design prediction chunk on CUDA device");
+                check_cublas(cublasDgemm(lane.blas,
+                  CUBLAS_OP_N, CUBLAS_OP_N,
+                  count, combination_count, size, &alpha,
+                  prediction_chunk, count,
+                  lane.coefficients, size, &beta,
+                  lane.predictions + chunk_start, sample_count),
+                  "cublasDgemm(cached design fold Cholesky predictions)");
+              }
+            }
+          } else {
+            const double* prediction_matrix = d_resident_genotypes_ +
+              start * resident_genotypes_.rows;
+            check_cublas(cublasDgemm(lane.blas,
+              CUBLAS_OP_T, CUBLAS_OP_N,
+              sample_count, combination_count, size, &alpha,
+              prediction_matrix, size, lane.coefficients, size, &beta,
+              lane.predictions, sample_count),
+              "cublasDgemm(cached fold Cholesky predictions)");
+          }
+        }
+      }
+      synchronize_level0_cholesky_lanes(system_count);
+      for(size_t system = 0; system < system_count; ++system)
+        check_cuda(cudaMemcpy(solver_status[system].data(),
+          level0_cholesky_lanes_[system].info,
+          solver_status[system].size() * sizeof(int),
+          cudaMemcpyDeviceToHost),
+          "copy cached fold Cholesky solver status to host");
+      if(timings) timings->ridge_ms += elapsed_ms(phase_start);
+
+      for(size_t system = 0; system < system_count; ++system) {
+        for(int parameter = 0; parameter < parameter_count; ++parameter) {
+          const int factor_status = solver_status[system][2 * parameter];
+          const int solve_status = solver_status[system][2 * parameter + 1];
+          if(factor_status != 0 || solve_status != 0) {
+            std::ostringstream message;
+            message << "cuSOLVER cached fold Cholesky failed for system="
+                    << system << " parameter=" << parameter
+                    << " factor_info=" << factor_status
+                    << " solve_info=" << solve_status;
+            throw std::runtime_error(message.str());
+          }
+        }
+      }
+
+      if(copy_results_to_host) {
+        if(timings) phase_start = ComputeClock::now();
+        std::vector<CudaHostRegistration> prediction_registrations(
+          system_count);
+        std::vector<CudaHostRegistration> coefficient_registrations(
+          system_count);
+        // Pageable destinations can serialize these otherwise independent
+        // fold-lane copies. Registration failure deliberately falls back to
+        // the CUDA runtime's pageable-copy behavior.
+        for(size_t system = 0; system < system_count; ++system) {
+          if(predictions[system].size() > 0) {
+            const size_t bytes =
+              static_cast<size_t>(predictions[system].size()) *
+                sizeof(double);
+            if(prediction_registrations[system].try_register(
+                 predictions[system].data(), bytes)) {
+              if(timings) {
+                timings->pinned_download_count++;
+                timings->pinned_download_bytes += bytes;
+              }
+            }
+          }
+          if(coefficients[system].size() > 0) {
+            const size_t bytes =
+              static_cast<size_t>(coefficients[system].size()) *
+                sizeof(double);
+            if(coefficient_registrations[system].try_register(
+                 coefficients[system].data(), bytes)) {
+              if(timings) {
+                timings->pinned_download_count++;
+                timings->pinned_download_bytes += bytes;
+              }
+            }
+          }
+        }
+        for(size_t system = 0; system < system_count; ++system) {
+          CudaLevel0CholeskyLane& lane = level0_cholesky_lanes_[system];
+          if(resident_fold_systems_.output_indices.empty()) {
+            check_cuda(cudaMemcpyAsync(coefficients[system].data(),
+              lane.coefficients,
+              coefficients[system].size() * sizeof(double),
+              cudaMemcpyDeviceToHost, lane.stream),
+              "copy cached fold Cholesky coefficients from CUDA device");
+            if(predictions[system].size() > 0)
+              check_cuda(cudaMemcpyAsync(predictions[system].data(),
+                lane.predictions,
+                predictions[system].size() * sizeof(double),
+                cudaMemcpyDeviceToHost, lane.stream),
+                "copy cached fold Cholesky predictions from CUDA device");
+            continue;
+          }
+          const Eigen::Index sample_count = column_counts(
+            static_cast<Eigen::Index>(system));
+          for(int parameter = 0; parameter < parameter_count; ++parameter) {
+            for(int output = 0;
+                output < output_right_hand_side_count; ++output) {
+              const int source_outcome =
+                resident_fold_systems_.output_indices[output];
+              const Eigen::Index source_column =
+                parameter * right_hand_side_count + source_outcome;
+              const Eigen::Index destination_column =
+                parameter * output_right_hand_side_count + output;
+              check_cuda(cudaMemcpyAsync(
+                coefficients[system].col(destination_column).data(),
+                lane.coefficients + source_column * size_index,
+                static_cast<size_t>(size_index) * sizeof(double),
+                cudaMemcpyDeviceToHost, lane.stream),
+                "copy selected cached fold Cholesky coefficients");
+              if(sample_count > 0)
+                check_cuda(cudaMemcpyAsync(
+                  predictions[system].col(destination_column).data(),
+                  lane.predictions + source_column * sample_count,
+                  static_cast<size_t>(sample_count) * sizeof(double),
+                  cudaMemcpyDeviceToHost, lane.stream),
+                  "copy selected cached fold Cholesky predictions");
+            }
+          }
+        }
+        synchronize_level0_cholesky_lanes(system_count);
+        for(size_t system = 0; system < system_count; ++system) {
+          check_cuda(
+            prediction_registrations[system].unregister_now(),
+            "cudaHostUnregister(cached fold predictions)");
+          check_cuda(
+            coefficient_registrations[system].unregister_now(),
+            "cudaHostUnregister(cached fold coefficients)");
+        }
+        if(timings) timings->download_ms += elapsed_ms(phase_start);
+      }
+      if(timings) {
+        timings->resident_reuse_count += system_count;
+      }
+      return true;
+    }
+
     void compute_products(
       const Eigen::Ref<const Eigen::MatrixXd>& genotypes,
       const Eigen::Ref<const Eigen::MatrixXd>& phenotypes,
@@ -1934,13 +3770,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const bool genotypes_are_resident =
         resident_genotype_columns(genotypes, 0, genotypes.cols()) != nullptr;
       if(!genotypes_are_resident)
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           chunk_samples * genotypes.rows(), "cudaMalloc(genotype chunk)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(Gram matrix)");
+      ensure_capacity(d_gram_, gram.size(), "cudaMalloc(Gram matrix)");
       if(phenotype_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           chunk_samples * phenotypes.cols(), "cudaMalloc(phenotype chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(), "cudaMalloc(crossproduct)");
+        ensure_capacity(d_crossproduct_, crossproduct.size(), "cudaMalloc(crossproduct)");
       }
 
       const double alpha = 1.0;
@@ -2068,13 +3904,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(), "cudaMalloc(design product chunk)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(), "cudaMalloc(design Gram matrix)");
+      ensure_capacity(d_gram_, gram.size(), "cudaMalloc(design Gram matrix)");
       if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           chunk_rows * outcomes.cols(), "cudaMalloc(design outcome chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(),
+        ensure_capacity(d_crossproduct_, crossproduct.size(),
           "cudaMalloc(design crossproduct)");
       }
 
@@ -2166,13 +4002,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(),
         "cudaMalloc(design crossproduct design)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+      ensure_capacity(d_phenotypes_,
         chunk_rows * outcomes.cols(),
         "cudaMalloc(design crossproduct outcomes)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(),
+      ensure_capacity(d_crossproduct_, crossproduct.size(),
         "cudaMalloc(design crossproduct)");
       const double alpha = 1.0;
       for(Eigen::Index start = 0; start < design.rows(); start += chunk_rows) {
@@ -2244,21 +4080,21 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(), "cudaMalloc(weighted design chunk)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_, chunk_rows,
+      ensure_capacity(d_ridge_parameters_, chunk_rows,
         "cudaMalloc(design weight chunk)");
-      ensure_capacity(d_projected_, projected_capacity_,
+      ensure_capacity(d_projected_,
         chunk_rows * design.cols(), "cudaMalloc(weighted design matrix chunk)");
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+      ensure_capacity(d_gram_, gram.size(),
         "cudaMalloc(weighted Gram matrix)");
       if(outcome_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           chunk_rows * outcomes.cols(), "cudaMalloc(weighted outcome chunk)");
-        ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+        ensure_capacity(d_scaled_rhs_,
           chunk_rows * outcomes.cols(),
           "cudaMalloc(weighted outcome matrix chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, crossproduct.size(),
+        ensure_capacity(d_crossproduct_, crossproduct.size(),
           "cudaMalloc(weighted crossproduct)");
       }
 
@@ -2332,13 +4168,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           gram_events.reset(new CudaEventPair());
           gram_events->record_start();
         }
-        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-          features, features, count, &alpha,
-          d_genotypes_, count, d_projected_, count, &beta,
-          d_gram_, features), "cublasDgemm(weighted Gram chunk)");
+        compute_weighted_gram_lower_tiles(
+          d_genotypes_, d_projected_, count, features, beta);
         if(timings)
           timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
       }
+
+      const dim3 mirror_threads(16, 16);
+      const dim3 mirror_blocks(
+        (features + mirror_threads.x - 1) / mirror_threads.x,
+        (features + mirror_threads.y - 1) / mirror_threads.y);
+      mirror_lower_triangle<<<mirror_blocks, mirror_threads>>>(
+        d_gram_, features);
+      check_cuda(cudaGetLastError(), "mirror weighted Gram matrix kernel");
 
       ComputeClock::time_point transfer_start;
       if(timings) transfer_start = ComputeClock::now();
@@ -2388,18 +4230,10 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_gram_, gram_capacity_, gram.size(),
+      ensure_capacity(d_gram_, gram.size(),
         "cudaMalloc(diagonal-penalty Gram matrix)");
-      ensure_capacity(d_crossproduct_, crossproduct_capacity_, right_hand_sides.size(),
+      ensure_capacity(d_crossproduct_, right_hand_sides.size(),
         "cudaMalloc(diagonal-penalty right-hand sides)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
-        penalty_multipliers.size(), "cudaMalloc(diagonal-penalty multipliers)");
-      ensure_capacity(d_projected_, projected_capacity_, gram.size(),
-        "cudaMalloc(diagonal-penalty factorization matrix)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_, right_hand_sides.size(),
-        "cudaMalloc(diagonal-penalty solve workspace)");
-      ensure_capacity(d_predictions_, predictions_capacity_, solutions.size(),
-        "cudaMalloc(diagonal-penalty solutions)");
 
       const Eigen::MatrixXd packed_gram = contiguous_copy_if_needed(gram);
       const Eigen::MatrixXd packed_rhs = contiguous_copy_if_needed(right_hand_sides);
@@ -2414,71 +4248,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cuda(cudaMemcpy(d_crossproduct_, rhs_data,
         right_hand_sides.size() * sizeof(double), cudaMemcpyHostToDevice),
         "copy diagonal-penalty right-hand sides to CUDA device");
-      check_cuda(cudaMemcpy(d_ridge_parameters_, penalty_multipliers.data(),
-        penalty_multipliers.size() * sizeof(double), cudaMemcpyHostToDevice),
-        "copy diagonal-penalty multipliers to CUDA device");
       if(timings) timings->upload_ms += elapsed_ms(transfer_start);
-
-      int workspace_size = 0;
-      check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
-        CUBLAS_FILL_MODE_LOWER, size, d_projected_, size, &workspace_size),
-        "cusolverDnDpotrf_bufferSize");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
-        "cudaMalloc(cuSOLVER Cholesky workspace)");
-
-      std::unique_ptr<CudaEventPair> solve_events;
-      if(timings) {
-        solve_events.reset(new CudaEventPair());
-        solve_events->record_start();
-      }
-      const int threads = 256;
-      for(int parameter = 0; parameter < parameter_count; ++parameter) {
-        check_cuda(cudaMemcpy(d_projected_, d_gram_, gram.size() * sizeof(double),
-          cudaMemcpyDeviceToDevice), "copy diagonal-penalty factorization matrix");
-        check_cuda(cudaMemcpy(d_scaled_rhs_, d_crossproduct_,
-          right_hand_sides.size() * sizeof(double), cudaMemcpyDeviceToDevice),
-          "copy diagonal-penalty solve right-hand sides");
-        add_diagonal_penalty<<<(size + threads - 1) / threads, threads>>>(
-          d_projected_, d_ridge_parameters_, ridge_parameters(parameter), size);
-        check_cuda(cudaGetLastError(), "add diagonal penalty kernel");
-
-        check_cusolver(cusolverDnDpotrf(solver_handle_, CUBLAS_FILL_MODE_LOWER,
-          size, d_projected_, size, d_solver_workspace_, workspace_size,
-          d_solver_info_), "cusolverDnDpotrf");
-        int solver_info = 0;
-        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
-          cudaMemcpyDeviceToHost), "copy Cholesky factorization status to host");
-        if(solver_info != 0) {
-          std::ostringstream message;
-          message << "cuSOLVER Cholesky factorization failed with info=" << solver_info;
-          throw std::runtime_error(message.str());
-        }
-
-        check_cusolver(cusolverDnDpotrs(solver_handle_, CUBLAS_FILL_MODE_LOWER,
-          size, right_hand_side_count, d_projected_, size, d_scaled_rhs_, size,
-          d_solver_info_), "cusolverDnDpotrs");
-        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
-          cudaMemcpyDeviceToHost), "copy Cholesky solve status to host");
-        if(solver_info != 0) {
-          std::ostringstream message;
-          message << "cuSOLVER Cholesky solve failed with info=" << solver_info;
-          throw std::runtime_error(message.str());
-        }
-
-        check_cuda(cudaMemcpy(
-          d_predictions_ + static_cast<Eigen::Index>(parameter) *
-            size * right_hand_side_count,
-          d_scaled_rhs_, right_hand_sides.size() * sizeof(double),
-          cudaMemcpyDeviceToDevice),
-          "store diagonal-penalty solutions on CUDA device");
-      }
-      if(timings) timings->ridge_ms += solve_events->record_stop_and_elapsed_ms();
-
-      if(timings) transfer_start = ComputeClock::now();
-      check_cuda(cudaMemcpy(solutions.data(), d_predictions_,
-        solutions.size() * sizeof(double), cudaMemcpyDeviceToHost),
-        "copy diagonal-penalty solutions from CUDA device");
-      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+      diagonal_penalty_solve_device(size, right_hand_side_count,
+        ridge_parameters, penalty_multipliers, solutions, timings);
     }
 
     void diagonal_penalty_predict(
@@ -2548,12 +4320,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           size, combination_count);
         const Eigen::Index chunk_samples = bounded_cuda_chunk_rows(
           sample_count_index, streaming_columns);
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           chunk_samples * size,
           "cudaMalloc(diagonal-penalty prediction chunk)");
-        ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+        ensure_capacity(d_inverse_, coefficients.size(),
           "cudaMalloc(diagonal-penalty streamed coefficients)");
-        ensure_capacity(d_predictions_, predictions_capacity_,
+        ensure_capacity(d_predictions_,
           chunk_samples * combination_count,
           "cudaMalloc(diagonal-penalty prediction result chunk)");
 
@@ -2632,7 +4404,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         Eigen::VectorXi::Constant(1, size);
       const int saved_factorized_size = factorized_size_;
       if(saved_factorized_size > 0) {
-        ensure_capacity(d_gram_, gram_capacity_,
+        ensure_capacity(d_gram_,
           static_cast<Eigen::Index>(saved_factorized_size) *
             saved_factorized_size,
           "cudaMalloc(saved diagonal-penalty factorization)");
@@ -2714,9 +4486,9 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         factorized_size_ = 0;
         return;
       }
-      ensure_capacity(d_factorized_, factorized_capacity_, gram.size(),
+      ensure_capacity(d_factorized_, gram.size(),
         "cudaMalloc(reusable factorization matrix)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         penalty_multipliers.size(), "cudaMalloc(reusable factorization multipliers)");
 
       const Eigen::MatrixXd packed_gram = contiguous_copy_if_needed(gram);
@@ -2739,7 +4511,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
         CUBLAS_FILL_MODE_LOWER, size, d_factorized_, size, &workspace_size),
         "cusolverDnDpotrf_bufferSize(reusable factorization)");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER reusable Cholesky workspace)");
 
       std::unique_ptr<CudaEventPair> solve_events;
@@ -2786,7 +4558,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         "reusable solve right-hand-side count");
       const Eigen::Index chunk_columns = bounded_cuda_chunk_rows(
         right_hand_sides.cols(), factorized_size_);
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         chunk_columns * factorized_size_,
         "cudaMalloc(reusable solve right-hand-side chunk)");
 
@@ -2908,23 +4680,23 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         size, group_count);
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), streaming_columns);
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * size, "cudaMalloc(grouped LOOCV design chunk)");
-      ensure_capacity(d_projected_, projected_capacity_,
+      ensure_capacity(d_projected_,
         chunk_rows * size,
         "cudaMalloc(grouped LOOCV transposed design chunk)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         chunk_rows * size,
         "cudaMalloc(grouped LOOCV influence solve chunk)");
-      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+      ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(grouped LOOCV coefficients)");
-      ensure_capacity(d_outcomes_, outcomes_capacity_, chunk_rows,
+      ensure_capacity(d_outcomes_, chunk_rows,
         "cudaMalloc(grouped LOOCV residual chunk)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         chunk_rows, "cudaMalloc(grouped LOOCV leverage weight chunk)");
-      ensure_capacity(d_leverage_, leverage_capacity_, chunk_rows,
+      ensure_capacity(d_leverage_, chunk_rows,
         "cudaMalloc(grouped LOOCV leverage chunk)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_rows * group_count,
         "cudaMalloc(grouped LOOCV prediction chunk)");
 
@@ -3081,12 +4853,12 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         group_offsets.size(), "grouped prediction group count");
       const Eigen::Index chunk_rows = bounded_cuda_chunk_rows(
         design.rows(), design.cols());
-      ensure_capacity(d_genotypes_, genotypes_capacity_,
+      ensure_capacity(d_genotypes_,
         chunk_rows * design.cols(),
         "cudaMalloc(grouped prediction design)");
-      ensure_capacity(d_inverse_, inverse_capacity_, coefficients.size(),
+      ensure_capacity(d_inverse_, coefficients.size(),
         "cudaMalloc(grouped prediction coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_rows * group_offsets.size(),
         "cudaMalloc(grouped predictions)");
 
@@ -3193,11 +4965,11 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const int saved_factorized_size = ridge_factorized_size_;
       const int saved_rhs_count = ridge_factorized_rhs_count_;
       if(saved_factorized_size > 0) {
-        ensure_capacity(d_gram_, gram_capacity_,
+        ensure_capacity(d_gram_,
           static_cast<Eigen::Index>(saved_factorized_size) *
             saved_factorized_size,
           "cudaMalloc(saved ridge eigenvectors)");
-        ensure_capacity(d_eigenvalues_, eigenvalues_capacity_,
+        ensure_capacity(d_eigenvalues_,
           saved_factorized_size, "cudaMalloc(saved ridge eigenvalues)");
         check_cuda(cudaMemcpy(d_gram_, d_ridge_vectors_,
           static_cast<size_t>(saved_factorized_size) *
@@ -3209,7 +4981,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
           cudaMemcpyDeviceToDevice),
           "save reusable ridge eigenvalues");
         if(saved_rhs_count > 0) {
-          ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+          ensure_capacity(d_crossproduct_,
             static_cast<Eigen::Index>(saved_factorized_size) *
               saved_rhs_count,
             "cudaMalloc(saved transformed ridge right-hand sides)");
@@ -3241,13 +5013,13 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       };
       try {
         if(size > 0) {
-          ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
+          ensure_capacity(d_ridge_vectors_,
             eigenvectors.size(),
             "cudaMalloc(ridge eigenvectors)");
-          ensure_capacity(d_ridge_values_, ridge_values_capacity_,
+          ensure_capacity(d_ridge_values_,
             eigenvalues.size(), "cudaMalloc(ridge eigenvalues)");
           if(phenotype_count > 0)
-            ensure_capacity(d_ridge_rhs_, ridge_rhs_capacity_,
+            ensure_capacity(d_ridge_rhs_,
               transformed_right_hand_sides.size(),
               "cudaMalloc(ridge transformed right-hand sides)");
         }
@@ -3320,15 +5092,15 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         return;
       }
 
-      ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
+      ensure_capacity(d_ridge_vectors_,
         symmetric_matrix.size(),
         "cudaMalloc(reusable ridge factorization matrix)");
-      ensure_capacity(d_ridge_values_, ridge_values_capacity_, size,
+      ensure_capacity(d_ridge_values_, size,
         "cudaMalloc(reusable ridge eigenvalues)");
       if(right_hand_side_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, right_hand_sides.size(),
+        ensure_capacity(d_phenotypes_, right_hand_sides.size(),
           "cudaMalloc(reusable ridge right-hand sides)");
-        ensure_capacity(d_ridge_rhs_, ridge_rhs_capacity_,
+        ensure_capacity(d_ridge_rhs_,
           right_hand_sides.size(),
           "cudaMalloc(reusable transformed ridge right-hand sides)");
       }
@@ -3358,7 +5130,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, size,
         d_ridge_vectors_, size, d_ridge_values_, &workspace_size),
         "cusolverDnDsyevd_bufferSize(reusable ridge)");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER reusable ridge workspace)");
 
       std::unique_ptr<CudaEventPair> eigensolve_events;
@@ -3435,25 +5207,25 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       const bool genotypes_are_resident =
         resident_genotype_columns(genotypes, 0, genotypes.cols()) != nullptr;
       if(!genotypes_are_resident)
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           std::max<Eigen::Index>(1, chunk_samples * genotypes.rows()),
           "cudaMalloc(fused ridge genotype chunk)");
-      ensure_capacity(d_gram_, gram_capacity_,
+      ensure_capacity(d_gram_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge Gram matrix)");
-      ensure_capacity(d_ridge_vectors_, ridge_vectors_capacity_,
+      ensure_capacity(d_ridge_vectors_,
         static_cast<Eigen::Index>(blocks) * blocks,
         "cudaMalloc(fused ridge eigenvectors)");
-      ensure_capacity(d_ridge_values_, ridge_values_capacity_, blocks,
+      ensure_capacity(d_ridge_values_, blocks,
         "cudaMalloc(fused ridge eigenvalues)");
       if(phenotype_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_,
+        ensure_capacity(d_phenotypes_,
           std::max<Eigen::Index>(1, chunk_samples * phenotypes.cols()),
           "cudaMalloc(fused ridge phenotype chunk)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_,
+        ensure_capacity(d_crossproduct_,
           static_cast<Eigen::Index>(blocks) * phenotype_count,
           "cudaMalloc(fused ridge crossproduct)");
-        ensure_capacity(d_ridge_rhs_, ridge_rhs_capacity_,
+        ensure_capacity(d_ridge_rhs_,
           static_cast<Eigen::Index>(blocks) * phenotype_count,
           "cudaMalloc(fused transformed ridge right-hand sides)");
       }
@@ -3570,7 +5342,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, blocks,
         d_ridge_vectors_, blocks, d_ridge_values_, &workspace_size),
         "cusolverDnDsyevd_bufferSize(fused ridge)");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER fused ridge workspace)");
 
       std::unique_ptr<CudaEventPair> eigensolve_events;
@@ -3676,33 +5448,33 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         resident_genotype_columns(
           prediction_matrix, 0, prediction_matrix.cols()) != nullptr;
       if(!prediction_is_resident)
-        ensure_capacity(d_genotypes_, genotypes_capacity_,
+        ensure_capacity(d_genotypes_,
           chunk_samples * size,
           "cudaMalloc(factorized ridge prediction chunk)");
-      ensure_capacity(d_ridge_parameters_, ridge_parameters_capacity_,
+      ensure_capacity(d_ridge_parameters_,
         ridge_parameters.size(), "cudaMalloc(factorized ridge parameters)");
-      ensure_capacity(d_inverse_, inverse_capacity_,
+      ensure_capacity(d_inverse_,
         static_cast<Eigen::Index>(size) * parameter_count,
         "cudaMalloc(factorized ridge inverse)");
-      ensure_capacity(d_scaled_rhs_, scaled_rhs_capacity_,
+      ensure_capacity(d_scaled_rhs_,
         static_cast<Eigen::Index>(size) * combination_count,
         "cudaMalloc(factorized ridge scaled right-hand sides)");
-      ensure_capacity(d_phenotypes_, phenotypes_capacity_, coefficients.size(),
+      ensure_capacity(d_phenotypes_, coefficients.size(),
         "cudaMalloc(factorized ridge coefficients)");
-      ensure_capacity(d_predictions_, predictions_capacity_,
+      ensure_capacity(d_predictions_,
         chunk_samples * combination_count,
         "cudaMalloc(factorized ridge prediction results chunk)");
       if(leave_one_out) {
-        ensure_capacity(d_outcomes_, outcomes_capacity_,
+        ensure_capacity(d_outcomes_,
           chunk_samples * phenotype_count,
           "cudaMalloc(factorized ridge LOOCV outcome chunk)");
-        ensure_capacity(d_projected_, projected_capacity_,
+        ensure_capacity(d_projected_,
           chunk_samples * size,
           "cudaMalloc(factorized ridge projected matrix chunk)");
-        ensure_capacity(d_squared_, squared_capacity_,
+        ensure_capacity(d_squared_,
           chunk_samples * size,
           "cudaMalloc(factorized ridge squared projected matrix chunk)");
-        ensure_capacity(d_leverage_, leverage_capacity_,
+        ensure_capacity(d_leverage_,
           chunk_samples * parameter_count,
           "cudaMalloc(factorized ridge LOOCV leverage chunk)");
       }
@@ -3884,14 +5656,14 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       transformed_right_hand_sides.resize(size, right_hand_side_count);
       if(size == 0) return;
 
-      ensure_capacity(d_gram_, gram_capacity_, symmetric_matrix.size(),
+      ensure_capacity(d_gram_, symmetric_matrix.size(),
         "cudaMalloc(eigendecomposition matrix)");
-      ensure_capacity(d_eigenvalues_, eigenvalues_capacity_, size,
+      ensure_capacity(d_eigenvalues_, size,
         "cudaMalloc(eigenvalues)");
       if(right_hand_side_count > 0) {
-        ensure_capacity(d_phenotypes_, phenotypes_capacity_, right_hand_sides.size(),
+        ensure_capacity(d_phenotypes_, right_hand_sides.size(),
           "cudaMalloc(eigendecomposition right-hand sides)");
-        ensure_capacity(d_crossproduct_, crossproduct_capacity_, right_hand_sides.size(),
+        ensure_capacity(d_crossproduct_, right_hand_sides.size(),
           "cudaMalloc(transformed right-hand sides)");
       }
 
@@ -3914,7 +5686,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       check_cusolver(cusolverDnDsyevd_bufferSize(solver_handle_, CUSOLVER_EIG_MODE_VECTOR,
         CUBLAS_FILL_MODE_LOWER, size, d_gram_, size, d_eigenvalues_, &workspace_size),
         "cusolverDnDsyevd_bufferSize");
-      ensure_capacity(d_solver_workspace_, solver_workspace_capacity_, workspace_size,
+      ensure_capacity(d_solver_workspace_, workspace_size,
         "cudaMalloc(cuSOLVER workspace)");
 
       std::unique_ptr<CudaEventPair> eigensolve_events;
@@ -3966,17 +5738,241 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
   private:
+    void compute_weighted_gram_lower_tiles(
+      const double* design, const double* weighted_design,
+      int rows, int features, double beta) {
+
+      // Retain the optimized GEMM path while skipping off-diagonal work in
+      // the upper triangle. The completed lower triangle is mirrored later.
+      const int tile_size = 256;
+      const double alpha = 1.0;
+      for(int column = 0; column < features; column += tile_size) {
+        const int columns = std::min(tile_size, features - column);
+        for(int row = column; row < features; row += tile_size) {
+          const int rows_in_tile = std::min(tile_size, features - row);
+          check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+            rows_in_tile, columns, rows, &alpha,
+            design + static_cast<size_t>(row) * rows, rows,
+            weighted_design + static_cast<size_t>(column) * rows, rows,
+            &beta, d_gram_ + row + static_cast<size_t>(column) * features,
+            features), "cublasDgemm(weighted lower Gram tile)");
+        }
+      }
+    }
+
+    void compute_cached_weighted_design_products_device(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
+      Step1ComputeTimings* timings) {
+
+      resident_design_.weighted_gram_valid = false;
+      resident_design_.weighted_gram_factor_valid = false;
+      const int rows = checked_int(
+        resident_design_.rows, "cached weighted design row count");
+      const int features = checked_int(
+        resident_design_.columns, "cached weighted design feature count");
+      const int outcome_count = checked_int(
+        outcomes.cols(), "cached weighted design outcome count");
+      const int design_count = checked_element_count(
+        rows, features, "cached weighted design matrix");
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(features) * features;
+      const Eigen::Index crossproduct_elements =
+        static_cast<Eigen::Index>(features) * outcome_count;
+
+      ensure_capacity(d_projected_, design_count,
+        "cudaMalloc(cached weighted design matrix)");
+      ensure_capacity(d_ridge_parameters_, rows,
+        "cudaMalloc(cached design weights)");
+      ensure_capacity(d_gram_, gram_elements,
+        "cudaMalloc(cached weighted Gram matrix)");
+      if(outcome_count > 0) {
+        ensure_capacity(d_phenotypes_, outcomes.size(),
+          "cudaMalloc(cached weighted outcomes)");
+        ensure_capacity(d_scaled_rhs_, outcomes.size(),
+          "cudaMalloc(cached weighted outcome matrix)");
+        ensure_capacity(d_crossproduct_,
+          crossproduct_elements, "cudaMalloc(cached weighted crossproduct)");
+      }
+
+      const Eigen::MatrixXd packed_outcomes = outcome_count > 0 ?
+        contiguous_copy_if_needed(outcomes) : Eigen::MatrixXd();
+      const double* outcome_data = packed_outcomes.size() ?
+        packed_outcomes.data() : outcomes.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
+        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
+        "copy cached design weights to CUDA device");
+      if(outcome_count > 0)
+        check_cuda(cudaMemcpy(d_phenotypes_, outcome_data,
+          static_cast<size_t>(outcomes.size()) * sizeof(double),
+          cudaMemcpyHostToDevice),
+          "copy cached weighted outcomes to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      const int threads = 256;
+      scale_matrix_rows<<<
+        (design_count + threads - 1) / threads, threads>>>(
+        resident_design_data(), d_ridge_parameters_, d_projected_, rows,
+        design_count);
+      check_cuda(cudaGetLastError(),
+        "scale cached weighted design rows kernel");
+      if(outcome_count > 0) {
+        const int outcome_elements = checked_element_count(
+          rows, outcome_count, "cached weighted outcomes");
+        scale_matrix_rows<<<
+          (outcome_elements + threads - 1) / threads, threads>>>(
+          d_phenotypes_, d_ridge_parameters_, d_scaled_rhs_, rows,
+          outcome_elements);
+        check_cuda(cudaGetLastError(),
+          "scale cached weighted outcomes kernel");
+      }
+
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      if(outcome_count > 0) {
+        std::unique_ptr<CudaEventPair> crossproduct_events;
+        if(timings) {
+          crossproduct_events.reset(new CudaEventPair());
+          crossproduct_events->record_start();
+        }
+        check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+          features, outcome_count, rows, &alpha,
+          resident_design_data(), rows, d_scaled_rhs_, rows, &beta,
+          d_crossproduct_, features),
+          "cublasDgemm(cached weighted crossproduct)");
+        if(timings)
+          timings->crossproduct_ms +=
+            crossproduct_events->record_stop_and_elapsed_ms();
+      }
+
+      std::unique_ptr<CudaEventPair> gram_events;
+      if(timings) {
+        gram_events.reset(new CudaEventPair());
+        gram_events->record_start();
+      }
+      compute_weighted_gram_lower_tiles(
+        resident_design_data(), d_projected_, rows, features, beta);
+      const dim3 mirror_threads(16, 16);
+      const dim3 mirror_blocks(
+        (features + mirror_threads.x - 1) / mirror_threads.x,
+        (features + mirror_threads.y - 1) / mirror_threads.y);
+      mirror_lower_triangle<<<mirror_blocks, mirror_threads>>>(
+        d_gram_, features);
+      check_cuda(cudaGetLastError(),
+        "mirror cached weighted Gram matrix kernel");
+      if(timings) {
+        timings->gram_ms += gram_events->record_stop_and_elapsed_ms();
+        timings->resident_design_reuse_count++;
+      }
+      resident_design_.weighted_gram_valid = true;
+    }
+
+    void diagonal_penalty_solve_device(
+      int size,
+      int right_hand_side_count,
+      const Eigen::Ref<const Eigen::VectorXd>& ridge_parameters,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) {
+
+      const int parameter_count = checked_int(
+        ridge_parameters.size(), "diagonal-penalty parameter count");
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(size) * size;
+      const Eigen::Index right_hand_side_elements =
+        static_cast<Eigen::Index>(size) * right_hand_side_count;
+
+      ensure_capacity(d_ridge_parameters_,
+        penalty_multipliers.size(), "cudaMalloc(diagonal-penalty multipliers)");
+      ensure_capacity(d_projected_, gram_elements,
+        "cudaMalloc(diagonal-penalty factorization matrix)");
+      ensure_capacity(d_scaled_rhs_,
+        right_hand_side_elements,
+        "cudaMalloc(diagonal-penalty solve workspace)");
+      ensure_capacity(d_predictions_, solutions.size(),
+        "cudaMalloc(diagonal-penalty solutions)");
+
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, penalty_multipliers.data(),
+        penalty_multipliers.size() * sizeof(double), cudaMemcpyHostToDevice),
+        "copy diagonal-penalty multipliers to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      int workspace_size = 0;
+      check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, size, d_projected_, size, &workspace_size),
+        "cusolverDnDpotrf_bufferSize");
+      ensure_capacity(d_solver_workspace_,
+        workspace_size, "cudaMalloc(cuSOLVER Cholesky workspace)");
+
+      std::unique_ptr<CudaEventPair> solve_events;
+      if(timings) {
+        solve_events.reset(new CudaEventPair());
+        solve_events->record_start();
+      }
+      const int threads = 256;
+      for(int parameter = 0; parameter < parameter_count; ++parameter) {
+        check_cuda(cudaMemcpy(d_projected_, d_gram_,
+          static_cast<size_t>(gram_elements) * sizeof(double),
+          cudaMemcpyDeviceToDevice),
+          "copy diagonal-penalty factorization matrix");
+        check_cuda(cudaMemcpy(d_scaled_rhs_, d_crossproduct_,
+          static_cast<size_t>(right_hand_side_elements) * sizeof(double),
+          cudaMemcpyDeviceToDevice),
+          "copy diagonal-penalty solve right-hand sides");
+        add_diagonal_penalty<<<(size + threads - 1) / threads, threads>>>(
+          d_projected_, d_ridge_parameters_, ridge_parameters(parameter), size);
+        check_cuda(cudaGetLastError(), "add diagonal penalty kernel");
+
+        check_cusolver(cusolverDnDpotrf(solver_handle_, CUBLAS_FILL_MODE_LOWER,
+          size, d_projected_, size, d_solver_workspace_, workspace_size,
+          d_solver_info_), "cusolverDnDpotrf");
+        int solver_info = 0;
+        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+          cudaMemcpyDeviceToHost),
+          "copy Cholesky factorization status to host");
+        if(solver_info != 0) {
+          std::ostringstream message;
+          message << "cuSOLVER Cholesky factorization failed with info="
+                  << solver_info;
+          throw std::runtime_error(message.str());
+        }
+
+        check_cusolver(cusolverDnDpotrs(solver_handle_, CUBLAS_FILL_MODE_LOWER,
+          size, right_hand_side_count, d_projected_, size, d_scaled_rhs_, size,
+          d_solver_info_), "cusolverDnDpotrs");
+        check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+          cudaMemcpyDeviceToHost), "copy Cholesky solve status to host");
+        if(solver_info != 0) {
+          std::ostringstream message;
+          message << "cuSOLVER Cholesky solve failed with info=" << solver_info;
+          throw std::runtime_error(message.str());
+        }
+
+        check_cuda(cudaMemcpy(
+          d_predictions_ + static_cast<Eigen::Index>(parameter) *
+            right_hand_side_elements,
+          d_scaled_rhs_,
+          static_cast<size_t>(right_hand_side_elements) * sizeof(double),
+          cudaMemcpyDeviceToDevice),
+          "store diagonal-penalty solutions on CUDA device");
+      }
+      if(timings)
+        timings->ridge_ms += solve_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(solutions.data(), d_predictions_,
+        solutions.size() * sizeof(double), cudaMemcpyDeviceToHost),
+        "copy diagonal-penalty solutions from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
+    }
+
     static void release_level0_cholesky_lane(
       CudaLevel0CholeskyLane& lane) {
       if(lane.stream) cudaStreamSynchronize(lane.stream);
-      if(lane.info) cudaFree(lane.info);
-      if(lane.workspace) cudaFree(lane.workspace);
-      if(lane.predictions) cudaFree(lane.predictions);
-      if(lane.coefficients) cudaFree(lane.coefficients);
-      if(lane.solve) cudaFree(lane.solve);
-      if(lane.right_hand_sides) cudaFree(lane.right_hand_sides);
-      if(lane.factor) cudaFree(lane.factor);
-      if(lane.gram) cudaFree(lane.gram);
       if(lane.solver) cusolverDnDestroy(lane.solver);
       if(lane.blas) cublasDestroy(lane.blas);
       if(lane.stream) cudaStreamDestroy(lane.stream);
@@ -4000,7 +5996,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
             "create batched Cholesky cuBLAS handle");
           check_cublas(cublasSetStream(lane.blas, lane.stream),
             "set batched Cholesky cuBLAS stream");
-          level0_cholesky_lanes_.push_back(lane);
+          level0_cholesky_lanes_.push_back(std::move(lane));
         } catch(...) {
           release_level0_cholesky_lane(lane);
           throw;
@@ -4099,45 +6095,37 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     }
 
     void invalidate_resident_genotypes() {
-      resident_host_data_ = nullptr;
-      resident_rows_ = 0;
-      resident_columns_ = 0;
-      resident_valid_ = false;
+      resident_genotypes_.invalidate();
+      invalidate_resident_fold_systems();
+    }
+
+    void invalidate_resident_fold_systems() {
+      resident_fold_systems_.invalidate();
+    }
+
+    void release_packed_hardcall_buffers_noexcept() {
+      for(const auto& registration : registered_packed_hardcall_buffers_)
+        cudaHostUnregister(registration.first);
+      registered_packed_hardcall_buffers_.clear();
+      cudaGetLastError();
     }
 
     void invalidate_resident_design() {
-      resident_design_rows_ = 0;
-      resident_design_columns_ = 0;
-      resident_design_valid_ = false;
+      resident_design_.invalidate();
+      if(resident_fold_systems_.uses_design())
+        invalidate_resident_fold_systems();
+    }
+
+    const double* resident_design_data() const {
+      return resident_design_.data(
+        d_resident_genotypes_, level1_design_.data());
     }
 
     const double* resident_genotype_columns(
       const Eigen::Ref<const Eigen::MatrixXd>& matrix,
       Eigen::Index start_column, Eigen::Index column_count) const {
-
-      if(!resident_valid_ || !resident_host_data_ ||
-         matrix.rows() != resident_rows_ || matrix.innerStride() != 1 ||
-         matrix.outerStride() != resident_rows_ || start_column < 0 ||
-         column_count < 0 || start_column > matrix.cols() - column_count)
-        return nullptr;
-
-      const std::uintptr_t resident_address =
-        reinterpret_cast<std::uintptr_t>(resident_host_data_);
-      const std::uintptr_t matrix_address =
-        reinterpret_cast<std::uintptr_t>(matrix.data());
-      if(matrix_address < resident_address) return nullptr;
-      const std::uintptr_t byte_offset = matrix_address - resident_address;
-      if(byte_offset % sizeof(double) != 0) return nullptr;
-      const Eigen::Index element_offset =
-        static_cast<Eigen::Index>(byte_offset / sizeof(double));
-      if(resident_rows_ <= 0 || element_offset % resident_rows_ != 0)
-        return nullptr;
-      const Eigen::Index first_column = element_offset / resident_rows_;
-      if(first_column < 0 ||
-         first_column > resident_columns_ - matrix.cols())
-        return nullptr;
-      return d_resident_genotypes_ +
-        (first_column + start_column) * resident_rows_;
+      return resident_genotypes_.device_columns(
+        d_resident_genotypes_, matrix, start_column, column_count);
     }
 
     static Eigen::MatrixXd contiguous_copy_if_needed(
@@ -4201,73 +6189,19 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
         throw std::invalid_argument("Step 1 LOOCV outcomes have incompatible dimensions");
     }
 
-    static void ensure_capacity(double*& pointer, size_t& capacity,
+    template <typename T>
+    static void ensure_capacity(CudaDeviceBuffer<T>& buffer,
       Eigen::Index required, const char* label) {
       if(required < 0)
         throw std::runtime_error(
           std::string("negative CUDA allocation size for ") + label);
-      const size_t required_size = static_cast<size_t>(required);
-      if(required_size <= capacity) return;
-      if(required_size > std::numeric_limits<size_t>::max() / sizeof(double))
-        throw std::runtime_error(std::string("CUDA allocation size overflow for ") + label);
-      if(pointer) check_cuda(cudaFree(pointer), "cudaFree while growing buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
-        required_size * sizeof(double)), label);
-      capacity = required_size;
+      buffer.ensure(static_cast<size_t>(required), label);
     }
 
-    static void ensure_capacity(unsigned char*& pointer, size_t& capacity,
+    static void ensure_capacity(
+      CudaDeviceBuffer<unsigned char>& buffer,
       size_t required, const char* label) {
-      if(required <= capacity) return;
-      if(pointer) check_cuda(cudaFree(pointer),
-        "cudaFree while growing byte buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer), required),
-        label);
-      capacity = required;
-    }
-
-    static void ensure_capacity(unsigned int*& pointer, size_t& capacity,
-      Eigen::Index required, const char* label) {
-      if(required < 0)
-        throw std::runtime_error(
-          std::string("negative CUDA allocation size for ") + label);
-      const size_t required_size = static_cast<size_t>(required);
-      if(required_size <= capacity) return;
-      if(required_size >
-         std::numeric_limits<size_t>::max() / sizeof(unsigned int))
-        throw std::runtime_error(
-          std::string("CUDA allocation size overflow for ") + label);
-      if(pointer) check_cuda(cudaFree(pointer),
-        "cudaFree while growing unsigned buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
-        required_size * sizeof(unsigned int)), label);
-      capacity = required_size;
-    }
-
-    static void ensure_capacity(int*& pointer, size_t& capacity,
-      Eigen::Index required, const char* label) {
-      if(required < 0)
-        throw std::runtime_error(
-          std::string("negative CUDA allocation size for ") + label);
-      const size_t required_size = static_cast<size_t>(required);
-      if(required_size <= capacity) return;
-      if(required_size >
-         std::numeric_limits<size_t>::max() / sizeof(int))
-        throw std::runtime_error(
-          std::string("CUDA allocation size overflow for ") + label);
-      if(pointer) check_cuda(cudaFree(pointer),
-        "cudaFree while growing integer buffer");
-      pointer = nullptr;
-      capacity = 0;
-      check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer),
-        required_size * sizeof(int)), label);
-      capacity = required_size;
+      buffer.ensure(required, label);
     }
 
     int device_;
@@ -4277,76 +6211,57 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     size_t pinned_staging_chunk_bytes_;
     bool level0_cholesky_enabled_;
     bool level0_fold_batch_enabled_;
+    bool level0_resident_folds_enabled_;
+    bool register_packed_hardcalls_enabled_;
     bool direct_grouped_upload_;
     Eigen::Index resident_preprocess_max_elements_;
     Eigen::Index level1_resident_max_elements_;
     void* pinned_staging_[2] = {nullptr, nullptr};
     cudaStream_t upload_streams_[2] = {nullptr, nullptr};
-    double* d_genotypes_;
-    double* d_resident_genotypes_;
-    double* d_phenotypes_;
-    double* d_gram_;
-    double* d_crossproduct_;
-    double* d_factorized_;
-    double* d_ridge_vectors_;
-    double* d_ridge_values_;
-    double* d_ridge_rhs_;
-    double* d_eigenvalues_;
-    double* d_solver_workspace_;
-    int* d_solver_info_;
-    double* d_ridge_parameters_;
-    double* d_inverse_;
-    double* d_scaled_rhs_;
-    double* d_predictions_;
-    double* d_outcomes_;
-    double* d_projected_;
-    double* d_squared_;
-    double* d_leverage_;
-    double* d_preprocess_covariates_;
-    double* d_preprocess_weights_;
-    double* d_preprocess_coefficients_;
-    double* d_preprocess_scales_;
-    double* d_preprocess_multipliers_;
-    unsigned char* d_packed_hardcalls_;
-    unsigned char* d_transposed_hardcalls_;
-    unsigned int* d_packed_row_counts_;
-    size_t genotypes_capacity_;
-    size_t resident_genotypes_capacity_;
-    const double* resident_host_data_;
-    Eigen::Index resident_rows_;
-    Eigen::Index resident_columns_;
-    bool resident_valid_;
-    Eigen::Index resident_design_rows_;
-    Eigen::Index resident_design_columns_;
-    bool resident_design_valid_;
-    size_t phenotypes_capacity_;
-    size_t gram_capacity_;
-    size_t factorized_capacity_;
+    CudaDeviceBuffer<double> d_genotypes_;
+    CudaDeviceBuffer<double> d_resident_genotypes_;
+    CudaDeviceBuffer<double> d_phenotypes_;
+    CudaDeviceBuffer<double> d_gram_;
+    CudaDeviceBuffer<double> d_crossproduct_;
+    CudaDeviceBuffer<double> d_factorized_;
+    CudaDeviceBuffer<double> d_ridge_vectors_;
+    CudaDeviceBuffer<double> d_ridge_values_;
+    CudaDeviceBuffer<double> d_ridge_rhs_;
+    CudaDeviceBuffer<double> d_eigenvalues_;
+    CudaDeviceBuffer<double> d_solver_workspace_;
+    CudaDeviceBuffer<int> d_solver_info_;
+    CudaDeviceBuffer<double> d_ridge_parameters_;
+    CudaDeviceBuffer<double> d_inverse_;
+    CudaDeviceBuffer<double> d_scaled_rhs_;
+    CudaDeviceBuffer<double> d_predictions_;
+    CudaDeviceBuffer<double> d_outcomes_;
+    CudaDeviceBuffer<double> d_projected_;
+    CudaDeviceBuffer<double> d_cached_weighted_gram_factor_;
+    CudaDeviceBuffer<double> d_level1_ones_;
+    CudaDeviceBuffer<double> d_level0_phenotypes_;
+    CudaDeviceBuffer<double> d_level0_prediction_block_;
+    CudaDeviceBuffer<double> d_level0_normalized_predictions_;
+    CudaDeviceBuffer<double> d_squared_;
+    CudaDeviceBuffer<double> d_leverage_;
+    CudaDeviceBuffer<double> d_preprocess_covariates_;
+    CudaDeviceBuffer<double> d_preprocess_weights_;
+    CudaDeviceBuffer<double> d_preprocess_coefficients_;
+    CudaDeviceBuffer<double> d_preprocess_scales_;
+    CudaDeviceBuffer<double> d_preprocess_multipliers_;
+    CudaDeviceBuffer<unsigned char> d_packed_hardcalls_;
+    CudaDeviceBuffer<unsigned char> d_transposed_hardcalls_;
+    CudaDeviceBuffer<unsigned int> d_packed_row_counts_;
+    CudaResidentGenotypes resident_genotypes_;
+    CudaResidentDesign resident_design_;
+    CudaLevel1DesignCache level1_design_;
+    CudaResidentFoldSystems resident_fold_systems_;
+    Step1StaticInputCacheState packed_static_inputs_;
+    Step1StaticInputCacheState level0_phenotypes_;
     int factorized_size_;
-    size_t ridge_vectors_capacity_;
-    size_t ridge_values_capacity_;
-    size_t ridge_rhs_capacity_;
-    size_t crossproduct_capacity_;
-    size_t eigenvalues_capacity_;
-    size_t solver_workspace_capacity_;
     size_t pinned_staging_capacity_;
     bool pinned_staging_available_;
-    size_t ridge_parameters_capacity_ = 0;
-    size_t inverse_capacity_ = 0;
-    size_t scaled_rhs_capacity_ = 0;
-    size_t predictions_capacity_ = 0;
-    size_t outcomes_capacity_ = 0;
-    size_t projected_capacity_ = 0;
-    size_t squared_capacity_ = 0;
-    size_t leverage_capacity_ = 0;
-    size_t preprocess_covariates_capacity_ = 0;
-    size_t preprocess_weights_capacity_ = 0;
-    size_t preprocess_coefficients_capacity_ = 0;
-    size_t preprocess_scales_capacity_ = 0;
-    size_t preprocess_multipliers_capacity_ = 0;
-    size_t packed_hardcalls_capacity_ = 0;
-    size_t transposed_hardcalls_capacity_ = 0;
-    size_t packed_row_counts_capacity_ = 0;
+    std::vector<std::pair<unsigned char*, size_t>>
+      registered_packed_hardcall_buffers_;
     int ridge_factorized_size_;
     int ridge_factorized_rhs_count_;
     std::vector<CudaLevel0CholeskyLane> level0_cholesky_lanes_;

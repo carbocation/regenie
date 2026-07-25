@@ -23,12 +23,26 @@ project(regenie
   )
 
 include(CMakePackageConfigHelpers)
+include(CMakeDependentOption)
 include(GNUInstallDirs)
 include(CTest)
 
-option(REGENIE_WITH_CUDA "Build the experimental CUDA Step 1 compute backend" OFF)
+option(REGENIE_WITH_CUDA "Build the experimental CUDA compute backends" OFF)
+cmake_dependent_option(REGENIE_WITH_STEP2_CUDA
+  "Build the experimental Stage 2 CUDA compute backend" ON
+  "REGENIE_WITH_CUDA" OFF)
 set(REGENIE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
   "CUDA architectures to compile for when REGENIE_WITH_CUDA=ON")
+set(REGENIE_LIBDEFLATE "AUTO" CACHE STRING
+  "libdeflate acceleration for zlib-compressed BGEN: AUTO, ON, or OFF")
+set_property(CACHE REGENIE_LIBDEFLATE PROPERTY STRINGS AUTO ON OFF)
+set(REGENIE_LIBDEFLATE_ROOT "" CACHE PATH
+  "Root of a libdeflate installation")
+string(TOUPPER "${REGENIE_LIBDEFLATE}" REGENIE_LIBDEFLATE)
+if(NOT REGENIE_LIBDEFLATE MATCHES "^(AUTO|ON|OFF)$")
+  message(FATAL_ERROR
+    "REGENIE_LIBDEFLATE must be one of: AUTO, ON, or OFF")
+endif()
 
 # specify the C++ standard
 set(CMAKE_CXX_STANDARD 11)
@@ -60,7 +74,7 @@ if(REGENIE_WITH_CUDA)
   endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
-  message(STATUS "Building experimental CUDA Step 1 backend for architectures: ${REGENIE_CUDA_ARCHITECTURES}")
+  message(STATUS "Building experimental CUDA compute backends for architectures: ${REGENIE_CUDA_ARCHITECTURES}")
 endif()
 
 # check Boost IOStreams
@@ -122,6 +136,10 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/SKAT.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Newton_CG.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Optimizer.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/MultiTrait_Tests.cpp
   ${CMAKE_SOURCE_DIR}/src/MCC.cpp
@@ -133,9 +151,9 @@ add_executable(regenie
   )
 target_include_directories(regenie PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
-function(configure_step1_cuda target_name)
+function(configure_cuda_target target_name)
   if(REGENIE_WITH_CUDA)
-    target_sources(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
+    target_sources(${target_name} PRIVATE ${ARGN})
     target_compile_definitions(${target_name} PRIVATE WITH_CUDA)
     target_link_libraries(${target_name} PRIVATE CUDA::cublas CUDA::cusolver CUDA::cudart)
     set_target_properties(${target_name} PROPERTIES
@@ -145,7 +163,17 @@ function(configure_step1_cuda target_name)
   endif()
 endfunction()
 
-configure_step1_cuda(regenie)
+function(configure_step2_cuda_target target_name)
+  if(REGENIE_WITH_STEP2_CUDA)
+    configure_cuda_target(${target_name} ${ARGN})
+    target_compile_definitions(${target_name} PRIVATE WITH_STEP2_CUDA)
+  endif()
+endfunction()
+
+configure_cuda_target(regenie
+  ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
+configure_step2_cuda_target(regenie
+  ${CMAKE_SOURCE_DIR}/src/Step2_Compute_CUDA.cu)
 
 set(CMAKE_CXX_FLAGS "-O3 -Wall -pedantic -ffast-math -Wno-unused-local-typedefs -Wno-deprecated-declarations -Wno-long-long -Wno-c11-extensions -fPIC")
 add_definitions(-DVERSION_NUMBER="${RG_VERSION}")
@@ -332,7 +360,9 @@ target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
 if(BUILD_TESTING)
   add_executable(step1_compute_test
     ${CMAKE_SOURCE_DIR}/test/test_step1_compute.cpp
-    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp)
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Optimizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp)
   target_include_directories(step1_compute_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
@@ -344,11 +374,33 @@ if(BUILD_TESTING)
     target_link_libraries(step1_compute_test PRIVATE
       ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
   endif()
-  configure_step1_cuda(step1_compute_test)
+  configure_cuda_target(step1_compute_test
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute_CUDA.cu)
   add_test(NAME step1_compute_cpu
     COMMAND step1_compute_test --backend cpu)
   add_test(NAME step1_compute_auto
     COMMAND step1_compute_test --backend auto)
+
+  add_executable(step2_compute_test
+    ${CMAKE_SOURCE_DIR}/test/test_step2_compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp)
+  target_include_directories(step2_compute_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(step2_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(step2_compute_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  configure_step2_cuda_target(step2_compute_test
+    ${CMAKE_SOURCE_DIR}/src/Step2_Compute_CUDA.cu)
+  add_test(NAME step2_compute_cpu
+    COMMAND step2_compute_test --backend cpu)
+  add_test(NAME step2_compute_auto
+    COMMAND step2_compute_test --backend auto)
 
   add_executable(cox_firth_test
     ${CMAKE_SOURCE_DIR}/test/test_cox_firth.cpp
@@ -386,6 +438,35 @@ endif()
 
 # Other libraries
 find_library(ZLIB_LIBRARY libz.a z REQUIRED)
+add_library(regenie_libdeflate INTERFACE)
+if(NOT REGENIE_LIBDEFLATE STREQUAL "OFF")
+  set(libdeflate_hints
+    "${REGENIE_LIBDEFLATE_ROOT}" "$ENV{LIBDEFLATE_ROOT}")
+  find_path(REGENIE_LIBDEFLATE_INCLUDE_DIR libdeflate.h
+    HINTS ${libdeflate_hints} PATH_SUFFIXES include)
+  if(BUILD_STATIC)
+    find_library(REGENIE_LIBDEFLATE_LIBRARY NAMES libdeflate.a
+      HINTS ${libdeflate_hints} PATH_SUFFIXES lib lib64)
+  else()
+    find_library(REGENIE_LIBDEFLATE_LIBRARY NAMES deflate libdeflate
+      HINTS ${libdeflate_hints} PATH_SUFFIXES lib lib64)
+  endif()
+  if(REGENIE_LIBDEFLATE_INCLUDE_DIR AND REGENIE_LIBDEFLATE_LIBRARY)
+    target_include_directories(regenie_libdeflate INTERFACE
+      "${REGENIE_LIBDEFLATE_INCLUDE_DIR}")
+    target_link_libraries(regenie_libdeflate INTERFACE
+      "${REGENIE_LIBDEFLATE_LIBRARY}")
+    target_compile_definitions(regenie_libdeflate INTERFACE
+      WITH_LIBDEFLATE)
+    message(STATUS "Using libdeflate for zlib-compressed BGEN")
+  elseif(REGENIE_LIBDEFLATE STREQUAL "ON")
+    message(FATAL_ERROR
+      "libdeflate was not found. Set REGENIE_LIBDEFLATE_ROOT or "
+      "CMAKE_PREFIX_PATH, or use REGENIE_LIBDEFLATE=OFF.")
+  else()
+    message(STATUS "libdeflate not found; using zlib for compressed BGEN")
+  endif()
+endif()
 find_library(M_LIB m REQUIRED)
 find_library(DL_LIB dl REQUIRED)
 set(GFORTRAN_LIBRARIES "")
@@ -419,6 +500,7 @@ elseif("${UNAME_S}" STREQUAL "Darwin")
 endif()
 target_link_libraries(
   regenie PRIVATE
+  regenie_libdeflate
   ${ZLIB_LIBRARY} ${M_LIB} ${DL_LIB} ${PTHREAD_LIB}
   ${GFORTRAN_LIBRARIES}
 )
@@ -427,6 +509,7 @@ if(BUILD_TESTING)
   # as the application, so a static OpenBLAS build must also expose its
   # Fortran runtime dependencies to these targets.
   target_link_libraries(step1_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
+  target_link_libraries(step2_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
   target_link_libraries(cox_firth_test PRIVATE ${GFORTRAN_LIBRARIES})
 endif()
 

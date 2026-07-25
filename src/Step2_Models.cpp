@@ -41,6 +41,8 @@
 #include "Data.hpp"
 #include "MCC.hpp"
 
+#include <array>
+
 using namespace std;
 using namespace Eigen;
 using namespace boost;
@@ -48,7 +50,11 @@ using boost::math::normal;
 using boost::math::chi_squared;
 
 
-void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, struct in_files& files, struct filter const& filters, struct phenodt const& pheno_data, struct param& params, mstream& sout) {
+MatrixXd read_loco_predictions_for_chromosome(int const& chrom,
+    const Ref<const MatrixXd>& ltco_prs, struct in_files const& files,
+    struct filter const& filters, struct phenodt const& pheno_data,
+    struct param const& params, const Ref<const ArrayXb>& phenotypes_to_read,
+    mstream& sout) {
 
   string line, filename, tmp_pheno;
   std::vector< string > id_strings, tmp_str_vec ;
@@ -56,19 +62,13 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
   uint32_t indiv_index;
   Files blupf;
 
-  // skip reading if specified by user or if PRS is given (same for all chromosomes)
-  if( params.use_prs || params.skip_blups ) return;
-
-  m_ests.blups = MatrixXd::Zero(params.n_samples, params.n_pheno);
-
-  if(!silent) sout << "   -reading loco predictions for the chromosome..." << flush;
-  auto t1 = std::chrono::high_resolution_clock::now();
+  MatrixXd blups = MatrixXd::Zero(params.n_samples, params.n_pheno);
 
   // read blup file for each phenotype
   for(int ph = 0; ph < params.n_pheno; ph++) {
-    if( !params.pheno_pass(ph) ) continue;
+    if(!phenotypes_to_read(ph)) continue;
 
-    filename = files.blup_files[ files.pheno_names[ph] ];
+    filename = files.blup_files.at(files.pheno_names[ph]);
     ArrayXb read_indiv = ArrayXb::Constant(params.n_samples, false);
     blupf.openForRead(filename, sout);
 
@@ -98,7 +98,7 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
 
       // ignore sample if it is not in genotype data
       if (!in_map(id_strings[filecol], params.FID_IID_to_ind)) continue;
-      indiv_index = params.FID_IID_to_ind[id_strings[filecol]];
+      indiv_index = params.FID_IID_to_ind.at(id_strings[filecol]);
 
       // ignore sample if it is not included in analysis
       if(!filters.ind_in_analysis(indiv_index)) continue;
@@ -119,9 +119,9 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
         throw "individual has missing predictions (FID_IID=" + id_strings[filecol] + ";chr=" + to_string( chrom ) + ";phenotype=" + files.pheno_names[ph] + 
           "). Either ignore these individuals using option '--remove', or skip reading predictions with option '--ignore-pred'.\n" + params.err_help ;
       else if(params.w_ltco && (chrom != params.ltco_chr)) // use ltco
-        m_ests.blups(indiv_index, ph) = in_blup - m_ests.ltco_prs(indiv_index, ph);
+        blups(indiv_index, ph) = in_blup - ltco_prs(indiv_index, ph);
       else // loco
-        m_ests.blups(indiv_index, ph) = in_blup;
+        blups(indiv_index, ph) = in_blup;
     }
 
     // force all non-masked samples to have loco predictions
@@ -130,15 +130,32 @@ void blup_read_chr(bool const& silent, int const& chrom, struct ests& m_ests, st
       throw "all samples included in the analysis (for phenotype " +
         files.pheno_names[ph] + ") must have LOCO predictions in file : " + filename;
 
-    //cerr << m_ests.blups.col(ph).head(5)<<endl;
+    //cerr << blups.col(ph).head(5)<<endl;
 
     blupf.closeFile();
   }
 
+  return blups;
+}
+
+void blup_read_chr(bool const& silent, int const& chrom,
+    struct ests& m_ests, struct in_files& files,
+    struct filter const& filters, struct phenodt const& pheno_data,
+    struct param& params, mstream& sout) {
+
+  // skip reading if specified by user or if PRS is given (same for all chromosomes)
+  if(params.use_prs || params.skip_blups) return;
+
+  if(!silent)
+    sout << "   -reading loco predictions for the chromosome..." << flush;
+  const auto t1 = std::chrono::high_resolution_clock::now();
+  m_ests.blups = read_loco_predictions_for_chromosome(chrom,
+    m_ests.ltco_prs, files, filters, pheno_data, params,
+    params.pheno_pass, sout);
   if(silent) return;
 
   sout << "done";
-  auto t2 = std::chrono::high_resolution_clock::now();
+  const auto t2 = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
   sout << " (" << duration.count() << "ms) "<< endl;
 
@@ -340,6 +357,271 @@ void compute_score_qt_mcc(int const& isnp, int const& snp_index, int const& thre
 
 }
 // score test stat for QT
+struct PackedSparseQtDecodeEntry {
+  unsigned char count = 0;
+  unsigned char allele_sum = 0;
+  unsigned char squared_sum = 0;
+  unsigned char missing_count = 0;
+  std::array<unsigned char, 4> offsets{};
+  std::array<unsigned char, 4> codes{};
+};
+
+static const std::array<PackedSparseQtDecodeEntry, 256>&
+packed_sparse_qt_decode_lookup() {
+  static const std::array<PackedSparseQtDecodeEntry, 256> lookup = [] {
+    std::array<PackedSparseQtDecodeEntry, 256> entries{};
+    for(unsigned int byte = 0; byte < entries.size(); ++byte) {
+      PackedSparseQtDecodeEntry& entry = entries[byte];
+      for(unsigned int offset = 0; offset < 4; ++offset) {
+        const unsigned int code = (byte >> (2 * offset)) & 3;
+        if(code == 0) continue;
+        entry.offsets[entry.count] = offset;
+        entry.codes[entry.count] = code;
+        entry.count++;
+        if(code == 3)
+          entry.missing_count++;
+        else {
+          entry.allele_sum += code;
+          entry.squared_sum += code * code;
+        }
+      }
+    }
+    return entries;
+  }();
+  return lookup;
+}
+
+template<int CovariateCount>
+static void accumulate_fixed_packed_qt_terms(
+    const vector<unsigned char>& packed,
+    const double missing_mean,
+    const Eigen::Index sample_count,
+    const std::array<PackedSparseQtDecodeEntry, 256>& decode_lookup,
+    const double* term_data,
+    VectorXd& XtG,
+    ArrayXd& num,
+    double& squared_norm) {
+  const auto accumulate_sample = [&](const Eigen::Index sample,
+                                     const unsigned int code) {
+    const double genotype = code == 3 ? missing_mean :
+      static_cast<double>(code);
+    squared_norm += genotype * genotype;
+    const double* terms = term_data + sample * (CovariateCount + 1);
+    for(int covariate = 0; covariate < CovariateCount; ++covariate)
+      XtG(covariate) += genotype * terms[covariate];
+    num(0) += genotype * terms[CovariateCount];
+  };
+
+  const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
+  for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+    const unsigned char packed_byte = packed[byte_index];
+    if(packed_byte == 0) continue;
+    const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+    const Eigen::Index first_sample = 4 * byte_index;
+    for(unsigned int carrier = 0; carrier < entry.count; ++carrier)
+      accumulate_sample(first_sample + entry.offsets[carrier],
+        entry.codes[carrier]);
+  }
+  if(sample_count % 4) {
+    const unsigned char packed_byte = packed[full_bytes];
+    for(Eigen::Index offset = 0; offset < sample_count % 4; ++offset) {
+      const unsigned int code = (packed_byte >> (2 * offset)) & 3;
+      if(code != 0) accumulate_sample(4 * full_bytes + offset, code);
+    }
+  }
+}
+
+static void accumulate_packed_qt(
+    const int isnp,
+    const bool sparse_genotype,
+    const Ref<const MatrixXd>& yres,
+    struct phenodt const& pheno_data,
+    struct geno_block const& gblock,
+    VectorXd& XtG,
+    ArrayXd& num,
+    double& squared_norm) {
+  const vector<unsigned char>& packed =
+    gblock.step2_pgen_packed_hardcalls[isnp];
+  const double missing_mean = gblock.step2_pgen_packed_means[isnp];
+  const Eigen::Index sample_count = yres.rows();
+  const int covariate_count = pheno_data.new_cov.cols();
+  const bool intercept_only = covariate_count == 1;
+  const bool use_row_major_terms =
+    gblock.step2_pgen_direct_qt_terms_valid;
+  const double intercept_value = intercept_only ?
+    pheno_data.new_cov(0, 0) : 0;
+
+  if(yres.cols() != 1)
+    throw "packed QT scoring requires one phenotype";
+
+  XtG = VectorXd::Zero(covariate_count);
+  num = ArrayXd::Zero(1);
+  squared_norm = 0;
+  double genotype_sum = 0;
+
+  const auto& decode_lookup = packed_sparse_qt_decode_lookup();
+  const size_t full_bytes = static_cast<size_t>(sample_count) / 4;
+  if(intercept_only) {
+    const double missing_squared = missing_mean * missing_mean;
+    const auto accumulate_sparse_byte = [&](const unsigned char packed_byte,
+                                            const Eigen::Index first_sample) {
+      const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+      genotype_sum += entry.allele_sum +
+        entry.missing_count * missing_mean;
+      squared_norm += entry.squared_sum +
+        entry.missing_count * missing_squared;
+      for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
+        const unsigned int code = entry.codes[carrier];
+        const double genotype = code == 3 ? missing_mean :
+          static_cast<double>(code);
+        num(0) += genotype *
+          yres(first_sample + entry.offsets[carrier], 0);
+      }
+    };
+
+    if(sparse_genotype) {
+      size_t byte_index = 0;
+      for(; byte_index + sizeof(uint64_t) <= full_bytes;
+          byte_index += sizeof(uint64_t)) {
+        uint64_t packed_word;
+        std::memcpy(&packed_word, packed.data() + byte_index,
+          sizeof(packed_word));
+        if(packed_word == 0) continue;
+        for(size_t byte_offset = 0; byte_offset < sizeof(uint64_t);
+            ++byte_offset) {
+          const unsigned char packed_byte =
+            packed[byte_index + byte_offset];
+          if(packed_byte != 0)
+            accumulate_sparse_byte(packed_byte,
+              4 * (byte_index + byte_offset));
+        }
+      }
+      for(; byte_index < full_bytes; ++byte_index) {
+        const unsigned char packed_byte = packed[byte_index];
+        if(packed_byte != 0)
+          accumulate_sparse_byte(packed_byte, 4 * byte_index);
+      }
+    } else {
+      for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+        const unsigned char packed_byte = packed[byte_index];
+        if(packed_byte == 0) continue;
+        const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+        genotype_sum += entry.allele_sum +
+          entry.missing_count * missing_mean;
+        squared_norm += entry.squared_sum +
+          entry.missing_count * missing_squared;
+        const Eigen::Index first_sample = 4 * byte_index;
+        if(entry.missing_count == 0) {
+          num(0) += static_cast<double>(packed_byte & 3) *
+            yres(first_sample, 0);
+          num(0) += static_cast<double>((packed_byte >> 2) & 3) *
+            yres(first_sample + 1, 0);
+          num(0) += static_cast<double>((packed_byte >> 4) & 3) *
+            yres(first_sample + 2, 0);
+          num(0) += static_cast<double>((packed_byte >> 6) & 3) *
+            yres(first_sample + 3, 0);
+        } else {
+          for(unsigned int carrier = 0; carrier < entry.count; ++carrier) {
+            const unsigned int code = entry.codes[carrier];
+            const double genotype = code == 3 ? missing_mean :
+              static_cast<double>(code);
+            num(0) += genotype *
+              yres(first_sample + entry.offsets[carrier], 0);
+          }
+        }
+      }
+    }
+    if(sample_count % 4) {
+      const unsigned char packed_byte = packed[full_bytes];
+      for(Eigen::Index offset = 0; offset < sample_count % 4; ++offset) {
+        const unsigned int code = (packed_byte >> (2 * offset)) & 3;
+        if(code == 0) continue;
+        const double genotype = code == 3 ? missing_mean :
+          static_cast<double>(code);
+        genotype_sum += genotype;
+        squared_norm += genotype * genotype;
+        num(0) += genotype * yres(4 * full_bytes + offset, 0);
+      }
+    }
+    XtG(0) = genotype_sum * intercept_value;
+    return;
+  }
+
+  if(use_row_major_terms) {
+    const double* term_data = gblock.step2_pgen_direct_qt_terms.data();
+    switch(covariate_count) {
+    case 2:
+      accumulate_fixed_packed_qt_terms<2>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 3:
+      accumulate_fixed_packed_qt_terms<3>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 4:
+      accumulate_fixed_packed_qt_terms<4>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 5:
+      accumulate_fixed_packed_qt_terms<5>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 6:
+      accumulate_fixed_packed_qt_terms<6>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 7:
+      accumulate_fixed_packed_qt_terms<7>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    case 8:
+      accumulate_fixed_packed_qt_terms<8>(packed, missing_mean, sample_count,
+        decode_lookup, term_data, XtG, num, squared_norm);
+      return;
+    default:
+      break;
+    }
+  }
+
+  const auto accumulate_sample = [&](const Eigen::Index sample,
+                                     const unsigned int code) {
+    const double genotype = code == 3 ? missing_mean :
+      static_cast<double>(code);
+    if(genotype == 0) return;
+    squared_norm += genotype * genotype;
+    if(use_row_major_terms) {
+      const double* terms =
+        &gblock.step2_pgen_direct_qt_terms(sample, 0);
+      for(int covariate = 0; covariate < covariate_count; ++covariate)
+        XtG(covariate) += genotype * terms[covariate];
+      num(0) += genotype * terms[covariate_count];
+    } else {
+      for(int covariate = 0; covariate < covariate_count; ++covariate)
+        XtG(covariate) +=
+          genotype * pheno_data.new_cov(sample, covariate);
+      num(0) += genotype * yres(sample, 0);
+    }
+  };
+
+  for(size_t byte_index = 0; byte_index < full_bytes; ++byte_index) {
+    const unsigned char packed_byte = packed[byte_index];
+    if(packed_byte == 0) continue;
+    const PackedSparseQtDecodeEntry& entry = decode_lookup[packed_byte];
+    const Eigen::Index first_sample = 4 * byte_index;
+    for(unsigned int carrier = 0; carrier < entry.count; ++carrier)
+      accumulate_sample(first_sample + entry.offsets[carrier],
+        entry.codes[carrier]);
+  }
+  if(sample_count % 4) {
+    const unsigned char packed_byte = packed[full_bytes];
+    for(Eigen::Index offset = 0; offset < sample_count % 4; ++offset) {
+      const unsigned int code =
+        (packed_byte >> (2 * offset)) & 3;
+      if(code != 0) accumulate_sample(4 * full_bytes + offset, code);
+    }
+  }
+}
+
 void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_num, string const& test_string, string const& model_type, const Ref<const MatrixXd>& yres, const Ref<const RowVectorXd>& p_sd_yres, struct param const& params, struct phenodt& pheno_data, struct geno_block& gblock, variant_block* block_info, vector<snp> const& snpinfo, struct in_files& files, mstream& sout){
 
   bool run_full_test = true; // disable this for QTs // !params.skip_cov_res;
@@ -376,10 +658,43 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
   }
 
   if( run_full_test ){
-    if(dt_thr->qt_unscaled) {
+    if(gblock.step2_backend_scores.has_variant(params.n_pheno, isnp)) {
+      num = gblock.step2_backend_scores.numerators().col(isnp).array();
+      denum_arr =
+        gblock.step2_backend_scores.denominators().col(isnp).array();
+      dt_thr->stats = num / denum_arr.sqrt();
+      if(params.htp_out) {
+        dt_thr->scores = num;
+        dt_thr->skat_var = denum_arr;
+      }
+      dt_thr->bhat = dt_thr->stats * pheno_data.scf_sv /
+        denum_arr.sqrt();
+
+    } else if(dt_thr->qt_packed_direct) {
+      VectorXd XtG;
+      double raw_squared_norm;
+      accumulate_packed_qt(isnp, dt_thr->is_sparse, yres, pheno_data, gblock,
+        XtG, num, raw_squared_norm);
+      num -= (pheno_data.YtX * XtG).array();
+      denum = raw_squared_norm - XtG.squaredNorm();
+      dt_thr->stats = num / sqrt(denum);
+      dt_thr->bhat = dt_thr->stats / sqrt(denum) *
+        pheno_data.scf_sv;
+
+    } else if(dt_thr->qt_unscaled) {
 
       const double genotype_scale = gsc / block_info->scale_fac;
-      num = (yres.transpose() * Geno.matrix()).array() * genotype_scale;
+      if(dt_thr->qt_algebraic_projection) {
+        if(gblock.step2_qt_YtG_valid) {
+          num = (gblock.step2_qt_YtG.col(isnp) -
+            pheno_data.YtX * dt_thr->qt_XtG).array() * genotype_scale;
+        } else {
+          num = (yres.transpose() * Geno.matrix() -
+            pheno_data.YtX * dt_thr->qt_XtG).array() * genotype_scale;
+        }
+      } else {
+        num = (yres.transpose() * Geno.matrix()).array() * genotype_scale;
+      }
 
       if(dt_thr->qt_complete_masks) {
         const double residual_dof =
@@ -389,9 +704,26 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
         dt_thr->bhat = dt_thr->stats / sqrt(denum) *
           pheno_data.scf_sv;
       } else {
-        denum_arr = genotype_scale * genotype_scale *
-          (pheno_data.masked_indivs.transpose().cast<double>() *
-            Geno.square().matrix());
+        if(gblock.step2_qt_missing_pheno_indices != nullptr) {
+          const double residual_dof =
+            params.n_analyzed - params.ncov_analyzed;
+          denum_arr = ArrayXd::Constant(params.n_pheno,
+            block_info->scale_fac * block_info->scale_fac * residual_dof);
+          const std::vector<std::vector<int>>& missing_by_sample =
+            *gblock.step2_qt_missing_pheno_indices;
+          for(uint32_t sample = 0; sample < params.n_samples; ++sample) {
+            if(missing_by_sample[sample].empty()) continue;
+            const double genotype_squared =
+              Geno(sample) * Geno(sample);
+            for(int ph : missing_by_sample[sample])
+              denum_arr(ph) -= genotype_squared;
+          }
+          denum_arr *= genotype_scale * genotype_scale;
+        } else {
+          denum_arr = genotype_scale * genotype_scale *
+            (pheno_data.masked_indivs.transpose().cast<double>() *
+              Geno.square().matrix());
+        }
         dt_thr->stats = num / denum_arr.sqrt();
         dt_thr->bhat = dt_thr->stats * pheno_data.scf_sv /
           denum_arr.sqrt();
@@ -400,9 +732,12 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
     } else if( params.strict_mode ) {
 
       if(dt_thr->is_sparse){
-        ArrayXd XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse; // k x 1
-        num = yres.transpose() * dt_thr->Gsparse - pheno_data.YtX * XtG.matrix();
-        denum = dt_thr->Gsparse.squaredNorm() - XtG.square().sum();
+        VectorXd XtG =
+          pheno_data.new_cov.transpose() * dt_thr->Gsparse;
+        num = yres.transpose() * dt_thr->Gsparse;
+        const double sparse_squared_norm = dt_thr->Gsparse.squaredNorm();
+        num -= (pheno_data.YtX * XtG).array();
+        denum = sparse_squared_norm - XtG.squaredNorm();
       } else {
         num = (yres.transpose() * Geno.matrix()).array() * gsc;
         denum = gsc * gsc * (params.n_analyzed - params.ncov_analyzed); 
@@ -421,16 +756,61 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
 
       // compute GtG for each phenotype (different missing patterns)
       if(dt_thr->is_sparse){
-        VectorXd XtG = pheno_data.new_cov.transpose() * dt_thr->Gsparse; // k x 1 - do this for all traits (Geno is only residualized once across traits)
-        num = yres.transpose() * dt_thr->Gsparse - pheno_data.YtX * XtG; // P x 1 
+        VectorXd XtG =
+          pheno_data.new_cov.transpose() * dt_thr->Gsparse;
+        const double sparse_squared_norm = dt_thr->Gsparse.squaredNorm();
+        if(gblock.step2_qt_sparse_residuals_valid) {
+          num = ArrayXd::Zero(params.n_pheno);
+          for(SpVec::InnerIterator genotype(dt_thr->Gsparse);
+              genotype; ++genotype) {
+            const double* residuals =
+              &gblock.step2_qt_sparse_residuals(genotype.index(), 0);
+            const double genotype_value = genotype.value();
+#if defined(_OPENMP)
+#pragma omp simd
+#endif
+            for(int ph = 0; ph < params.n_pheno; ++ph)
+              num(ph) += genotype_value * residuals[ph];
+          }
+        } else {
+          num = yres.transpose() * dt_thr->Gsparse;
+        }
+        num -= (pheno_data.YtX * XtG).array();
         double XtG_ss = XtG.squaredNorm();
         denum_arr.resize(params.n_pheno);
-        for (int ph = 0; ph < params.n_pheno; ph++) {
-          SpVec Gm = dt_thr->Gsparse.cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>()); // N x 1
-          VectorXd XtGm = pheno_data.new_cov.transpose() * Gm;
-          denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + XtG_ss; // last term is an approximation assuming X'X is same for all traits (=I)
-          //VectorXd vm = (pheno_data.new_cov * XtG).cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>());
-          //denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + vm.squaredNorm(); // correct callculation but more expensive
+        if(dt_thr->qt_complete_masks) {
+          const double shared_denum = sparse_squared_norm -
+            2 * XtG.dot(XtG) + XtG_ss;
+          denum_arr.setConstant(shared_denum);
+        } else if(gblock.step2_qt_sparse_residuals_valid &&
+                  gblock.step2_qt_observed_masks_valid) {
+          // Start from the complete-sample denominator. Removing one sample
+          // from a phenotype changes ||G||^2 by -g^2 and the cross term by
+          // +2*g*x_i'(X'G). Updating only missing traits avoids rebuilding a
+          // masked sparse vector and repeating X'G for every phenotype.
+          denum_arr.setConstant(sparse_squared_norm - XtG_ss);
+          for(SpVec::InnerIterator genotype(dt_thr->Gsparse);
+              genotype; ++genotype) {
+            const Eigen::Index sample = genotype.index();
+            const double genotype_value = genotype.value();
+            const double projection =
+              pheno_data.new_cov.row(sample).dot(XtG);
+            const double missing_adjustment =
+              -genotype_value * genotype_value +
+              2 * genotype_value * projection;
+            const bool* observed =
+              &gblock.step2_qt_observed_masks(sample, 0);
+            for(int ph = 0; ph < params.n_pheno; ++ph)
+              if(!observed[ph]) denum_arr(ph) += missing_adjustment;
+          }
+        } else {
+          for (int ph = 0; ph < params.n_pheno; ph++) {
+            SpVec Gm = dt_thr->Gsparse.cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>()); // N x 1
+            VectorXd XtGm = pheno_data.new_cov.transpose() * Gm;
+            denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + XtG_ss; // last term is an approximation assuming X'X is same for all traits (=I)
+            //VectorXd vm = (pheno_data.new_cov * XtG).cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>());
+            //denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + vm.squaredNorm(); // correct callculation but more expensive
+          }
         }
       } else {
         num = (yres.transpose() * Geno.matrix()).array() * gsc;
@@ -511,21 +891,28 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
 
     MapArXb mask (pheno_data.masked_indivs.col(i).data(), params.n_samples, 1);
     MapcMatXd XWsqrt (m_ests.X_Gamma[i].data(), params.n_samples, m_ests.X_Gamma[i].cols());
+    const bool use_backend_score =
+      gblock.step2_backend_scores.has_score(i, isnp);
 
-    // project out covariates from G
-    if(dt_thr->is_sparse) {
-      GWs = dt_thr->Gsparse.cwiseProduct(m_ests.Gamma_sqrt_mask.col(i));
-      XtWG = XWsqrt.transpose() * GWs;
+    if(use_backend_score) {
+      dt_thr->denum(i) =
+        gblock.step2_backend_scores.denominators()(i, isnp);
     } else {
-      GW = (Geno * m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
-      dt_thr->Gres = GW - XWsqrt * (XWsqrt.transpose() * GW);
-    }
+      // project out covariates from G
+      if(dt_thr->is_sparse) {
+        GWs = dt_thr->Gsparse.cwiseProduct(m_ests.Gamma_sqrt_mask.col(i));
+        XtWG = XWsqrt.transpose() * GWs;
+      } else {
+        GW = (Geno * m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
+        XtWG.noalias() = XWsqrt.transpose() * GW;
+      }
 
-    // denominator
-    if(dt_thr->is_sparse) 
-      dt_thr->denum(i) = GWs.squaredNorm() - XtWG.squaredNorm();
-    else
-      dt_thr->denum(i) = dt_thr->Gres.squaredNorm();
+      // denominator
+      if(dt_thr->is_sparse)
+        dt_thr->denum(i) = GWs.squaredNorm() - XtWG.squaredNorm();
+      else
+        dt_thr->denum(i) = GW.squaredNorm() - XtWG.squaredNorm();
+    }
 
     double sqrt_denum = sqrt( dt_thr->denum(i) );
     if( sqrt_denum < params.numtol ){
@@ -536,19 +923,42 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
     }
 
     // score test stat for BT
-    if(dt_thr->is_sparse) 
+    if(use_backend_score)
+      dt_thr->stats(i) =
+        gblock.step2_backend_scores.numerators()(i, isnp) / sqrt_denum;
+    else if(dt_thr->is_sparse)
       dt_thr->stats(i) = GWs.dot(yres.col(i)) / sqrt_denum;
-    else
-      dt_thr->stats(i) = dt_thr->Gres.col(0).dot(yres.col(i)) / sqrt_denum;
+    else {
+      double score = GW.dot(yres.col(i));
+      if(i < static_cast<int>(gblock.step2_binary_XtY.size()))
+        score -= XtWG.dot(gblock.step2_binary_XtY[i]);
+      dt_thr->stats(i) = score / sqrt_denum;
+    }
 
     if(params.htp_out) {
       dt_thr->scores(i) = dt_thr->stats(i) * sqrt_denum;
       dt_thr->skat_var(i) = dt_thr->denum(i);
     }
 
-    if(dt_thr->is_sparse && (fabs(dt_thr->stats(i)) > params.z_thr)){ // no need if correction is not applied
-      dt_thr->Gres = -XWsqrt * XtWG;
-      dt_thr->Gres += GWs;
+    if(block_info->is_corrected(i) &&
+       (fabs(dt_thr->stats(i)) > params.z_thr)) {
+      if(use_backend_score) {
+        if(dt_thr->is_sparse) {
+          GWs = dt_thr->Gsparse.cwiseProduct(
+            m_ests.Gamma_sqrt_mask.col(i));
+          XtWG = XWsqrt.transpose() * GWs;
+        } else {
+          GW = (Geno *
+            m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
+          XtWG.noalias() = XWsqrt.transpose() * GW;
+        }
+      }
+      if(dt_thr->is_sparse) {
+        dt_thr->Gres = -XWsqrt * XtWG;
+        dt_thr->Gres += GWs;
+      } else {
+        dt_thr->Gres = GW - XWsqrt * XtWG;
+      }
     }
     /*
     if(params.debug) {
@@ -662,6 +1072,8 @@ void compute_score_cox(int const& isnp, int const& snp_index, int const& chrom, 
   Eigen::VectorXd XtWG;
   Eigen::VectorXd XtUG;
   Eigen::VectorXd XtVG;
+  Eigen::VectorXd projection_coeff;
+  Eigen::VectorXd projection_raw_cross;
   double T;
 
   // header snp info for sum stats
@@ -678,16 +1090,62 @@ void compute_score_cox(int const& isnp, int const& snp_index, int const& chrom, 
     }
     MapArXb mask(pheno_data.masked_indivs.col(i).data(), params.n_samples, 1);
 
-    // score stat
-    if (dt_thr->is_sparse) {
-      dt_thr->Gres = dt_thr->Gsparse - m_ests.cox_MLE_NULL[i].X1_X1WX1inv * (dt_thr->Gsparse.transpose() * m_ests.cox_MLE_NULL[i].WX1).transpose();
+    const MatrixXd& projection =
+      m_ests.cox_MLE_NULL[i].X1_X1WX1inv;
+    const MatrixXd& weighted_design = m_ests.cox_MLE_NULL[i].WX1;
+    bool genotype_materialized = false;
+    const bool use_backend_score =
+      !params.coxscore_exact &&
+      gblock.step2_backend_scores.has_score(i, isnp);
+
+    if(use_backend_score) {
+      T = gblock.step2_backend_scores.numerators()(i, isnp);
+      dt_thr->denum(i) =
+        gblock.step2_backend_scores.denominators()(i, isnp);
+    } else if(params.coxscore_exact ||
+       (i >= static_cast<int>(gblock.step2_cox_projection_gram.size()))) {
+      if(dt_thr->is_sparse) {
+        projection_coeff = weighted_design.transpose() * dt_thr->Gsparse;
+        dt_thr->Gres = dt_thr->Gsparse - projection * projection_coeff;
+      } else {
+        projection_coeff.noalias() = weighted_design.transpose() *
+          Geno.matrix();
+        dt_thr->Gres = Geno.matrix() - projection * projection_coeff;
+      }
+      genotype_materialized = true;
+      T = (dt_thr->Gres.array() *
+        m_ests.cox_MLE_NULL[i].residual.array() *
+        mask.cast<double>()).sum();
+      dt_thr->denum(i) = m_ests.cox_MLE_NULL[i].res_var *
+        dt_thr->Gres.squaredNorm();
     } else {
-      dt_thr->Gres = Geno.matrix() - m_ests.cox_MLE_NULL[i].X1_X1WX1inv * (Geno.matrix().transpose() * m_ests.cox_MLE_NULL[i].WX1).transpose();
+      double raw_norm_squared;
+      double raw_score;
+      if(dt_thr->is_sparse) {
+        projection_coeff = weighted_design.transpose() * dt_thr->Gsparse;
+        projection_raw_cross = projection.transpose() * dt_thr->Gsparse;
+        raw_norm_squared = dt_thr->Gsparse.squaredNorm();
+        raw_score = dt_thr->Gsparse.dot(
+          gblock.step2_cox_score_residual[i]);
+      } else {
+        projection_coeff.noalias() = weighted_design.transpose() *
+          Geno.matrix();
+        projection_raw_cross.noalias() = projection.transpose() *
+          Geno.matrix();
+        raw_norm_squared = Geno.matrix().squaredNorm();
+        raw_score = Geno.matrix().dot(
+          gblock.step2_cox_score_residual[i]);
+      }
+      T = raw_score - projection_coeff.dot(
+        gblock.step2_cox_projection_score[i]);
+      const double projected_norm_squared = raw_norm_squared -
+        2 * projection_coeff.dot(projection_raw_cross) +
+        projection_coeff.dot(
+          gblock.step2_cox_projection_gram[i] * projection_coeff);
+      dt_thr->denum(i) =
+        m_ests.cox_MLE_NULL[i].res_var * projected_norm_squared;
     }
-    T = (dt_thr->Gres.array() * m_ests.cox_MLE_NULL[i].residual.array() * mask.cast<double>()).sum();
-    
-    dt_thr->denum(i) = m_ests.cox_MLE_NULL[i].res_var * (dt_thr->Gres.array()).pow(2).sum();
-    
+
     if (params.coxscore_exact) {
       sqrtWG = dt_thr->Gres.array() * (m_ests.cox_MLE_NULL[i].mu.array().sqrt()) * mask.cast<double>();
       RGammaG = cumulativeSum_reverse2( m_ests.survival_data_pheno[i].R.transpose() * (m_ests.cox_MLE_NULL[i].w_exp_eta.array() * (m_ests.survival_data_pheno[i].permute_mtx * dt_thr->Gres).array()).matrix());
@@ -699,6 +1157,22 @@ void compute_score_cox(int const& isnp, int const& snp_index, int const& chrom, 
       dt_thr->denum(i) = sqrtWG.squaredNorm() - UhalfG.squaredNorm() - (XtVG.array() * (m_ests.cox_MLE_NULL[i].cov_inv * XtVG).array()).sum();
     }
     dt_thr->stats(i) = T/sqrt(dt_thr->denum(i));
+
+    if(!genotype_materialized && block_info->is_corrected(i) &&
+       (fabs(dt_thr->stats(i)) > params.z_thr)) {
+      if(use_backend_score) {
+        if(dt_thr->is_sparse)
+          projection_coeff =
+            weighted_design.transpose() * dt_thr->Gsparse;
+        else
+          projection_coeff.noalias() =
+            weighted_design.transpose() * Geno.matrix();
+      }
+      if(dt_thr->is_sparse)
+        dt_thr->Gres = dt_thr->Gsparse - projection * projection_coeff;
+      else
+        dt_thr->Gres = Geno.matrix() - projection * projection_coeff;
+    }
 
     if(params.htp_out) {
       dt_thr->scores(i) = dt_thr->stats(i) * sqrt( dt_thr->denum(i) );

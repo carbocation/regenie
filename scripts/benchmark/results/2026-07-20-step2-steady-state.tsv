@@ -1,0 +1,11 @@
+run_id	system	revision	model	mode	dataset	prediction_mode	samples	variants	phenotypes	correction	processes	threads_per_process	wall_s	internal_total_s	kernel_s	gpu_active_window_util_mean_pct	gpu_active_window_power_mean_w	corrected_tests	validation
+step2-n2-binary8-score-full	n2-standard-16-smt-off	db1ce23	binary	score	real_ld_n50k_m700k	loco	50000	700000	8	none	1	8	168.922	168.921731	NA	NA	NA	0	measured_full_cpu_anchor
+step2-a2-binary8-score-full-before	a2-highgpu-1g	94c5d98	binary	score	real_ld_n50k_m700k	loco	50000	700000	8	none	1	12	37.1656	36.798515	6.738603	20.29	74.08	0	control_for_ae9144d
+step2-a2-binary8-score-full-unexpanded	a2-highgpu-1g	ae9144d	binary	score	real_ld_n50k_m700k	loco	50000	700000	8	none	1	12	27.2888	27.016047	6.048582	25.31	97.93	0	all_8_files_byte_identical_to_control
+step2-a2-binary8-score-full-unexpanded-4way	a2-highgpu-1g	ae9144d	binary	score	real_ld_n50k_m700k	loco	50000	700000	8	none	4	3	13.61	NA	6.676670	48.79	166.88	0	four_balanced_shards_exit0_total_variants700000
+step2-n1-t4-binary8-score-full-before	n1-standard-8-t4	94c5d98	binary	score	real_ld_n50k_m700k	ignore_pred	50000	700000	8	none	1	4	67.2813	66.906464	32.301913	49.31	59.56	0	control_for_ae9144d
+step2-n1-t4-binary8-score-full-unexpanded	n1-standard-8-t4	ae9144d	binary	score	real_ld_n50k_m700k	ignore_pred	50000	700000	8	none	1	4	60.9328	60.524616	38.547524	64.83	61.31	0	all_8_files_byte_identical_to_control
+step2-n1-t4-binary8-score-full-unexpanded-2way	n1-standard-8-t4	ae9144d	binary	score	real_ld_n50k_m700k	ignore_pred	50000	700000	8	none	2	2	54.77	NA	71.599130	90.45	64.83	0	two_balanced_shards_exit0_total_variants700000
+step2-n2-binary8-firth-full	n2-standard-16-smt-off	db1ce23	binary	firth	real_ld_n50k_m700k	loco	50000	700000	8	approximate_firth_p0.01	1	8	252.56	252.473983	NA	NA	NA	59904	all_8_files_byte_identical_to_cpu_baseline
+step2-a2-binary8-firth-full	a2-highgpu-1g	ae9144d	binary	firth	real_ld_n50k_m700k	loco	50000	700000	8	approximate_firth_p0.01	1	12	114.92	114.639375	6.738306	6.50	59.22	59904	matched_correction_count_and_pilot_cpu_cuda_conformance
+step2-n1-t4-binary8-firth-full	n1-standard-8-t4	ae9144d	binary	firth	real_ld_n50k_m700k	ignore_pred	50000	700000	8	approximate_firth_p0.01	1	4	219.414	219.049149	55.017674	25.73	38.67	57990	ignore_pred_changes_scores_and_correction_count

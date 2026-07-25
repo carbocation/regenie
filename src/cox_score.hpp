@@ -25,6 +25,11 @@ class cox_mle {
         Eigen::MatrixXd UhalfX;
         Eigen::VectorXd Dhalf;
         Eigen::MatrixXd cov_inv;
+        // Small inverse (X1' W X1)^-1 used by the default Cox genotype
+        // projection. Keeping it separately lets the blockwise CPU scorer
+        // form X1'G once instead of multiplying G by every phenotype's
+        // materialized sample-by-covariate projection.
+        Eigen::MatrixXd X1tWX1inv;
         Eigen::MatrixXd X1_X1WX1inv;
         Eigen::MatrixXd WX1;
         double res_var;

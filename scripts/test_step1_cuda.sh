@@ -98,6 +98,81 @@ run_with_memory_log() {
   return "${command_status}"
 }
 
+run_level0_pipeline_unwind_test() {
+  if [[ ! -e /dev/full ]]; then
+    echo "/dev/full is required for the Level 0 pipeline unwind test" >&2
+    return 97
+  fi
+
+  local fault_dir
+  fault_dir="$(mktemp -d "${validation_dir}/level0_pipeline_unwind.XXXXXX")"
+  local fault_prefix="${fault_dir}/full"
+  local output_prefix="${fault_dir}/regenie"
+  local output_log="${fault_dir}/stdout.log"
+  ln -s /dev/full "${fault_prefix}_l0_Y1"
+
+  local args=(
+    --step 1
+    --pgen "${repo_root}/example/example"
+    --covarFile "${repo_root}/example/covariates.txt"
+    --phenoFile "${repo_root}/example/phenotype.txt"
+    --phenoCol Y1
+    --remove "${repo_root}/example/fid_iid_to_remove.txt"
+    --qt
+    --bsize 100
+    --threads 1
+    --seed 12345
+    --step1-profile
+    --lowmem
+    --lowmem-prefix "${fault_prefix}"
+    --compute-backend cuda
+    --gpu-device "${device}"
+    --out "${output_prefix}"
+  )
+  local command_status=0
+  env REGENIE_CUDA_RESIDENT_MB=64 \
+    REGENIE_STEP1_LEVEL0_PIPELINE=1 \
+    REGENIE_STEP1_PGEN_PREFETCH_MB=64 \
+    REGENIE_STEP1_PGEN_PACKED=1 \
+    "${build_dir}/regenie" "${args[@]}" > "${output_log}" 2>&1 ||
+    command_status=$?
+  if (( command_status != 1 )); then
+    echo "Level 0 pipeline unwind exited with ${command_status}, expected 1" >&2
+    tail -n 40 "${output_log}" >&2
+    return 96
+  fi
+  grep -q 'block \[2\].*pipeline wait' "${output_log}"
+  grep -q 'ERROR: cannot successfully write temporary level 0 predictions to disk' \
+    "${output_log}"
+
+  if [[ "${RUN_COMPUTE_SANITIZER:-1}" != "0" ]] && \
+     command -v compute-sanitizer >/dev/null 2>&1; then
+    local sanitizer_output="${fault_dir}/sanitizer-stdout.log"
+    local sanitizer_log="${fault_dir}/compute-sanitizer.log"
+    command_status=0
+    REGENIE_CUDA_RESIDENT_MB=64 \
+      REGENIE_STEP1_LEVEL0_PIPELINE=1 \
+      REGENIE_STEP1_PGEN_PREFETCH_MB=64 \
+      REGENIE_STEP1_PGEN_PACKED=1 \
+      compute-sanitizer --tool memcheck --error-exitcode 99 \
+      --log-file "${sanitizer_log}" \
+      "${build_dir}/regenie" "${args[@]}" \
+      > "${sanitizer_output}" 2>&1 || command_status=$?
+    if (( command_status != 1 )); then
+      echo "Sanitized Level 0 unwind exited with ${command_status}, expected 1" >&2
+      tail -n 40 "${sanitizer_output}" >&2
+      tail -n 40 "${sanitizer_log}" >&2
+      return 95
+    fi
+    grep -q 'block \[2\].*pipeline wait' "${sanitizer_output}"
+    grep -q 'ERROR: cannot successfully write temporary level 0 predictions to disk' \
+      "${sanitizer_output}"
+    grep -q '^========= ERROR SUMMARY: 0 errors$' "${sanitizer_log}"
+  fi
+
+  echo "STEP1_CUDA_LEVEL0_UNWIND status=PASS results=${fault_dir}"
+}
+
 nvcc --version
 export REGENIE_CUDA_RESIDENT_MB="${resident_mb}"
 export REGENIE_CUDA_LEVEL0_CHOLESKY="${level0_cholesky}"
@@ -181,6 +256,8 @@ if [[ "${RUN_COMPUTE_SANITIZER:-1}" != "0" ]] && \
     compute-sanitizer --tool memcheck --error-exitcode 99 \
     "${build_dir}/step1_compute_test" --backend cuda --device "${device}"
 fi
+
+run_level0_pipeline_unwind_test
 
 "${build_dir}/step1_compute_test" --backend cpu --benchmark \
   --blocks "${benchmark_blocks}" --samples "${benchmark_samples}" \
