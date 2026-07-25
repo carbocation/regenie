@@ -355,6 +355,19 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& solutions,
       Step1ComputeTimings* timings = nullptr);
 
+    // Prepare and repeatedly apply a diagonal-penalized factorization of the
+    // most recent cached weighted Gram. These calls are separate so iterative
+    // methods do not refactorize the preconditioner for every right-hand side.
+    virtual bool factorize_cached_weighted_gram(
+      double ridge_parameter,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Step1ComputeTimings* timings = nullptr);
+
+    virtual bool solve_factorized_cached_weighted_gram(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings = nullptr);
+
     // Apply X' W X to one or more vectors using the cached design X without
     // materializing a weighted Gram matrix. Returns false when the backend
     // cannot provide this resident-design operation.

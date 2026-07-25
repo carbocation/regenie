@@ -435,6 +435,26 @@ bool Step1ComputeBackend::solve_cached_weighted_gram(
   return false;
 }
 
+bool Step1ComputeBackend::factorize_cached_weighted_gram(
+  double ridge_parameter,
+  const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+  Step1ComputeTimings* timings) {
+  (void)ridge_parameter;
+  (void)penalty_multipliers;
+  (void)timings;
+  return false;
+}
+
+bool Step1ComputeBackend::solve_factorized_cached_weighted_gram(
+  const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+  Eigen::MatrixXd& solutions,
+  Step1ComputeTimings* timings) {
+  (void)right_hand_sides;
+  (void)solutions;
+  (void)timings;
+  return false;
+}
+
 bool Step1ComputeBackend::compute_cached_weighted_design_hessian_product(
   const Eigen::Ref<const Eigen::VectorXd>& weights,
   const Eigen::Ref<const Eigen::MatrixXd>& vectors,

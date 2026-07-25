@@ -669,6 +669,7 @@ struct CudaResidentDesign {
   Eigen::Index columns = 0;
   bool valid = false;
   bool weighted_gram_valid = false;
+  bool weighted_gram_factor_valid = false;
   CudaResidentDesignStorage storage =
     CudaResidentDesignStorage::reusable_buffer;
 
@@ -679,6 +680,7 @@ struct CudaResidentDesign {
     columns = new_columns;
     valid = true;
     weighted_gram_valid = false;
+    weighted_gram_factor_valid = false;
     storage = new_storage;
   }
 
@@ -687,6 +689,7 @@ struct CudaResidentDesign {
     columns = 0;
     valid = false;
     weighted_gram_valid = false;
+    weighted_gram_factor_valid = false;
     storage = CudaResidentDesignStorage::reusable_buffer;
   }
 
@@ -1878,6 +1881,167 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
 
       diagonal_penalty_solve_device(features, right_hand_side_count,
         ridge_parameters, penalty_multipliers, solutions, timings);
+      return true;
+    }
+
+    bool factorize_cached_weighted_gram(
+      double ridge_parameter,
+      const Eigen::Ref<const Eigen::VectorXd>& penalty_multipliers,
+      Step1ComputeTimings* timings) override {
+
+      resident_design_.weighted_gram_factor_valid = false;
+      if(!resident_design_.valid || !resident_design_.weighted_gram_valid ||
+         penalty_multipliers.size() != resident_design_.columns)
+        return false;
+      if(!std::isfinite(ridge_parameter) || ridge_parameter < 0 ||
+         !penalty_multipliers.allFinite() ||
+         (penalty_multipliers.array() < 0).any())
+        throw std::invalid_argument(
+          "Step 1 cached weighted Gram factorization requires finite non-negative penalties");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int features = checked_int(
+        resident_design_.columns,
+        "cached weighted Gram factorization feature count");
+      if(features == 0) {
+        resident_design_.weighted_gram_factor_valid = true;
+        return true;
+      }
+      const Eigen::Index gram_elements =
+        static_cast<Eigen::Index>(features) * features;
+      if(d_gram_.capacity() < gram_elements) return false;
+
+      ensure_capacity(d_cached_weighted_gram_factor_, gram_elements,
+        "cudaMalloc(cached weighted Gram factor)");
+      ensure_capacity(d_ridge_parameters_, penalty_multipliers.size(),
+        "cudaMalloc(cached weighted Gram penalty multipliers)");
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, penalty_multipliers.data(),
+        static_cast<size_t>(penalty_multipliers.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached weighted Gram penalty multipliers to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      int workspace_size = 0;
+      check_cusolver(cusolverDnDpotrf_bufferSize(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, features,
+        d_cached_weighted_gram_factor_, features, &workspace_size),
+        "cusolverDnDpotrf_bufferSize(cached weighted Gram)");
+      ensure_capacity(d_solver_workspace_, workspace_size,
+        "cudaMalloc(cached weighted Gram Cholesky workspace)");
+
+      std::unique_ptr<CudaEventPair> factor_events;
+      if(timings) {
+        factor_events.reset(new CudaEventPair());
+        factor_events->record_start();
+      }
+      check_cuda(cudaMemcpy(d_cached_weighted_gram_factor_, d_gram_,
+        static_cast<size_t>(gram_elements) * sizeof(double),
+        cudaMemcpyDeviceToDevice),
+        "copy cached weighted Gram factorization matrix");
+      const int threads = 256;
+      add_diagonal_penalty<<<
+        (features + threads - 1) / threads, threads>>>(
+        d_cached_weighted_gram_factor_, d_ridge_parameters_,
+        ridge_parameter, features);
+      check_cuda(cudaGetLastError(),
+        "add cached weighted Gram diagonal penalty kernel");
+      check_cusolver(cusolverDnDpotrf(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, features,
+        d_cached_weighted_gram_factor_, features,
+        d_solver_workspace_, workspace_size, d_solver_info_),
+        "cusolverDnDpotrf(cached weighted Gram)");
+      int solver_info = 0;
+      check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "copy cached weighted Gram factorization status to host");
+      if(solver_info != 0) {
+        std::ostringstream message;
+        message << "cached weighted Gram Cholesky factorization failed with info="
+                << solver_info;
+        throw std::runtime_error(message.str());
+      }
+      if(timings)
+        timings->ridge_ms +=
+          factor_events->record_stop_and_elapsed_ms();
+      resident_design_.weighted_gram_factor_valid = true;
+      return true;
+    }
+
+    bool solve_factorized_cached_weighted_gram(
+      const Eigen::Ref<const Eigen::MatrixXd>& right_hand_sides,
+      Eigen::MatrixXd& solutions,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid ||
+         !resident_design_.weighted_gram_factor_valid)
+        return false;
+      if(right_hand_sides.rows() != resident_design_.columns)
+        throw std::invalid_argument(
+          "Step 1 factorized cached weighted Gram solve received incompatible dimensions");
+      if(!right_hand_sides.allFinite())
+        throw std::invalid_argument(
+          "Step 1 factorized cached weighted Gram solve requires finite right-hand sides");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int features = checked_int(
+        resident_design_.columns,
+        "factorized cached weighted Gram feature count");
+      const int right_hand_side_count = checked_int(
+        right_hand_sides.cols(),
+        "factorized cached weighted Gram right-hand side count");
+      solutions.resize(features, right_hand_side_count);
+      if(features == 0 || right_hand_side_count == 0) {
+        solutions.setZero();
+        return true;
+      }
+
+      ensure_capacity(d_scaled_rhs_, right_hand_sides.size(),
+        "cudaMalloc(factorized cached weighted Gram right-hand sides)");
+      const Eigen::MatrixXd packed_right_hand_sides =
+        contiguous_copy_if_needed(right_hand_sides);
+      const double* right_hand_side_data =
+        packed_right_hand_sides.size() ?
+          packed_right_hand_sides.data() : right_hand_sides.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_scaled_rhs_, right_hand_side_data,
+        static_cast<size_t>(right_hand_sides.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy factorized cached weighted Gram right-hand sides to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> solve_events;
+      if(timings) {
+        solve_events.reset(new CudaEventPair());
+        solve_events->record_start();
+      }
+      check_cusolver(cusolverDnDpotrs(solver_handle_,
+        CUBLAS_FILL_MODE_LOWER, features, right_hand_side_count,
+        d_cached_weighted_gram_factor_, features, d_scaled_rhs_, features,
+        d_solver_info_),
+        "cusolverDnDpotrs(cached weighted Gram)");
+      int solver_info = 0;
+      check_cuda(cudaMemcpy(&solver_info, d_solver_info_, sizeof(int),
+        cudaMemcpyDeviceToHost),
+        "copy factorized cached weighted Gram solve status to host");
+      if(solver_info != 0) {
+        std::ostringstream message;
+        message << "cached weighted Gram Cholesky solve failed with info="
+                << solver_info;
+        throw std::runtime_error(message.str());
+      }
+      if(timings)
+        timings->ridge_ms +=
+          solve_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(solutions.data(), d_scaled_rhs_,
+        static_cast<size_t>(solutions.size()) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy factorized cached weighted Gram solutions from CUDA device");
+      if(timings) timings->download_ms += elapsed_ms(transfer_start);
       return true;
     }
 
@@ -5602,6 +5766,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       Step1ComputeTimings* timings) {
 
       resident_design_.weighted_gram_valid = false;
+      resident_design_.weighted_gram_factor_valid = false;
       const int rows = checked_int(
         resident_design_.rows, "cached weighted design row count");
       const int features = checked_int(
@@ -6071,6 +6236,7 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
     CudaDeviceBuffer<double> d_predictions_;
     CudaDeviceBuffer<double> d_outcomes_;
     CudaDeviceBuffer<double> d_projected_;
+    CudaDeviceBuffer<double> d_cached_weighted_gram_factor_;
     CudaDeviceBuffer<double> d_level1_ones_;
     CudaDeviceBuffer<double> d_level0_phenotypes_;
     CudaDeviceBuffer<double> d_level0_prediction_block_;
