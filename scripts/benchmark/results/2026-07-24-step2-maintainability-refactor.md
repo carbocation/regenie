@@ -106,20 +106,48 @@ The same final source archive was configured on `regenie-a100` with CUDA
   outcomes, binary missingness and observed counts, and Cox scoring against
   CPU references.
 
-The extended Stage-1-only build-boundary check, compute-sanitizer run, and
-end-to-end A100 integration were deferred when an unrelated CPU workload
-started on the host. No process was interrupted and no competing validation
-was launched. These checks remain operational follow-ups rather than failures
-of the completed conformance gate.
+The independent build boundary was then exercised with
+`REGENIE_WITH_CUDA=ON` and `REGENIE_WITH_STEP2_CUDA=OFF`:
+
+- the complete Step 1 CUDA conformance test passed;
+- Stage 2 CPU and auto conformance passed with `active=cpu`; and
+- an explicit Stage 2 CUDA request exited with the expected
+  `built without Stage 2 CUDA support` diagnostic.
+
+Compute Sanitizer 2025.2 reported zero errors for the full-CUDA Stage 2 unit
+suite.
+
+### Real-PGEN multi-block integration
+
+The end-to-end CUDA gate used 50,000 samples, 3,500 real-LD-derived PGEN
+variants, block size 1,000, and four blocks. It ran:
+
+- 32 quantitative traits with phenotype-specific missingness;
+- eight binary traits with phenotype-specific missingness; and
+- eight survival traits with phenotype-specific missingness.
+
+Each model ran through CPU, explicit CUDA, and auto placement. All six CUDA or
+auto logs asserted `Step 2 packed two-block pipeline : [enabled]`, and their
+profiles reported the active backend as CUDA. CPU profiles reported CPU.
+
+All 48 trait result files were byte-identical across CPU, CUDA, and auto.
+Representative retained missingness checks included 45,000 observations for
+`PHENO32`, 987 cases and 48,368 controls for `BT2`, and 9,870 events and
+39,485 censors for `TIME2`.
+
+The four-block, 32-trait quantitative CUDA pipeline was also run under Compute
+Sanitizer. It completed in 16.85 seconds, produced all 32 outputs, and reported
+zero errors.
 
 ## Conclusion
 
 The Stage 2 refactor preserves exact CPU scientific output across all three
 models and shows no performance regression at N=500,000 and P=8. The CPU
-release/regression suite and the primary CUDA backend conformance suite pass.
-The code is better isolated at the backend and build boundaries, while the
-larger upstream-origin numerical and PGEN structures remain substantially
-unchanged for future upstream merges.
+release/regression suite, CUDA backend conformance, independent Stage 2 build
+boundary, unit and integration memchecks, and real-PGEN CPU/CUDA/auto matrix
+all pass. The code is better isolated at the backend and build boundaries,
+while the larger upstream-origin numerical and PGEN structures remain
+substantially unchanged for future upstream merges.
 
 Raw remote artifacts are retained at:
 
