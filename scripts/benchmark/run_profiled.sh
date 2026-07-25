@@ -12,6 +12,8 @@ Options:
   --gpu-device INDEX       GPU to sample with nvidia-smi (default: none)
   --sample-interval SEC    Telemetry interval in seconds (default: 1)
   --revision REVISION      Revision recorded in metadata (default: auto-detect)
+  --env NAME=VALUE         Set and record one non-secret command environment
+                           variable; may be repeated
   -h, --help               Show this help
 
 The command is run once. The wrapper creates a timestamped run directory with
@@ -28,6 +30,7 @@ output_root=""
 gpu_device=""
 sample_interval="1"
 revision=""
+command_environment=()
 
 while (( $# > 0 )); do
   case "$1" in
@@ -53,6 +56,10 @@ while (( $# > 0 )); do
       ;;
     --revision)
       revision="${2:?--revision requires a value}"
+      shift 2
+      ;;
+    --env)
+      command_environment+=("${2:?--env requires NAME=VALUE}")
       shift 2
       ;;
     --)
@@ -92,6 +99,21 @@ if [[ -n "${gpu_device}" && ! "${gpu_device}" =~ ^[0-9]+$ ]]; then
   echo "--gpu-device must be a non-negative integer" >&2
   exit 2
 fi
+for assignment in "${command_environment[@]}"; do
+  if [[ "${assignment}" != *=* ]]; then
+    echo "--env requires NAME=VALUE: ${assignment}" >&2
+    exit 2
+  fi
+  environment_name="${assignment%%=*}"
+  if [[ ! "${environment_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "--env has an invalid variable name: ${environment_name}" >&2
+    exit 2
+  fi
+  if [[ "${assignment}" == *$'\n'* || "${assignment}" == *$'\t'* ]]; then
+    echo "--env values may not contain tabs or newlines" >&2
+    exit 2
+  fi
+done
 if [[ ! -x "$1" ]]; then
   echo "Benchmark command is not executable: $1" >&2
   exit 2
@@ -107,8 +129,12 @@ run_dir="${output_root%/}/${label}-${timestamp}"
 mkdir -p "${run_dir}"
 
 command_text=""
-printf -v command_text '%q ' "$@"
-command_text="${command_text% }"
+if (( ${#command_environment[@]} > 0 )); then
+  printf -v environment_text '%q ' "${command_environment[@]}"
+  command_text="env ${environment_text}"
+fi
+printf -v argument_text '%q ' "$@"
+command_text+="${argument_text% }"
 printf '%s\n' "${command_text}" > "${run_dir}/command.txt"
 
 if [[ -z "${revision}" ]]; then
@@ -134,8 +160,15 @@ fi
   printf 'binary_sha256\t%s\n' "${binary_sha256}"
   printf 'gpu_device\t%s\n' "${gpu_device:-none}"
   printf 'sample_interval_seconds\t%s\n' "${sample_interval}"
+  printf 'environment_count\t%s\n' "${#command_environment[@]}"
   printf 'command\t%s\n' "${command_text}"
 } > "${run_dir}/metadata.tsv"
+{
+  printf 'key\tvalue\n'
+  for assignment in "${command_environment[@]}"; do
+    printf '%s\t%s\n' "${assignment%%=*}" "${assignment#*=}"
+  done
+} > "${run_dir}/environment.tsv"
 
 {
   uname -srm
@@ -200,7 +233,8 @@ if [[ -n "${gpu_device}" ]]; then
 fi
 
 set +e
-/usr/bin/time -o "${run_dir}/resource.tsv" \
+/usr/bin/env "${command_environment[@]}" \
+  /usr/bin/time -o "${run_dir}/resource.tsv" \
   -f $'key\tvalue\ncommand_exit_status\t%x\nwall_seconds\t%e\nuser_seconds\t%U\nsystem_seconds\t%S\nmax_rss_kb\t%M\nfilesystem_inputs\t%I\nfilesystem_outputs\t%O\nmajor_page_faults\t%F\nminor_page_faults\t%R\nvoluntary_context_switches\t%w\ninvoluntary_context_switches\t%c\naverage_cpu_percent\t%P' \
   stdbuf -oL -eL "$@" 2>&1 \
   | tee "${run_dir}/console.log" \

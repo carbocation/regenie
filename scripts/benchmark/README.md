@@ -8,6 +8,7 @@ REGENIE v4.1.2. Start with the report for the stage you plan to run:
 | [Stage 1 production benchmark](results/2026-07-19-production.md) | N=500,000; 700,000 model-fitting variants; quantitative, binary, and survival traits with 0-10% missingness | Latest byte-exact default on A100 versus upstream v4.1.2 on an eight-core N2, plus a clearly separated opt-in path-Newton sensitivity |
 | [CUDA Step 1 refactor cross-model gate](results/2026-07-24-step1-cuda-refactor-gate.md) | A100; N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Refactor revision `340677f3` had no regression across all three models, flat backend compute timings, zero fallbacks, and 24/24 byte-identical LOCO files |
 | [CUDA Step 1 maintainability-refactor gate](results/2026-07-24-step1-maintainability-refactor.md) | N2 CPU validation and A100 N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Final Stage 1 revision `99f1152d` preserved upstream-origin numerical paths, changed end-to-end time by -0.94% to +0.17%, and produced 24/24 byte-identical LOCO files |
+| [Level 1 Newton-CG experiment](results/2026-07-25-step1-newton-cg.md) | N2 validation and A100 N=500,000; 700,000 model-fitting variants; P=8 binary traits | Bounded Newton-CG reduced nonlinear-solver work by 22.6% but warm Level 1 wall time by only 2.2%; retained behind the unified experimental optimizer selector |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `3ab5fbb` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=32 with 0-10% missingness, current processes 848.2 quantitative, 792.7 binary, and 524.9 survival variants/s; CPU chromosome fan-out remains the recommended production placement |
 | [Stage 2 maintainability-refactor gate](results/2026-07-24-step2-maintainability-refactor.md) | N2 release/regression validation; matched N=500,000, P=8 quantitative, binary, and survival CPU A/B; A100 CUDA conformance and integration | Final revision `1f2352d` produced 48/48 byte-identical N2 A/B pairs and 48/48 byte-identical CPU/CUDA/auto integration outputs, changed CPU wall time by -1.80% to -0.05%, and passed build-isolation and sanitizer gates |
 
@@ -28,6 +29,7 @@ scripts/benchmark/run_profiled.sh \
   --system-label a2-highgpu-1g \
   --output-root /path/to/results \
   --gpu-device 0 \
+  --env REGENIE_STEP1_LEVEL1_OPTIMIZER=path-newton \
   --revision "$(git rev-parse HEAD)" \
   -- \
   /path/to/regenie \
@@ -44,6 +46,12 @@ scripts/benchmark/run_profiled.sh \
 Use a stable `--system-label` that describes the machine type and relevant
 configuration, never a transient cloud instance name.
 
+Use repeated `--env NAME=VALUE` options for non-secret experimental modes
+instead of setting variables outside the wrapper. The wrapper records them in
+`command.txt`, `metadata.tsv`, and `environment.tsv`. Logistic Level 1
+comparisons should select exactly one of `irls`, `path-newton`, or `newton-cg`
+through `REGENIE_STEP1_LEVEL1_OPTIMIZER`.
+
 For optimized x86 measurements, configure with `MKLROOT` and verify that
 `binary_libraries.txt` links oneMKL. A BLAS mismatch can invalidate a CPU
 comparison.
@@ -52,7 +60,8 @@ comparison.
 
 Each invocation creates `LABEL-YYYYMMDDTHHMMSSZ/` containing:
 
-- exact command, Git revision, binary checksum, and linked libraries;
+- exact command and environment, Git revision, binary checksum, and linked
+  libraries;
 - CPU topology, memory, disks, and GPU configuration;
 - wall time, CPU time, peak RSS, page faults, context switches, and filesystem
   operations from GNU `time`;
@@ -98,6 +107,10 @@ Stage 1:
   [`TSV`](results/2026-07-23-step1-path-newton.tsv) — opt-in Level 1 ridge-path
   continuation experiment at N=500,000, 700,000 model-fitting variants, and
   P=8/P=32, including full downstream Stage 2 validation.
+- [`results/2026-07-25-step1-newton-cg.md`](results/2026-07-25-step1-newton-cg.md) —
+  bounded Newton-CG Level 1 experiment at N=500,000, 700,000 model-fitting
+  variants, and P=8, including N2/A100 validation and the matched path-Newton
+  comparison.
 - [`results/2026-07-23-step1-pinned-download.md`](results/2026-07-23-step1-pinned-download.md)
   and [`TSV`](results/2026-07-23-step1-pinned-download.tsv) — unconditional,
   byte-exact CUDA Level 0 download optimization, including the quantitative,

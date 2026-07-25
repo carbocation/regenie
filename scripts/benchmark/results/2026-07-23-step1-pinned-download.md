@@ -129,4 +129,5 @@ behind a feature flag.
 Path-Newton is a separate, non-byte-identical experiment. Its full P=8/P=32
 Stage 2 validation placed the numerical differences within the project's
 historically accepted envelope, but it remains disabled by default and can be
-enabled explicitly with `REGENIE_STEP1_LEVEL1_PATH_NEWTON=1`.
+enabled explicitly with
+`REGENIE_STEP1_LEVEL1_OPTIMIZER=path-newton`.

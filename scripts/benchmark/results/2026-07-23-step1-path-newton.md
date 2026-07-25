@@ -6,7 +6,7 @@ Status: retained as an experimental opt-in after full P=8/P=32 Stage 2
 validation. It can be enabled with:
 
 ```bash
-REGENIE_STEP1_LEVEL1_PATH_NEWTON=1 regenie ...
+REGENIE_STEP1_LEVEL1_OPTIMIZER=path-newton regenie ...
 ```
 
 Do not treat this as a byte-identical optimization. It preserves the

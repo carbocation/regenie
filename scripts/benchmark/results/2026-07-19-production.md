@@ -85,7 +85,7 @@ Path-Newton is disabled by default because it changes low-order printed digits
 in final Stage 2 results. It can be enabled explicitly with:
 
 ```bash
-REGENIE_STEP1_LEVEL1_PATH_NEWTON=1 regenie ...
+REGENIE_STEP1_LEVEL1_OPTIMIZER=path-newton regenie ...
 ```
 
 The following matched binary runs include the same unconditional Level 0

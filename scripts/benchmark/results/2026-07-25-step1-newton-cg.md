@@ -2,11 +2,11 @@
 
 Date: 2026-07-25
 
-Status: implementation and validation complete; retained temporarily as a
-disabled-by-default experiment pending a keep/remove decision. Enable it with:
+Status: retained as a disabled-by-default experimental optimizer. Enable it
+with:
 
 ```bash
-REGENIE_STEP1_LEVEL1_NEWTON_CG=1 regenie ...
+REGENIE_STEP1_LEVEL1_OPTIMIZER=newton-cg regenie ...
 ```
 
 Enabling Newton-CG also enables the existing path-Newton warm starts. The route
@@ -127,7 +127,7 @@ as expected for the existing experimental fast/inexact family, but the
 observed differences are small and the exact penalized-score acceptance guard
 was active for every Newton-CG step.
 
-## Decision point
+## Decision
 
 The experiment did not meet the automatic-retention target of at least 1.5x
 Level 1 speedup. It did demonstrate that factor-once/apply-many PCG is
@@ -137,9 +137,7 @@ however, that work reduction produces only a 2.2% warm end-to-end Level 1 gain
 because input becomes the bottleneck.
 
 The implementation remains isolated, opt-in, and covered by CPU, sanitizer,
-CUDA, and fallback tests while the maintenance-value tradeoff is discussed.
-It should not be made the default on this evidence. A keep decision would
-preserve it as an experimental option with potential upside if Level 0 input
-latency is reduced; a remove decision would drop the Newton-CG integration
-while the independently useful resident HVP and reusable-factor backend
-primitives could be considered separately.
+CUDA, and fallback tests. It is retained as the `newton-cg` value of the
+single Level 1 optimizer selector, alongside `irls` and `path-newton`. It
+should not be made the default on this evidence, but remains available as an
+experimental option with potential upside if Level 0 input latency is reduced.
