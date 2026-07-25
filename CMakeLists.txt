@@ -136,6 +136,7 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/SKAT.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/MultiTrait_Tests.cpp
@@ -357,7 +358,8 @@ target_include_directories(regenie PRIVATE ${EXTERN_LIBS_PATH}/eigen-3.4.0/)
 if(BUILD_TESTING)
   add_executable(step1_compute_test
     ${CMAKE_SOURCE_DIR}/test/test_step1_compute.cpp
-    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp)
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp)
   target_include_directories(step1_compute_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${EXTERN_LIBS_PATH}/eigen-3.4.0/)

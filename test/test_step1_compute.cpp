@@ -1,6 +1,7 @@
 /* Deterministic conformance and benchmark driver for Step 1 backends. */
 
 #include "Step1_Compute.hpp"
+#include "Step1_Newton_CG.hpp"
 
 #ifdef WITH_CUDA
 #include "Cuda_Resources.hpp"
@@ -109,6 +110,76 @@ void check_static_input_cache_state() {
       "Level 0 static-input scope accepted generation zero");
 
   std::cout << "STEP1_BACKEND_TEST case=static_input_cache_state status=PASS\n";
+}
+
+void check_newton_cg() {
+  Eigen::MatrixXd system(4, 4);
+  system <<
+    5.0, 1.0, 0.0, 0.0,
+    1.0, 4.0, 0.5, 0.0,
+    0.0, 0.5, 3.0, 0.25,
+    0.0, 0.0, 0.25, 2.0;
+  const Eigen::VectorXd right_hand_side =
+    (Eigen::VectorXd(4) << 1.0, -2.0, 0.5, 3.0).finished();
+  const Step1NewtonCgOperator apply_system =
+    [&system](const Eigen::VectorXd& vector, Eigen::VectorXd& product) {
+      product.noalias() = system * vector;
+      return true;
+    };
+  const Step1NewtonCgOperator apply_identity =
+    [](const Eigen::VectorXd& vector, Eigen::VectorXd& product) {
+      product = vector;
+      return true;
+    };
+  const Step1NewtonCgResult result =
+    step1_preconditioned_conjugate_gradient(
+      right_hand_side, 1e-12, 8, apply_system, apply_identity);
+  const Eigen::VectorXd expected = system.llt().solve(right_hand_side);
+  if(!result.valid || !result.converged ||
+     result.iterations < 1 || result.iterations > 4 ||
+     result.operator_calls != result.iterations ||
+     result.preconditioner_calls != result.iterations ||
+     (result.solution - expected).norm() > 1e-12)
+    throw std::runtime_error("Newton-CG SPD solve conformance failed");
+
+  const Eigen::LLT<Eigen::MatrixXd> factor(system);
+  const Step1NewtonCgOperator apply_exact_preconditioner =
+    [&factor](const Eigen::VectorXd& vector, Eigen::VectorXd& product) {
+      product = factor.solve(vector);
+      return true;
+    };
+  const Step1NewtonCgResult preconditioned_result =
+    step1_preconditioned_conjugate_gradient(
+      right_hand_side, 1e-12, 8, apply_system,
+      apply_exact_preconditioner);
+  if(!preconditioned_result.converged ||
+     preconditioned_result.iterations != 1 ||
+     (preconditioned_result.solution - expected).norm() > 1e-12)
+    throw std::runtime_error(
+      "Newton-CG exact preconditioner conformance failed");
+
+  const Step1NewtonCgResult zero_result =
+    step1_preconditioned_conjugate_gradient(
+      Eigen::VectorXd::Zero(4), 1e-6, 8, apply_system, apply_identity);
+  if(!zero_result.valid || !zero_result.converged ||
+     zero_result.iterations != 0 || zero_result.operator_calls != 0 ||
+     zero_result.preconditioner_calls != 0)
+    throw std::runtime_error("Newton-CG zero solve conformance failed");
+
+  const Step1NewtonCgOperator apply_indefinite =
+    [](const Eigen::VectorXd& vector, Eigen::VectorXd& product) {
+      product = -vector;
+      return true;
+    };
+  const Step1NewtonCgResult indefinite_result =
+    step1_preconditioned_conjugate_gradient(
+      right_hand_side, 1e-6, 8, apply_indefinite, apply_identity);
+  if(indefinite_result.valid || indefinite_result.converged ||
+     indefinite_result.operator_calls != 1)
+    throw std::runtime_error(
+      "Newton-CG accepted non-positive curvature");
+
+  std::cout << "STEP1_BACKEND_TEST case=newton_cg status=PASS\n";
 }
 
 #ifdef WITH_CUDA
@@ -2971,6 +3042,7 @@ int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
     check_static_input_cache_state();
+    check_newton_cg();
     std::unique_ptr<Step1ComputeBackend> backend =
       make_step1_compute_backend(options.backend, options.device);
     std::cout << "STEP1_BACKEND_TEST backend=" << backend->name()
