@@ -50,6 +50,17 @@ The implementation was developed in four commits:
 a1841d1 feat: add opt-in Level 1 Newton-CG corrections
 ```
 
+The final selector and benchmark interface were consolidated in:
+
+```text
+8de2bba refactor: unify Level 1 optimizer selection
+f55bdd2 bench: record Level 1 optimizer modes
+```
+
+These later commits replaced the competing Boolean environment variables with
+the `irls`, `path-newton`, and `newton-cg` enum values. They did not change the
+numerical kernels or acceptance logic.
+
 The following gates passed:
 
 - local CPU backend and bounded-PCG unit tests;
@@ -75,12 +86,27 @@ Validated artifacts:
 /home/james/build/regenie-newton-cg-a1841d1-cuda-dist/regenie-4.1.2-ga1841d17a6aa-linux-x86_64-native-cuda-sm80.tar.gz
 ```
 
+After selector consolidation, the full CPU Release, CTest, repository
+regression, and packaged-regression gates passed again on an N2. A separate N2
+ASan/UBSan run passed and the profiled wrapper recorded and applied
+`REGENIE_STEP1_LEVEL1_OPTIMIZER=newton-cg` in both its command and environment
+metadata. The A100 CUDA Release, CTest, backend conformance,
+compute-sanitizer, cross-route CPU/CUDA validation, repository regressions,
+and packaged regressions also passed. The resulting artifacts are:
+
+```text
+/home/james/build/regenie-level1-optimizer-f55bdd2-dist/regenie-4.1.2-gf55bdd2d4b8c-linux-x86_64-native-cpu-mkl.tar.gz
+/home/james/build/regenie-level1-optimizer-f55bdd2-cuda-dist/regenie-4.1.2-gf55bdd2d4b8c-linux-x86_64-native-cuda-sm80.tar.gz
+```
+
 ## N=500,000, P=8 A100 performance
 
 All runs used commit `a1841d1`, the same A100 40 GB, 700,000 model-fitting
 variants, eight binary traits with 0-10% missingness, `--bsize 1000`, 12
 threads, and the same retained 106 GB Level 0 cache. These are Level 1 replays,
-so identical Level 0 computation was not repeated.
+so identical Level 0 computation was not repeated. The later enum
+consolidation maps to the same two internal route predicates and therefore did
+not require repeating the performance experiment.
 
 | Route | Order | Level 1 wall (s) | Solver work (s) | Exposed L0-read wait (s) | Program total (s) |
 | --- | ---: | ---: | ---: | ---: | ---: |
