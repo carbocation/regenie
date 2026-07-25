@@ -137,6 +137,7 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Newton_CG.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Optimizer.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp
@@ -360,6 +361,7 @@ if(BUILD_TESTING)
   add_executable(step1_compute_test
     ${CMAKE_SOURCE_DIR}/test/test_step1_compute.cpp
     ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Optimizer.cpp
     ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp)
   target_include_directories(step1_compute_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src

@@ -305,7 +305,7 @@ and phase timings.
 | `REGENIE_STEP1_PGEN_PREFETCH_MB` | 4,096 MB | Maximum extra buffer for next-block PGEN prefetch; `0` disables |
 | `REGENIE_STEP1_PGEN_TILE_VARIANTS` | 8 | PGEN materialization tile width, from 1 through 64 |
 | `REGENIE_STEP1_LEVEL0_PIPELINE` | automatic | Force the two-backend packed Level 0 pipeline off/on; automatic use also requires an expanded block no larger than 1,000 MB |
-| `REGENIE_STEP1_LEVEL1_PATH_NEWTON` | `0` | Opt into logistic Level 1 path continuation |
+| `REGENIE_STEP1_LEVEL1_OPTIMIZER` | `irls` | Logistic Level 1 optimizer: `irls`, `path-newton`, or `newton-cg` |
 
 Host-side pipeline controls include `REGENIE_STEP1_BULK_L0_READ` (default
 `1`), `REGENIE_STEP1_LEVEL1_L0_PREFETCH` (default `1`),
@@ -313,6 +313,10 @@ Host-side pipeline controls include `REGENIE_STEP1_BULK_L0_READ` (default
 `REGENIE_STEP1_LEVEL0_ASYNC_WRITE_MB` (default 1,024 MB),
 `REGENIE_STEP1_OUTPUT_THREADS` (default configured threads), and
 `REGENIE_STEP1_PREDICTION_CACHE` (default is eligibility-based; `0` disables).
+The `newton-cg` optimizer first applies path-Newton continuation, then bounded
+Newton-CG where continuation does not converge, with ordinary IRLS as the
+fallback. Both accelerated optimizers are experimental and can change
+floating-point rounding.
 
 ### Step 2
 

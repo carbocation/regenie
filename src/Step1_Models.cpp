@@ -38,6 +38,7 @@
 #include "Step1_Models.hpp"
 #include "Step1_Compute.hpp"
 #include "Step1_Level1_Newton_CG.hpp"
+#include "Step1_Level1_Optimizer.hpp"
 #include "Step2_Models.hpp"
 #include "HLM.hpp"
 #include "Pheno.hpp"
@@ -69,22 +70,6 @@ bool step1_level1_l0_prefetch_enabled() {
   if(std::string(value) == "0") return false;
   throw std::invalid_argument(
     "REGENIE_STEP1_LEVEL1_L0_PREFETCH must be '0' or '1'");
-}
-
-bool step1_level1_path_newton_enabled() {
-  const char* value = std::getenv("REGENIE_STEP1_LEVEL1_PATH_NEWTON");
-  if(!value || !*value || std::string(value) == "0") return false;
-  if(std::string(value) == "1") return true;
-  throw std::invalid_argument(
-    "REGENIE_STEP1_LEVEL1_PATH_NEWTON must be '0' or '1'");
-}
-
-bool step1_level1_newton_cg_enabled() {
-  const char* value = std::getenv("REGENIE_STEP1_LEVEL1_NEWTON_CG");
-  if(!value || !*value || std::string(value) == "0") return false;
-  if(std::string(value) == "1") return true;
-  throw std::invalid_argument(
-    "REGENIE_STEP1_LEVEL1_NEWTON_CG must be '0' or '1'");
 }
 
 int step1_level1_l0_read_threads(const struct param* params) {
@@ -556,6 +541,7 @@ void cache_concatenated_level1_predictions(
 }
 
 struct LogisticLevel1Profile {
+  Step1Level1Optimizer optimizer = Step1Level1Optimizer::Irls;
   Step1ComputeTimings backend;
   double read_l0_ms = 0;
   double read_l0_wait_ms = 0;
@@ -604,6 +590,7 @@ struct LogisticLevel1Profile {
     std::ostringstream profile;
     profile << std::fixed << std::setprecision(3)
       << "STEP1_PROFILE scope=level1_logistic"
+      << " optimizer=" << step1_level1_optimizer_name(optimizer)
       << " wall_ms=" << wall_ms
       << " read_l0_ms=" << read_l0_ms
       << " read_l0_wait_ms=" << read_l0_wait_ms
@@ -2457,9 +2444,13 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   LogisticLevel1Profile profile;
   Step1ComputeTimings* profile_timings =
     profile.backend_timings(params->profile_step1);
-  const bool use_newton_cg = step1_level1_newton_cg_enabled();
+  const Step1Level1Optimizer optimizer =
+    step1_level1_optimizer_from_environment();
+  profile.optimizer = optimizer;
+  const bool use_newton_cg =
+    optimizer == Step1Level1Optimizer::NewtonCg;
   const bool use_path_newton =
-    step1_level1_path_newton_enabled() || use_newton_cg;
+    optimizer != Step1Level1Optimizer::Irls;
 
   int niter_cur;
   int ph_eff;

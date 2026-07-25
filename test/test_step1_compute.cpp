@@ -1,6 +1,7 @@
 /* Deterministic conformance and benchmark driver for Step 1 backends. */
 
 #include "Step1_Compute.hpp"
+#include "Step1_Level1_Optimizer.hpp"
 #include "Step1_Newton_CG.hpp"
 
 #ifdef WITH_CUDA
@@ -180,6 +181,52 @@ void check_newton_cg() {
       "Newton-CG accepted non-positive curvature");
 
   std::cout << "STEP1_BACKEND_TEST case=newton_cg status=PASS\n";
+}
+
+void check_level1_optimizer() {
+  struct OptimizerCase {
+    const char* value;
+    Step1Level1Optimizer expected;
+  };
+  const OptimizerCase cases[] = {
+    {nullptr, Step1Level1Optimizer::Irls},
+    {"", Step1Level1Optimizer::Irls},
+    {"irls", Step1Level1Optimizer::Irls},
+    {"path-newton", Step1Level1Optimizer::PathNewton},
+    {"newton-cg", Step1Level1Optimizer::NewtonCg}
+  };
+  for(const OptimizerCase& test_case : cases) {
+    const Step1Level1Optimizer parsed =
+      parse_step1_level1_optimizer(test_case.value);
+    if(parsed != test_case.expected ||
+       parse_step1_level1_optimizer(
+         step1_level1_optimizer_name(parsed)) != parsed)
+      throw std::runtime_error(
+        "Level 1 optimizer did not parse or round-trip");
+  }
+
+  const char* invalid_values[] = {
+    "0", "1", "path_newton", "PATH-NEWTON", "newton"
+  };
+  for(const char* value : invalid_values) {
+    bool rejected = false;
+    try {
+      parse_step1_level1_optimizer(value);
+    } catch(const std::invalid_argument& error) {
+      const std::string message(error.what());
+      rejected =
+        message.find("REGENIE_STEP1_LEVEL1_OPTIMIZER") !=
+          std::string::npos &&
+        message.find("irls, path-newton, newton-cg") !=
+          std::string::npos;
+    }
+    if(!rejected)
+      throw std::runtime_error(
+        "Level 1 optimizer accepted an invalid mode");
+  }
+
+  std::cout
+    << "STEP1_BACKEND_TEST case=level1_optimizer status=PASS\n";
 }
 
 #ifdef WITH_CUDA
@@ -3043,6 +3090,7 @@ int main(int argc, char** argv) {
     const Options options = parse_options(argc, argv);
     check_static_input_cache_state();
     check_newton_cg();
+    check_level1_optimizer();
     std::unique_ptr<Step1ComputeBackend> backend =
       make_step1_compute_backend(options.backend, options.device);
     std::cout << "STEP1_BACKEND_TEST backend=" << backend->name()
