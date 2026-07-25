@@ -1881,6 +1881,105 @@ class CudaStep1ComputeBackend : public Step1ComputeBackend {
       return true;
     }
 
+    bool compute_cached_weighted_design_hessian_product(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& vectors,
+      Eigen::MatrixXd& products,
+      Step1ComputeTimings* timings) override {
+
+      if(!resident_design_.valid) return false;
+      if(weights.size() != resident_design_.rows ||
+         vectors.rows() != resident_design_.columns)
+        throw std::invalid_argument(
+          "Step 1 cached Hessian product received incompatible dimensions");
+      if(!weights.allFinite() || (weights.array() < 0).any() ||
+         !vectors.allFinite())
+        throw std::invalid_argument(
+          "Step 1 cached Hessian product requires finite vectors and finite non-negative weights");
+
+      check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+      const int rows = checked_int(
+        resident_design_.rows, "cached Hessian product row count");
+      const int features = checked_int(
+        resident_design_.columns, "cached Hessian product feature count");
+      const int vector_count = checked_int(
+        vectors.cols(), "cached Hessian product vector count");
+      products.resize(features, vector_count);
+      if(features == 0 || vector_count == 0 || rows == 0) {
+        products.setZero();
+        return true;
+      }
+
+      const Eigen::Index prediction_elements =
+        static_cast<Eigen::Index>(rows) * vector_count;
+      ensure_capacity(d_ridge_parameters_, rows,
+        "cudaMalloc(cached Hessian weights)");
+      ensure_capacity(d_inverse_, vectors.size(),
+        "cudaMalloc(cached Hessian vectors)");
+      ensure_capacity(d_predictions_, prediction_elements,
+        "cudaMalloc(cached Hessian predictions)");
+      ensure_capacity(d_scaled_rhs_, prediction_elements,
+        "cudaMalloc(cached weighted Hessian predictions)");
+      ensure_capacity(d_crossproduct_, products.size(),
+        "cudaMalloc(cached Hessian products)");
+
+      const Eigen::MatrixXd packed_vectors =
+        contiguous_copy_if_needed(vectors);
+      const double* vector_data =
+        packed_vectors.size() ? packed_vectors.data() : vectors.data();
+      ComputeClock::time_point transfer_start;
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(d_ridge_parameters_, weights.data(),
+        static_cast<size_t>(rows) * sizeof(double), cudaMemcpyHostToDevice),
+        "copy cached Hessian weights to CUDA device");
+      check_cuda(cudaMemcpy(d_inverse_, vector_data,
+        static_cast<size_t>(vectors.size()) * sizeof(double),
+        cudaMemcpyHostToDevice),
+        "copy cached Hessian vectors to CUDA device");
+      if(timings) timings->upload_ms += elapsed_ms(transfer_start);
+
+      std::unique_ptr<CudaEventPair> product_events;
+      if(timings) {
+        product_events.reset(new CudaEventPair());
+        product_events->record_start();
+      }
+      const double alpha = 1.0;
+      const double beta = 0.0;
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+        rows, vector_count, features, &alpha,
+        resident_design_data(), rows, d_inverse_, features, &beta,
+        d_predictions_, rows),
+        "cublasDgemm(cached Hessian design product)");
+      const int prediction_count = checked_element_count(
+        rows, vector_count, "cached Hessian prediction matrix");
+      const int threads = 256;
+      scale_matrix_rows<<<
+        (prediction_count + threads - 1) / threads, threads>>>(
+        d_predictions_, d_ridge_parameters_, d_scaled_rhs_, rows,
+        prediction_count);
+      check_cuda(cudaGetLastError(),
+        "scale cached Hessian predictions kernel");
+      check_cublas(cublasDgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        features, vector_count, rows, &alpha,
+        resident_design_data(), rows, d_scaled_rhs_, rows, &beta,
+        d_crossproduct_, features),
+        "cublasDgemm(cached Hessian transpose product)");
+      if(timings)
+        timings->gram_ms +=
+          product_events->record_stop_and_elapsed_ms();
+
+      if(timings) transfer_start = ComputeClock::now();
+      check_cuda(cudaMemcpy(products.data(), d_crossproduct_,
+        static_cast<size_t>(products.size()) * sizeof(double),
+        cudaMemcpyDeviceToHost),
+        "copy cached Hessian products from CUDA device");
+      if(timings) {
+        timings->download_ms += elapsed_ms(transfer_start);
+        timings->resident_design_reuse_count++;
+      }
+      return true;
+    }
+
     void compute_cached_design_crossproduct(
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Eigen::MatrixXd& crossproduct,

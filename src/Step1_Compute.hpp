@@ -355,6 +355,15 @@ class Step1ComputeBackend {
       Eigen::MatrixXd& solutions,
       Step1ComputeTimings* timings = nullptr);
 
+    // Apply X' W X to one or more vectors using the cached design X without
+    // materializing a weighted Gram matrix. Returns false when the backend
+    // cannot provide this resident-design operation.
+    virtual bool compute_cached_weighted_design_hessian_product(
+      const Eigen::Ref<const Eigen::VectorXd>& weights,
+      const Eigen::Ref<const Eigen::MatrixXd>& vectors,
+      Eigen::MatrixXd& products,
+      Step1ComputeTimings* timings = nullptr);
+
     virtual void compute_cached_design_crossproduct(
       const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
       Eigen::MatrixXd& crossproduct,

@@ -2421,6 +2421,31 @@ void run_conformance(Step1ComputeBackend& candidate) {
       throw std::runtime_error(
         "CUDA backend did not support the cached weighted Gram solve");
 
+    const Eigen::MatrixXd resident_hessian_vectors =
+      deterministic_matrix(resident_design.cols(), 3, -0.37);
+    const Eigen::MatrixXd expected_resident_hessian_products =
+      expected_resident_gram * resident_hessian_vectors;
+    Eigen::MatrixXd resident_hessian_products;
+    const bool resident_hessian_product_supported =
+      candidate.compute_cached_weighted_design_hessian_product(
+        resident_weights, resident_hessian_vectors,
+        resident_hessian_products, &resident_design_timings);
+    if(std::string(candidate.name()) == "cuda" &&
+       !resident_hessian_product_supported)
+      throw std::runtime_error(
+        "CUDA backend did not support the cached Hessian product");
+
+    Eigen::MatrixXd resident_post_hessian_gram_solutions;
+    const bool resident_post_hessian_gram_solve_supported =
+      candidate.solve_cached_weighted_gram(
+        resident_cached_gram_rhs, resident_ridge_parameters,
+        resident_penalty_multipliers,
+        resident_post_hessian_gram_solutions, &resident_design_timings);
+    if(resident_cached_gram_solve_supported !=
+         resident_post_hessian_gram_solve_supported)
+      throw std::runtime_error(
+        "cached Hessian product invalidated the cached weighted Gram");
+
     const double resident_prediction_error = relative_error(
       resident_predictions, expected_resident_predictions);
     const double resident_gram_error = relative_error(
@@ -2433,6 +2458,14 @@ void run_conformance(Step1ComputeBackend& candidate) {
       resident_cached_gram_solve_supported ?
         relative_error(resident_cached_gram_solutions,
           expected_resident_cached_gram_solutions) : 0.0;
+    const double resident_hessian_product_error =
+      resident_hessian_product_supported ?
+        relative_error(resident_hessian_products,
+          expected_resident_hessian_products) : 0.0;
+    const double resident_post_hessian_gram_solve_error =
+      resident_post_hessian_gram_solve_supported ?
+        relative_error(resident_post_hessian_gram_solutions,
+          expected_resident_cached_gram_solutions) : 0.0;
     const double resident_score_error = relative_error(
       resident_score, expected_resident_score);
     if(resident_prediction_error > 5e-12 ||
@@ -2440,6 +2473,8 @@ void run_conformance(Step1ComputeBackend& candidate) {
        resident_crossproduct_error > 5e-12 ||
        resident_solve_error > 5e-12 ||
        resident_cached_gram_solve_error > 5e-12 ||
+       resident_hessian_product_error > 5e-12 ||
+       resident_post_hessian_gram_solve_error > 5e-12 ||
        resident_score_error > 5e-12 ||
        resident_design_timings.resident_design_upload_count != 3 ||
        resident_design_timings.resident_design_upload_bytes !=
@@ -2447,6 +2482,7 @@ void run_conformance(Step1ComputeBackend& candidate) {
        resident_design_timings.resident_design_reuse_count !=
          static_cast<uint64_t>(
            3 + resident_solve_supported +
+             resident_hessian_product_supported +
              (resident_group_supported ? 3 : 0)) ||
        (resident_fold_supported &&
          resident_fold_timings.resident_design_reuse_count != 3))
@@ -2494,6 +2530,12 @@ void run_conformance(Step1ComputeBackend& candidate) {
                    resident_cached_gram_solve_supported
               << " cached_gram_solve_relative_error=" <<
                    resident_cached_gram_solve_error
+              << " hessian_product_supported=" <<
+                   resident_hessian_product_supported
+              << " hessian_product_relative_error=" <<
+                   resident_hessian_product_error
+              << " post_hessian_cached_gram_solve_relative_error=" <<
+                   resident_post_hessian_gram_solve_error
               << " crossproduct_relative_error=" << resident_score_error
               << " grouped_prediction_relative_error=" <<
                    resident_group_prediction_error

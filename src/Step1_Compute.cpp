@@ -435,6 +435,18 @@ bool Step1ComputeBackend::solve_cached_weighted_gram(
   return false;
 }
 
+bool Step1ComputeBackend::compute_cached_weighted_design_hessian_product(
+  const Eigen::Ref<const Eigen::VectorXd>& weights,
+  const Eigen::Ref<const Eigen::MatrixXd>& vectors,
+  Eigen::MatrixXd& products,
+  Step1ComputeTimings* timings) {
+  (void)weights;
+  (void)vectors;
+  (void)products;
+  (void)timings;
+  return false;
+}
+
 void Step1ComputeBackend::compute_cached_design_crossproduct(
   const Eigen::Ref<const Eigen::MatrixXd>& outcomes,
   Eigen::MatrixXd& crossproduct,
