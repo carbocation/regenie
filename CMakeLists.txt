@@ -136,6 +136,7 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/SKAT.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Models.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+  ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Newton_CG.cpp
   ${CMAKE_SOURCE_DIR}/src/Step1_Newton_CG.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Compute.cpp
   ${CMAKE_SOURCE_DIR}/src/Step2_Models.cpp

@@ -37,6 +37,7 @@
 #include "cox_firth.hpp"
 #include "Step1_Models.hpp"
 #include "Step1_Compute.hpp"
+#include "Step1_Level1_Newton_CG.hpp"
 #include "Step2_Models.hpp"
 #include "HLM.hpp"
 #include "Pheno.hpp"
@@ -76,6 +77,14 @@ bool step1_level1_path_newton_enabled() {
   if(std::string(value) == "1") return true;
   throw std::invalid_argument(
     "REGENIE_STEP1_LEVEL1_PATH_NEWTON must be '0' or '1'");
+}
+
+bool step1_level1_newton_cg_enabled() {
+  const char* value = std::getenv("REGENIE_STEP1_LEVEL1_NEWTON_CG");
+  if(!value || !*value || std::string(value) == "0") return false;
+  if(std::string(value) == "1") return true;
+  throw std::invalid_argument(
+    "REGENIE_STEP1_LEVEL1_NEWTON_CG must be '0' or '1'");
 }
 
 int step1_level1_l0_read_threads(const struct param* params) {
@@ -554,6 +563,7 @@ struct LogisticLevel1Profile {
   double cache_wall_ms = 0;
   double irls_wall_ms = 0;
   double path_newton_wall_ms = 0;
+  double newton_cg_wall_ms = 0;
   double validation_ms = 0;
   double prediction_cache_wall_ms = 0;
   double prediction_cache_write_ms = 0;
@@ -568,6 +578,13 @@ struct LogisticLevel1Profile {
   uint64_t path_newton_solves = 0;
   uint64_t path_newton_score_calls = 0;
   uint64_t path_newton_converged_models = 0;
+  uint64_t newton_cg_attempted_models = 0;
+  uint64_t newton_cg_accepted_steps = 0;
+  uint64_t newton_cg_converged_models = 0;
+  uint64_t newton_cg_hessian_product_calls = 0;
+  uint64_t newton_cg_preconditioner_calls = 0;
+  uint64_t newton_cg_prediction_calls = 0;
+  uint64_t newton_cg_score_calls = 0;
   uint64_t resident_design_phenotypes = 0;
 
   Step1ComputeTimings* backend_timings(bool enabled) {
@@ -598,6 +615,7 @@ struct LogisticLevel1Profile {
       << " cache_wall_ms=" << cache_wall_ms
       << " irls_wall_ms=" << irls_wall_ms
       << " path_newton_wall_ms=" << path_newton_wall_ms
+      << " newton_cg_wall_ms=" << newton_cg_wall_ms
       << " validation_ms=" << validation_ms
       << " prediction_cache_wall_ms=" << prediction_cache_wall_ms
       << " prediction_cache_write_ms=" << prediction_cache_write_ms
@@ -620,6 +638,18 @@ struct LogisticLevel1Profile {
       << " path_newton_score_calls=" << path_newton_score_calls
       << " path_newton_converged_models=" <<
            path_newton_converged_models
+      << " newton_cg_attempted_models=" <<
+           newton_cg_attempted_models
+      << " newton_cg_accepted_steps=" << newton_cg_accepted_steps
+      << " newton_cg_converged_models=" <<
+           newton_cg_converged_models
+      << " newton_cg_hessian_product_calls=" <<
+           newton_cg_hessian_product_calls
+      << " newton_cg_preconditioner_calls=" <<
+           newton_cg_preconditioner_calls
+      << " newton_cg_prediction_calls=" <<
+           newton_cg_prediction_calls
+      << " newton_cg_score_calls=" << newton_cg_score_calls
       << " upload_ms=" << backend.upload_ms
       << " gram_ms=" << backend.gram_ms
       << " crossproduct_ms=" << backend.crossproduct_ms
@@ -2427,7 +2457,9 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   LogisticLevel1Profile profile;
   Step1ComputeTimings* profile_timings =
     profile.backend_timings(params->profile_step1);
-  const bool use_path_newton = step1_level1_path_newton_enabled();
+  const bool use_newton_cg = step1_level1_newton_cg_enabled();
+  const bool use_path_newton =
+    step1_level1_path_newton_enabled() || use_newton_cg;
 
   int niter_cur;
   int ph_eff;
@@ -2542,7 +2574,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         // use warm starts (i.e. set final beta of previous ridge param 
         // as initial beta for current ridge param)
         betaold = betanew;
-        bool path_newton_converged = false;
+        bool warm_start_converged = false;
         if(use_path_newton && resident_design && j > 0) {
           const auto path_start =
             std::chrono::high_resolution_clock::now();
@@ -2557,13 +2589,13 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               etavec, pivec);
           betaold = path_result.accepted_coefficients;
           score = path_result.score;
-          path_newton_converged = path_result.converged;
+          warm_start_converged = path_result.converged;
           profile.path_newton_solves += path_result.solve_calls;
           profile.solve_calls += path_result.solve_calls;
           profile.prediction_calls += path_result.prediction_calls;
           profile.path_newton_score_calls += path_result.score_calls;
           profile.score_calls += path_result.score_calls;
-          if(path_newton_converged) {
+          if(warm_start_converged) {
             betanew = betaold;
             ++profile.path_newton_converged_models;
           }
@@ -2573,7 +2605,50 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
                 path_start).count();
         }
 
-        while(!path_newton_converged &&
+        if(use_newton_cg && resident_design && j > 0 &&
+           !warm_start_converged) {
+          const auto newton_cg_start =
+            std::chrono::high_resolution_clock::now();
+          ++profile.newton_cg_attempted_models;
+          const Step1Level1NewtonCgResult newton_cg_result =
+            run_step1_level1_newton_cg_corrections(
+              compute_backend, profile_timings, i, ph, params->cv_folds,
+              params->tau[ph](j), params->l1_ridge_tol,
+              params->numtol_eps, params->l1_ridge_eps,
+              l1->ridge_param_mult, betaold, fold_offsets,
+              l1->test_offset[ph], l1->test_pheno_raw[ph],
+              masked_in_folds, cached_predictions, cached_weights,
+              cached_score_outcome, etavec, pivec, wvec);
+          betaold = newton_cg_result.accepted_coefficients;
+          if(newton_cg_result.score.size() == score.size())
+            score = newton_cg_result.score;
+          profile.newton_cg_accepted_steps +=
+            newton_cg_result.accepted_steps;
+          profile.newton_cg_hessian_product_calls +=
+            newton_cg_result.hessian_product_calls;
+          profile.newton_cg_preconditioner_calls +=
+            newton_cg_result.preconditioner_calls;
+          profile.newton_cg_prediction_calls +=
+            newton_cg_result.prediction_calls;
+          profile.prediction_calls +=
+            newton_cg_result.prediction_calls;
+          profile.newton_cg_score_calls +=
+            newton_cg_result.score_calls;
+          profile.score_calls += newton_cg_result.score_calls;
+          profile.solve_calls +=
+            newton_cg_result.preconditioner_calls;
+          warm_start_converged = newton_cg_result.converged;
+          if(warm_start_converged) {
+            betanew = betaold;
+            ++profile.newton_cg_converged_models;
+          }
+          profile.newton_cg_wall_ms +=
+            std::chrono::duration<double, std::milli>(
+              std::chrono::high_resolution_clock::now() -
+                newton_cg_start).count();
+        }
+
+        while(!warm_start_converged &&
               niter_cur++ < params->niter_max_ridge){
           const auto iteration_start =
             std::chrono::high_resolution_clock::now();
