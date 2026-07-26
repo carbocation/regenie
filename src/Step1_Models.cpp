@@ -558,6 +558,7 @@ struct LogisticLevel1Profile {
   uint64_t irls_iterations = 0;
   uint64_t line_search_iterations = 0;
   uint64_t prediction_calls = 0;
+  uint64_t prediction_reuses = 0;
   uint64_t weighted_product_calls = 0;
   uint64_t score_calls = 0;
   uint64_t solve_calls = 0;
@@ -618,6 +619,7 @@ struct LogisticLevel1Profile {
       << " irls_iterations=" << irls_iterations
       << " line_search_iterations=" << line_search_iterations
       << " prediction_calls=" << prediction_calls
+      << " prediction_reuses=" << prediction_reuses
       << " weighted_product_calls=" << weighted_product_calls
       << " score_calls=" << score_calls
       << " solve_calls=" << solve_calls
@@ -749,6 +751,7 @@ struct ResidentLogisticLevel1Workspace {
 struct ResidentLogisticLevel1IterationResult {
   int line_search_iterations = 0;
   uint64_t prediction_calls = 0;
+  uint64_t prediction_reuses = 0;
   uint64_t weighted_product_calls = 0;
   uint64_t solve_calls = 0;
   uint64_t score_calls = 0;
@@ -760,7 +763,8 @@ run_resident_logistic_level1_iteration(
   const ResidentLogisticLevel1Problem& problem,
   ResidentLogisticLevel1Workspace& workspace,
   int held_out_fold, int ridge_parameter,
-  const ArrayXd& previous_coefficients) {
+  const ArrayXd& previous_coefficients,
+  bool previous_predictions_ready) {
 
   ResidentLogisticLevel1IterationResult result;
   const auto predict = [&] (const ArrayXd& coefficients) {
@@ -773,7 +777,10 @@ run_resident_logistic_level1_iteration(
 
   workspace.weights.setZero();
   workspace.working_outcome.setZero();
-  predict(previous_coefficients);
+  if(previous_predictions_ready)
+    ++result.prediction_reuses;
+  else
+    predict(previous_coefficients);
   for(int fold = 0; fold < problem.params.cv_folds; ++fold) {
     if(fold == held_out_fold) continue;
     const Eigen::Index start = problem.fold_offsets[fold];
@@ -2557,6 +2564,10 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
       // starting values for each trait
       betaold = betanew = ArrayXd::Zero(bs_l1);
+      // Ordinary resident IRLS finishes with cached_predictions evaluated at
+      // betanew. Experimental corrections can leave a rejected candidate in
+      // that buffer, so they conservatively invalidate this state below.
+      bool resident_predictions_match_beta = false;
 
       for(int j = 0; j < params->n_ridge_l1; ++j ) {
         if( l1->pheno_l1_not_converged(ph) ) break;
@@ -2567,6 +2578,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         betaold = betanew;
         bool warm_start_converged = false;
         if(use_path_newton && resident_design && j > 0) {
+          resident_predictions_match_beta = false;
           const auto path_start =
             std::chrono::high_resolution_clock::now();
           const Level1PathNewtonResult path_result =
@@ -2598,6 +2610,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
         if(use_newton_cg && resident_design && j > 0 &&
            !warm_start_converged) {
+          resident_predictions_match_beta = false;
           const auto newton_cg_start =
             std::chrono::high_resolution_clock::now();
           ++profile.newton_cg_attempted_models;
@@ -2685,10 +2698,12 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
             const ResidentLogisticLevel1IterationResult result =
               run_resident_logistic_level1_iteration(
-                resident_problem, resident_workspace, i, j, betaold);
+                resident_problem, resident_workspace, i, j, betaold,
+                resident_predictions_match_beta);
             current_line_search_iterations =
               result.line_search_iterations;
             profile.prediction_calls += result.prediction_calls;
+            profile.prediction_reuses += result.prediction_reuses;
             profile.weighted_product_calls +=
               result.weighted_product_calls;
             profile.solve_calls += result.solve_calls;
@@ -2700,6 +2715,7 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               l1->pheno_l1_not_converged(ph) = true;
               break;
             }
+            resident_predictions_match_beta = true;
 
           } else {
 
@@ -2832,7 +2848,12 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
         const auto validation_start =
           std::chrono::high_resolution_clock::now();
         if(resident_design) {
-          predict_resident(betanew);
+          if(resident_predictions_match_beta)
+            ++profile.prediction_reuses;
+          else {
+            predict_resident(betanew);
+            resident_predictions_match_beta = true;
+          }
           const Eigen::Index start = fold_offsets[i];
           const Eigen::Index count = fold_offsets[i + 1] - start;
           etatest = l1->test_offset[ph][i].array() +
