@@ -421,6 +421,27 @@ if(BUILD_TESTING)
       ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
   endif()
   add_test(NAME cox_firth COMMAND cox_firth_test)
+
+  add_executable(cox_ridge_test
+    ${CMAKE_SOURCE_DIR}/test/test_cox_ridge.cpp
+    ${CMAKE_SOURCE_DIR}/src/cox_ridge.cpp
+    ${CMAKE_SOURCE_DIR}/src/survival_data.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Compute.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Cox_Path_Newton.cpp
+    ${CMAKE_SOURCE_DIR}/src/Step1_Level1_Optimizer.cpp)
+  target_include_directories(cox_ridge_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${EXTERN_LIBS_PATH}/eigen-3.4.0/
+    ${BGEN_PATH}/3rd_party/boost_1_55_0/)
+  if(REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS)
+    target_include_directories(cox_ridge_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_INCLUDE_DIRS})
+  endif()
+  if(REGENIE_LINEAR_ALGEBRA_LIBRARIES)
+    target_link_libraries(cox_ridge_test PRIVATE
+      ${REGENIE_LINEAR_ALGEBRA_LIBRARIES})
+  endif()
+  add_test(NAME cox_ridge COMMAND cox_ridge_test)
 endif()
 
 # Boost IO
@@ -513,6 +534,7 @@ if(BUILD_TESTING)
   target_link_libraries(step1_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
   target_link_libraries(step2_compute_test PRIVATE ${GFORTRAN_LIBRARIES})
   target_link_libraries(cox_firth_test PRIVATE ${GFORTRAN_LIBRARIES})
+  target_link_libraries(cox_ridge_test PRIVATE ${GFORTRAN_LIBRARIES})
 endif()
 
 install(TARGETS regenie RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

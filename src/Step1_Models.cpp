@@ -671,7 +671,9 @@ struct LogisticLevel1Profile {
 };
 
 struct CoxLevel1Profile {
+  Step1Level1Optimizer optimizer = Step1Level1Optimizer::Irls;
   Step1ComputeTimings backend;
+  Step1CoxPathNewtonStats path_newton;
   double read_l0_ms = 0;
   double read_l0_wait_ms = 0;
   double check_l0_ms = 0;
@@ -704,6 +706,7 @@ struct CoxLevel1Profile {
     std::ostringstream profile;
     profile << std::fixed << std::setprecision(3)
       << "STEP1_PROFILE scope=level1_cox"
+      << " optimizer=" << step1_level1_optimizer_name(optimizer)
       << " wall_ms=" << wall_ms
       << " read_l0_ms=" << read_l0_ms
       << " read_l0_wait_ms=" << read_l0_wait_ms
@@ -729,6 +732,29 @@ struct CoxLevel1Profile {
            backend.resident_design_upload_bytes
       << " resident_design_reuses=" <<
         backend.resident_design_reuse_count
+      << " path_newton_attempted_models=" << path_newton.attempts
+      << " path_newton_solves=" << path_newton.correction_solves
+      << " path_newton_accepted_steps=" <<
+           path_newton.accepted_corrections
+      << " path_newton_converged_models=" <<
+           path_newton.converged_without_irls
+      << " path_newton_fallback_models=" << path_newton.fallbacks
+      << " path_newton_cached_gram_unavailable=" <<
+           path_newton.cached_gram_unavailable
+      << " path_newton_prediction_calls=" <<
+           path_newton.prediction_calls
+      << " path_newton_score_calls=" << path_newton.exact_score_calls
+      << " path_newton_halvings=" << path_newton.halvings
+      << " path_newton_rejected_nonfinite=" <<
+           path_newton.rejected_nonfinite
+      << " path_newton_rejected_non_descent=" <<
+           path_newton.rejected_non_descent
+      << " path_newton_rejected_objective=" <<
+           path_newton.rejected_objective
+      << " path_newton_rejected_score=" <<
+           path_newton.rejected_score
+      << " ordinary_backend_weighted_solves=" <<
+           path_newton.ordinary_weighted_solves
       << " upload_ms=" << backend.upload_ms
       << " gram_ms=" << backend.gram_ms
       << " crossproduct_ms=" << backend.crossproduct_ms
@@ -4159,6 +4185,9 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
   CoxLevel1Profile profile;
   Step1ComputeTimings* profile_timings =
     profile.backend_timings(params->profile_step1);
+  const Step1Level1Optimizer optimizer =
+    step1_level1_optimizer_from_environment();
+  profile.optimizer = optimizer;
   
   int ph_eff, l0_idx;
   int time_index, event_index;
@@ -4289,8 +4318,10 @@ void ridge_cox_level_1(struct in_files* files, struct param* params, struct phen
         std::chrono::high_resolution_clock::now() -
           fold_setup_start).count();
       const auto fit_start = std::chrono::high_resolution_clock::now();
-      cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true, compute_backend, resident_design, profile_timings);
+      cox_ridge_path coxRidgePath_fold(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask, params->n_ridge_l1, 1e-4, params->tau[time_index], params->niter_max_ridge, params->niter_max_line_search_ridge, params->l1_ridge_tol, true, compute_backend, resident_design, profile_timings, optimizer);
       coxRidgePath_fold.fit(survivalData_fold, l1->test_mat_conc[ph_eff], m_ests->offset_nullreg.col(time_index), fold_train_mask);
+      accumulate_step1_cox_path_newton_stats(
+        profile.path_newton, coxRidgePath_fold.path_newton_stats);
       profile.fit_ms += std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - fit_start).count();
 

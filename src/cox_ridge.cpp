@@ -81,12 +81,14 @@ cox_ridge::cox_ridge(const survival_data& survivalData, const Eigen::MatrixXd& X
     } else {
         _deviance(0) = null_deviance;
     }
+    _null_deviance = _deviance(0);
     _object(0) = _deviance(0) + lambda * (beta.array().pow(2).sum())/2;
 }
 
 void cox_ridge::reset(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const double& lambda_val, const Eigen::VectorXd& beta_init, const double& null_deviance) {
     // Reset the object's state based on the provided parameters
     converge = false;
+    _weighted_solve_count = 0;
 
     if (beta_init.size() > 0) {
         beta = beta_init;
@@ -110,7 +112,25 @@ void cox_ridge::reset(const survival_data& survivalData, const Eigen::MatrixXd& 
     } else {
         _deviance(0) = null_deviance;
     }
+    _null_deviance = _deviance(0);
     _object(0) = _deviance(0) + lambda * (beta.array().pow(2).sum())/2;
+}
+
+void cox_ridge::reset_from_path(
+    const survival_data& survivalData,
+    const Eigen::MatrixXd& Xmat,
+    const Eigen::VectorXd& offset_val,
+    const ArrayXb& mask,
+    double lambda_val,
+    const Eigen::VectorXd& beta_init,
+    double null_deviance,
+    double starting_deviance) {
+    reset(
+        survivalData, Xmat, offset_val, mask, lambda_val, beta_init,
+        null_deviance);
+    _deviance(0) = starting_deviance;
+    _object(0) = starting_deviance +
+        lambda * beta.squaredNorm() / 2;
 }
 
 void cox_ridge::coxGrad(const survival_data& survivalData) {
@@ -135,6 +155,43 @@ void cox_ridge::coxGrad(const survival_data& survivalData) {
     _diagHessian = survivalData.permute_mtx.transpose() * diag_hessian_order;
 }
 
+bool cox_ridge::exact_path_point(
+    const survival_data& survivalData,
+    const Eigen::MatrixXd& Xmat,
+    Step1CoxPathNewtonPoint& point) {
+    coxGrad(survivalData);
+    point.coefficients = beta;
+    point.linear_predictor = eta;
+    point.ordered_linear_predictor = eta_order;
+    point.unpenalized_score = step1_design_crossproduct(
+        _compute_backend, Xmat, _gradient, _resident_design, _timings);
+    const double loglik = _coxLoglik(survivalData);
+    point.negative_log_likelihood = -loglik;
+    point.deviance = _coxDevianceFromLoglik(survivalData, loglik);
+    return point.coefficients.allFinite() &&
+        point.linear_predictor.allFinite() &&
+        point.ordered_linear_predictor.allFinite() &&
+        point.unpenalized_score.allFinite() &&
+        std::isfinite(point.negative_log_likelihood) &&
+        std::isfinite(point.deviance);
+}
+
+void cox_ridge::install_path_point(
+    const Step1CoxPathNewtonPoint& point,
+    double lambda_val) {
+    beta = point.coefficients;
+    eta = point.linear_predictor;
+    eta_order = point.ordered_linear_predictor;
+    lambda = lambda_val;
+    converge = true;
+    _deviance.resize(1);
+    _object.resize(1);
+    _deviance(0) = point.deviance;
+    _object(0) = point.deviance +
+        lambda * beta.squaredNorm() / 2;
+    dev_ratio = 1 - point.deviance / _null_deviance;
+}
+
 double cox_ridge::_coxLoglik(const survival_data& survivalData) {
     Eigen::VectorXd rsk = cumulativeSum_reverse2(survivalData.w.array() * eta_order.array().exp());
 
@@ -144,7 +201,9 @@ double cox_ridge::_coxLoglik(const survival_data& survivalData) {
     return loglik_val;
 }
 
-double cox_ridge::_coxDeviance(const survival_data& survivalData) {
+double cox_ridge::_coxDevianceFromLoglik(
+    const survival_data& survivalData,
+    double loglik) {
     Eigen::VectorXd w_sub;
     if (survivalData.unique_time_indices.size() == survivalData.n_events) {
         // no tie
@@ -161,10 +220,12 @@ double cox_ridge::_coxDeviance(const survival_data& survivalData) {
         }
     }
     double lsat = -(w_sub.array() * (w_sub.array().log())).sum();
-    double loglik_val = _coxLoglik(survivalData);
+    return 2 * (lsat - loglik);
+}
 
-    double deviance = 2 * (lsat - loglik_val);
-    return deviance;
+double cox_ridge::_coxDeviance(const survival_data& survivalData) {
+    return _coxDevianceFromLoglik(
+        survivalData, _coxLoglik(survivalData));
 }
 
 void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask) {
@@ -203,6 +264,7 @@ void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
                     gram, crossproduct, ridge_parameter, penalty_multipliers,
                     solution, _timings);
             }
+            ++_weighted_solve_count;
             beta = solution.col(0);
             eta = mask.select(
                 step1_linear_prediction(_compute_backend, Xmat, beta,
@@ -262,7 +324,8 @@ void cox_ridge::fit(const survival_data& survivalData, const Eigen::MatrixXd& Xm
         _deviance.conservativeResize(break_pt);
         _object.conservativeResize(break_pt);
     }
-    dev_ratio = 1 - _deviance(_deviance.size() - 1) / _deviance(0);
+    dev_ratio =
+        1 - _deviance(_deviance.size() - 1) / _null_deviance;
 }
 
 Eigen::VectorXd cox_ridge::get_gradient() {
@@ -274,7 +337,7 @@ double cox_ridge::get_deviance() {
 }
 
 double cox_ridge::get_null_deviance() {
-    return _deviance(0);
+    return _null_deviance;
 }
 
 double cox_ridge::get_object() {
@@ -290,10 +353,11 @@ Eigen::VectorXd cox_ridge::get_deviance_all() {
 }
 
 
-cox_ridge_path::cox_ridge_path(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const int& nlambda, const double& lambda_min_max_ratio, const Eigen::VectorXd& lambda, const int& max_iter, const int& max_inner_iter, const double& tolerance, const bool& verbose_fit, Step1ComputeBackend* compute_backend, const bool& resident_design, Step1ComputeTimings* timings) {
+cox_ridge_path::cox_ridge_path(const survival_data& survivalData, const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& offset_val, const ArrayXb& mask, const int& nlambda, const double& lambda_min_max_ratio, const Eigen::VectorXd& lambda, const int& max_iter, const int& max_inner_iter, const double& tolerance, const bool& verbose_fit, Step1ComputeBackend* compute_backend, const bool& resident_design, Step1ComputeTimings* timings, Step1Level1Optimizer optimizer) {
     _compute_backend = compute_backend;
     _resident_design = resident_design;
     _timings = timings;
+    _optimizer = optimizer;
     int p = Xmat.cols();
     // set lambda_vec
     if (lambda.size() > 0) {
@@ -358,17 +422,91 @@ void cox_ridge_path::fit(const survival_data& survivalData, const Eigen::MatrixX
         _compute_backend, _resident_design, _timings);
     double nulldev_old = -999;
     Eigen::VectorXd beta_old(Xmat.cols());
+    // Both experimental Level 1 modes request the same safeguarded Cox
+    // continuation; Newton-CG remains specific to logistic Level 1.
+    const bool use_path_newton =
+        _optimizer != Step1Level1Optimizer::Irls &&
+        _compute_backend && _resident_design;
+    Step1CoxPathNewtonPoint exact_point;
+    bool exact_point_ready = false;
+    bool reusable_weighted_gram = false;
+    path_newton_stats = Step1CoxPathNewtonStats();
 
     for (int k = 0; k < _lambda_len; ++k) {
         ++break_pt;
+        bool completed_by_path_newton = false;
         if (k > 0) {
             cur_lambda = lambda_vec(k);
-            coxRidge.reset(survivalData, Xmat, offset_val, mask, cur_lambda, beta_old, nulldev_old);
+            if(use_path_newton && exact_point_ready &&
+               reusable_weighted_gram) {
+                const Eigen::VectorXd penalty_multipliers =
+                    Eigen::VectorXd::Ones(Xmat.cols());
+                const Step1CoxPathNewtonSolve solve =
+                    [&] (const Eigen::VectorXd& score, double penalty,
+                         Eigen::VectorXd& step) {
+                        const Eigen::MatrixXd right_hand_side = score;
+                        Eigen::VectorXd ridge_parameter(1);
+                        ridge_parameter(0) = penalty;
+                        Eigen::MatrixXd solution;
+                        if(!_compute_backend->solve_cached_weighted_gram(
+                             right_hand_side, ridge_parameter,
+                             penalty_multipliers, solution, _timings) ||
+                           solution.cols() != 1)
+                            return false;
+                        step = solution.col(0);
+                        return true;
+                    };
+                const Step1CoxPathNewtonEvaluate evaluate =
+                    [&] (const Eigen::VectorXd& coefficients,
+                         Step1CoxPathNewtonPoint& point) {
+                        cox_ridge candidate(
+                            survivalData, Xmat, offset_val, mask, cur_lambda,
+                            niter, mxitnr, tol, false, coefficients, nulldev_old,
+                            _compute_backend, _resident_design, _timings);
+                        return candidate.exact_path_point(
+                            survivalData, Xmat, point);
+                    };
+                const Step1CoxPathNewtonResult path_result =
+                    run_step1_cox_path_newton(
+                        exact_point, cur_lambda, tol, solve, evaluate);
+                Step1CoxPathNewtonStats result_stats = path_result.stats;
+                if(!path_result.converged)
+                    ++result_stats.fallbacks;
+                accumulate_step1_cox_path_newton_stats(
+                    path_newton_stats, result_stats);
+                exact_point = path_result.accepted_point;
+                exact_point_ready = true;
+                if(path_result.converged) {
+                    coxRidge.install_path_point(exact_point, cur_lambda);
+                    completed_by_path_newton = true;
+                } else {
+                    coxRidge.reset_from_path(
+                        survivalData, Xmat, offset_val, mask, cur_lambda,
+                        exact_point.coefficients, nulldev_old,
+                        exact_point.deviance);
+                }
+            } else {
+                coxRidge.reset(
+                    survivalData, Xmat, offset_val, mask, cur_lambda,
+                    beta_old, nulldev_old);
+            }
         }
         if (verbose) {
             std::cout << "lambda: " << cur_lambda << "\n";
         }
-        coxRidge.fit(survivalData, Xmat, offset_val, mask);
+        if(!completed_by_path_newton) {
+            coxRidge.fit(survivalData, Xmat, offset_val, mask);
+            path_newton_stats.ordinary_weighted_solves +=
+                coxRidge._weighted_solve_count;
+            if(use_path_newton) {
+                exact_point_ready = coxRidge.converge &&
+                    coxRidge.exact_path_point(
+                        survivalData, Xmat, exact_point);
+                reusable_weighted_gram =
+                    exact_point_ready &&
+                    coxRidge._weighted_solve_count > 0;
+            }
+        }
         std::cout << "converge: " << coxRidge.converge << "\n";
 
         if (coxRidge.converge == false) {
