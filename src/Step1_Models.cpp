@@ -206,7 +206,10 @@ class Level1DesignCacheScope {
   ~Level1DesignCacheScope() noexcept {
     if(!active_) return;
     try {
-      compute_backend_->release_cached_design();
+      if(persistent_)
+        compute_backend_->release_level1_design_cache();
+      else
+        compute_backend_->release_cached_design();
     } catch(...) {
     }
   }
@@ -234,17 +237,31 @@ class Level1DesignCacheScope {
     return active_;
   }
 
+  bool activate_persistent(Eigen::Index rows, Eigen::Index columns) {
+    if(active_)
+      throw std::logic_error("Step 1 Level 1 design cache is already active");
+    active_ = compute_backend_->activate_level1_design_cache(rows, columns);
+    persistent_ = active_;
+    if(!active_)
+      compute_backend_->release_level1_design_cache();
+    return active_;
+  }
+
   void release() {
     if(!active_) return;
     // Disarm before the explicit release so its exception behavior matches a
     // direct backend call; the destructor is fallback for other exits only.
     active_ = false;
-    compute_backend_->release_cached_design();
+    if(persistent_)
+      compute_backend_->release_level1_design_cache();
+    else
+      compute_backend_->release_cached_design();
   }
 
  private:
   Step1ComputeBackend* compute_backend_;
   bool active_ = false;
+  bool persistent_ = false;
 };
 
 template<typename Derived>
@@ -573,6 +590,7 @@ struct LogisticLevel1Profile {
   uint64_t newton_cg_prediction_calls = 0;
   uint64_t newton_cg_score_calls = 0;
   uint64_t resident_design_phenotypes = 0;
+  uint64_t persistent_level1_design_phenotypes = 0;
 
   Step1ComputeTimings* backend_timings(bool enabled) {
     return enabled ? &backend : nullptr;
@@ -610,6 +628,8 @@ struct LogisticLevel1Profile {
       << " prediction_cache_phenotypes=" << prediction_cache_phenotypes
       << " prediction_cache_bytes=" << prediction_cache_bytes
       << " resident_design_phenotypes=" << resident_design_phenotypes
+      << " persistent_level1_design_phenotypes=" <<
+           persistent_level1_design_phenotypes
       << " resident_design_uploads=" <<
         backend.resident_design_upload_count
       << " resident_design_upload_bytes=" <<
@@ -2493,8 +2513,20 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
       ph;
     int bs_l1 = params->total_n_block * params->n_ridge_l0;
 
-    // read in level 0 predictions from file
-    if(params->write_l0_pred)
+    Level1DesignCacheScope design_cache(compute_backend);
+    bool persistent_level1_design = false;
+    if(params->write_l0_pred && !use_l0_prefetch &&
+       !params->select_l0 && !params->within_sample_l0) {
+      const auto cache_start = std::chrono::high_resolution_clock::now();
+      persistent_level1_design = design_cache.activate_persistent(
+        params->n_samples, bs_l1);
+      profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - cache_start).count();
+    }
+
+    // Read Level 0 predictions unless Level 0 left this single-trait design
+    // resident on the same backend.
+    if(params->write_l0_pred && !persistent_level1_design)
       ph_eff = l0_reads.load(
         ph,
         phenotype_position + 1 < active_phenotypes.size() ?
@@ -2504,31 +2536,38 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
     profile.check_l0_ms += std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() - check_l0_start).count();
-    bs_l1 = kfold_level1_design_columns(
-      l1, ph_eff, params->cv_folds);
+    if(!persistent_level1_design)
+      bs_l1 = kfold_level1_design_columns(
+        l1, ph_eff, params->cv_folds);
 
     std::vector<Eigen::Index> fold_offsets(params->cv_folds + 1, 0);
     for(int fold = 0; fold < params->cv_folds; ++fold)
       fold_offsets[fold + 1] = fold_offsets[fold] +
-        l1->test_mat[ph_eff][fold].rows();
+        (persistent_level1_design ? params->cv_sizes(fold) :
+          l1->test_mat[ph_eff][fold].rows());
     const Eigen::Index total_rows = fold_offsets.back();
 
-    Level1DesignCacheScope design_cache(compute_backend);
-    bool resident_design = false;
+    bool resident_design = persistent_level1_design;
     if(!params->within_sample_l0) {
-      const auto cache_start = std::chrono::high_resolution_clock::now();
-      resident_design = design_cache.cache_partitions(
-        l1->test_mat[ph_eff], profile_timings);
-      profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::high_resolution_clock::now() - cache_start).count();
+      if(!resident_design) {
+        const auto cache_start = std::chrono::high_resolution_clock::now();
+        resident_design = design_cache.cache_partitions(
+          l1->test_mat[ph_eff], profile_timings);
+        profile.cache_wall_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - cache_start).count();
+      }
       if(resident_design) profile.resident_design_phenotypes++;
+      if(persistent_level1_design)
+        profile.persistent_level1_design_phenotypes++;
       if(params->profile_step1)
         sout << "\nSTEP1_LEVEL1_CACHE phenotype=" << ph + 1
              << " rows=" << total_rows
              << " columns=" << bs_l1
              << " bytes=" <<
                   static_cast<uint64_t>(total_rows) * bs_l1 * sizeof(double)
-             << " resident_design=" << resident_design << endl;
+             << " resident_design=" << resident_design
+             << " persistent_level1_design=" <<
+                  persistent_level1_design << endl;
     }
 
     VectorXd cached_predictions;

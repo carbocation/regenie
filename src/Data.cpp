@@ -1923,7 +1923,8 @@ void Data::level_0_calculations() {
   const Eigen::Index level1_design_columns =
     static_cast<Eigen::Index>(params.total_n_block) * params.n_ridge_l0;
   const bool cache_level1_design = params.write_l0_pred &&
-    params.n_pheno == 1 && params.trait_mode == 0 &&
+    params.n_pheno == 1 &&
+    (params.trait_mode == 0 || params.trait_mode == 1) &&
     !params.use_loocv && !params.test_l0 && !params.select_l0 &&
     !level0_pipeline_enabled &&
     step1_compute_backend->initialize_level1_design_cache(

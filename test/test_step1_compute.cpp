@@ -1347,6 +1347,34 @@ void check_persistent_level1_design_cache(
     throw std::runtime_error(
       "persistent Level 1 design cache conformance tolerance exceeded");
 
+  const uint64_t upload_count_before_reactivation =
+    timings.resident_design_upload_count;
+  const uint64_t upload_bytes_before_reactivation =
+    timings.resident_design_upload_bytes;
+  candidate.release_cached_design();
+  bool rejected_inactive_design = false;
+  try {
+    candidate.predict_cached_design(prediction_coefficients, predictions);
+  } catch(const std::invalid_argument&) {
+    rejected_inactive_design = true;
+  }
+  if(!rejected_inactive_design ||
+     candidate.activate_level1_design_cache(rows + 1, features) ||
+     !candidate.activate_level1_design_cache(rows, features))
+    throw std::runtime_error(
+      "persistent Level 1 design cache did not reactivate safely");
+  candidate.predict_cached_design(
+    prediction_coefficients, predictions, &timings);
+  const double reactivated_prediction_error = relative_error(
+    predictions, design * prediction_coefficients);
+  if(reactivated_prediction_error > 5e-12 ||
+     timings.resident_design_upload_count !=
+       upload_count_before_reactivation ||
+     timings.resident_design_upload_bytes !=
+       upload_bytes_before_reactivation)
+    throw std::runtime_error(
+      "persistent Level 1 design reactivation changed data or uploads");
+
   candidate.release_level1_design_cache();
   if(candidate.ridge_predict_cached_preprocessed_systems(
        fold_starts, fold_sizes, ridge_parameters,
@@ -1369,6 +1397,8 @@ void check_persistent_level1_design_cache(
             << " prediction_relative_error=" << direct_prediction_error
             << " fold_prediction_relative_error=" << fold_prediction_error
             << " fold_coefficient_relative_error=" << fold_coefficient_error
+            << " reactivated_prediction_relative_error=" <<
+              reactivated_prediction_error
             << " upload_bytes=" << timings.resident_design_upload_bytes
             << " status=PASS\n";
 }
