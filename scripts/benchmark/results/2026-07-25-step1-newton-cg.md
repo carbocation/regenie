@@ -9,10 +9,16 @@ with:
 REGENIE_STEP1_LEVEL1_OPTIMIZER=newton-cg regenie ...
 ```
 
-Enabling Newton-CG also enables the existing path-Newton warm starts. The route
-is currently limited to resident-CUDA Level 1 logistic models after the first
-ridge parameter. It does not affect quantitative, count, survival, CPU, or
-non-resident paths.
+At the time of this experiment, enabling Newton-CG also enabled the existing
+path-Newton warm starts and affected only resident-CUDA Level 1 logistic
+models after the first ridge parameter. It did not affect quantitative,
+count, survival, CPU, or non-resident paths at the revision benchmarked here.
+
+As of `3eb5843`, the same selector also controls safeguarded Cox path
+continuation. Both accelerated values select that same Cox route; Newton-CG
+itself remains logistic-specific. See
+[`2026-07-26-step1-priority234.md`](2026-07-26-step1-priority234.md) for its
+separate performance and downstream-sensitivity assessment.
 
 ## Research question
 

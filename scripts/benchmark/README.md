@@ -9,6 +9,7 @@ REGENIE v4.1.2. Start with the report for the stage you plan to run:
 | [CUDA Step 1 refactor cross-model gate](results/2026-07-24-step1-cuda-refactor-gate.md) | A100; N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Refactor revision `340677f3` had no regression across all three models, flat backend compute timings, zero fallbacks, and 24/24 byte-identical LOCO files |
 | [CUDA Step 1 maintainability-refactor gate](results/2026-07-24-step1-maintainability-refactor.md) | N2 CPU validation and A100 N=500,000; 700,000 model-fitting variants; P=8 quantitative, binary, and survival traits | Final Stage 1 revision `99f1152d` preserved upstream-origin numerical paths, changed end-to-end time by -0.94% to +0.17%, and produced 24/24 byte-identical LOCO files |
 | [Level 1 Newton-CG experiment](results/2026-07-25-step1-newton-cg.md) | N2 validation and A100 N=500,000; 700,000 model-fitting variants; P=8 binary traits | Bounded Newton-CG reduced nonlinear-solver work by 22.6% but warm Level 1 wall time by only 2.2%; retained behind the unified experimental optimizer selector |
+| [Stage 1 priority 2-4 assessment](results/2026-07-26-step1-priority234.md) | N2/A100 validation; N=500,000; 700,000 model-fitting variants; binary P=1/P=8 and survival P=8 | Prediction reuse and the P=1 resident handoff are byte-exact; Cox path continuation is a 1.765x Level 1 opt-in with documented cutoff-level Stage 2 sensitivity |
 | [Stage 2 benchmark](results/2026-07-20-step2.md) | Current CPU revision `3ab5fbb` versus upstream v4.1.2 at N=50,000/N=500,000 and P=8/P=32; quantitative dispatch checks from N=5,000 to N=500,000; best measured CUDA placement evidence; production projection for 100 million Stage 2 variants tested | At N=500,000 and P=32 with 0-10% missingness, current processes 848.2 quantitative, 792.7 binary, and 524.9 survival variants/s; CPU chromosome fan-out remains the recommended production placement |
 | [Stage 2 maintainability-refactor gate](results/2026-07-24-step2-maintainability-refactor.md) | N2 release/regression validation; matched N=500,000, P=8 quantitative, binary, and survival CPU A/B; A100 CUDA conformance and integration | Final revision `1f2352d` produced 48/48 byte-identical N2 A/B pairs and 48/48 byte-identical CPU/CUDA/auto integration outputs, changed CPU wall time by -1.80% to -0.05%, and passed build-isolation and sanitizer gates |
 
@@ -48,9 +49,11 @@ configuration, never a transient cloud instance name.
 
 Use repeated `--env NAME=VALUE` options for non-secret experimental modes
 instead of setting variables outside the wrapper. The wrapper records them in
-`command.txt`, `metadata.tsv`, and `environment.tsv`. Logistic Level 1
+`command.txt`, `metadata.tsv`, and `environment.tsv`. Nonlinear Level 1
 comparisons should select exactly one of `irls`, `path-newton`, or `newton-cg`
-through `REGENIE_STEP1_LEVEL1_OPTIMIZER`.
+through `REGENIE_STEP1_LEVEL1_OPTIMIZER`. For Cox models, both accelerated
+values select the same path-continuation route; Newton-CG remains
+logistic-specific.
 
 For optimized x86 measurements, configure with `MKLROOT` and verify that
 `binary_libraries.txt` links oneMKL. A BLAS mismatch can invalidate a CPU
@@ -111,6 +114,11 @@ Stage 1:
   bounded Newton-CG Level 1 experiment at N=500,000, 700,000 model-fitting
   variants, and P=8, including N2/A100 validation and the matched path-Newton
   comparison.
+- [`results/2026-07-26-step1-priority234.md`](results/2026-07-26-step1-priority234.md) and
+  [`TSV`](results/2026-07-26-step1-priority234.tsv) — resident logistic
+  prediction reuse, the single-trait binary Level 0-to-Level 1 design
+  handoff, and opt-in Cox path continuation, including a focused downstream
+  Stage 2 sensitivity audit.
 - [`results/2026-07-23-step1-pinned-download.md`](results/2026-07-23-step1-pinned-download.md)
   and [`TSV`](results/2026-07-23-step1-pinned-download.tsv) — unconditional,
   byte-exact CUDA Level 0 download optimization, including the quantitative,

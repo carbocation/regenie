@@ -1,0 +1,12 @@
+experiment	route	revision	system	backend	samples	variants	traits	model	scope	level1_s	process_wall_s	max_rss_kb	output_assessment	decision	notes
+priority2_prediction_reuse	control_1	f55bdd2d4b8c	gcp-a100-sxm4-40gb	cuda	500000	700000	8	binary	level1_replay	284.706289	304.90	29042692	matched_candidate_8_of_8_byte_identical	control	1216 prediction evaluations
+priority2_prediction_reuse	candidate	68030b764dad	gcp-a100-sxm4-40gb	cuda	500000	700000	8	binary	level1_replay	290.737543	311.06	29042488	8_of_8_byte_identical	retain_unconditionally	548 prediction evaluations plus 668 exact reuses
+priority2_prediction_reuse	control_2	f55bdd2d4b8c	gcp-a100-sxm4-40gb	cuda	500000	700000	8	binary	level1_replay	298.330997	318.72	29042532	matched_candidate_8_of_8_byte_identical	control	Reversed-order storage-sensitive control
+priority3_binary_handoff	control_1	a23ef2934de0	gcp-a100-sxm4-40gb	cuda	500000	700000	1	binary	full_stage1	41.218129	159.91	14911648	matched_sha256	control	Valid rerun after setup-only cache-directory error
+priority3_binary_handoff	candidate	68030b764dad	gcp-a100-sxm4-40gb	cuda	500000	700000	1	binary	full_stage1	30.892305	151.00	1172144	byte_identical	retain_unconditionally	Persistent Level0-to-Level1 design; GPU peak 32124 MiB
+priority3_binary_handoff	control_2	a23ef2934de0	gcp-a100-sxm4-40gb	cuda	500000	700000	1	binary	full_stage1	41.518672	160.02	14915136	matched_sha256	control	Five Level1 uploads totaling 14.22 GB
+priority4_cox_path	irls	68030b764dad	gcp-a100-sxm4-40gb	cuda	500000	700000	8	survival	level1_replay	248.254770	271.37	29521632	reference_default	default	337 ordinary weighted solves
+priority4_cox_path	path-newton	68030b764dad	gcp-a100-sxm4-40gb	cuda	500000	700000	8	survival	level1_replay	140.667694	163.86	NA	non_byte_identical	retain_experimental	111 accepted path solves; 160 of 160 later-lambda models converged
+priority4_cox_path	newton-cg	68030b764dad	gcp-a100-sxm4-40gb	cuda	500000	700000	8	survival	level1_replay	139.494276	162.23	NA	byte_identical_to_cox_path	retain_experimental	Same Cox path route as path-newton; no Cox Newton-CG
+priority4_stage2_audit	irls_predictions	68030b764dad	gcp-a100-host-cpu	cpu	500000	50000	1	survival	stage2	NA	48.23	4692780	reference_default	numerical_gate	50000 tests; no ignored corrected or failed variants
+priority4_stage2_audit	path_predictions	68030b764dad	gcp-a100-host-cpu	cpu	500000	50000	1	survival	stage2	NA	44.48	4690632	top100_and_genomewide_sets_exact_boundary_differences	retain_experimental	Top1000 overlap 999; one p_le_1e-5 crossing; no strong-signal sign flips
