@@ -1,6 +1,7 @@
 /* Deterministic conformance and benchmark driver for Step 1 backends. */
 
 #include "Step1_Compute.hpp"
+#include "Step1_Cox_Path_Newton.hpp"
 #include "Step1_Level1_Optimizer.hpp"
 #include "Step1_Newton_CG.hpp"
 
@@ -227,6 +228,211 @@ void check_level1_optimizer() {
 
   std::cout
     << "STEP1_BACKEND_TEST case=level1_optimizer status=PASS\n";
+}
+
+Step1CoxPathNewtonPoint quadratic_cox_path_point(
+  const Eigen::VectorXd& coefficients,
+  const Eigen::MatrixXd& hessian,
+  const Eigen::VectorXd& target) {
+
+  Step1CoxPathNewtonPoint point;
+  point.coefficients = coefficients;
+  point.linear_predictor = coefficients;
+  point.ordered_linear_predictor = coefficients.reverse();
+  const Eigen::VectorXd difference = coefficients - target;
+  point.unpenalized_score = -hessian * difference;
+  point.negative_log_likelihood =
+    0.5 * difference.dot(hessian * difference);
+  point.deviance = 2 * point.negative_log_likelihood;
+  return point;
+}
+
+void check_cox_path_newton() {
+  Eigen::MatrixXd hessian = Eigen::MatrixXd::Zero(3, 3);
+  hessian.diagonal() << 2.0, 3.0, 5.0;
+  const Eigen::VectorXd target =
+    (Eigen::VectorXd(3) << 1.0, -0.5, 0.25).finished();
+  const Eigen::VectorXd initial = Eigen::VectorXd::Zero(3);
+  const double penalty = 0.4;
+  const Step1CoxPathNewtonPoint initial_point =
+    quadratic_cox_path_point(initial, hessian, target);
+  const Step1CoxPathNewtonEvaluate evaluate =
+    [&] (const Eigen::VectorXd& coefficients,
+         Step1CoxPathNewtonPoint& point) {
+      point = quadratic_cox_path_point(coefficients, hessian, target);
+      return true;
+    };
+  const Step1CoxPathNewtonSolve exact_solve =
+    [&] (const Eigen::VectorXd& score, double current_penalty,
+         Eigen::VectorXd& step) {
+      Eigen::MatrixXd system = hessian;
+      system.diagonal().array() += current_penalty;
+      step = system.ldlt().solve(score);
+      return true;
+    };
+
+  const Step1CoxPathNewtonResult exact =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, exact_solve, evaluate);
+  Eigen::MatrixXd penalized_hessian = hessian;
+  penalized_hessian.diagonal().array() += penalty;
+  const Eigen::VectorXd expected =
+    penalized_hessian.ldlt().solve(hessian * target);
+  if(!exact.converged ||
+     (exact.accepted_point.coefficients - expected).norm() > 1e-12 ||
+     exact.stats.correction_solves != 1 ||
+     exact.stats.accepted_corrections != 1 ||
+     exact.stats.prediction_calls != 1 ||
+     exact.stats.exact_score_calls != 1)
+    throw std::runtime_error(
+      "Cox path-Newton exact correction did not converge");
+
+  const Step1CoxPathNewtonSolve doubled_solve =
+    [&] (const Eigen::VectorXd& score, double current_penalty,
+         Eigen::VectorXd& step) {
+      Eigen::MatrixXd system = hessian;
+      system.diagonal().array() += current_penalty;
+      step = 2 * system.ldlt().solve(score);
+      return true;
+    };
+  const Step1CoxPathNewtonResult halved =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, doubled_solve, evaluate);
+  if(!halved.converged ||
+     (halved.accepted_point.coefficients - expected).norm() > 1e-12 ||
+     halved.stats.halvings != 1 ||
+     halved.stats.rejected_score != 1 ||
+     halved.stats.accepted_corrections != 1)
+    throw std::runtime_error(
+      "Cox path-Newton did not safeguard an oversized correction");
+
+  const Step1CoxPathNewtonEvaluate reject_all =
+    [] (const Eigen::VectorXd&, Step1CoxPathNewtonPoint&) {
+      return false;
+    };
+  const Step1CoxPathNewtonResult rejected =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, exact_solve, reject_all);
+  if(rejected.converged ||
+     (rejected.accepted_point.coefficients - initial).norm() != 0 ||
+     rejected.stats.prediction_calls != 5 ||
+     rejected.stats.halvings != 4 ||
+     rejected.stats.rejected_nonfinite != 5)
+    throw std::runtime_error(
+      "Cox path-Newton mutated state after rejected candidates");
+
+  const Step1CoxPathNewtonSolve unavailable_solve =
+    [] (const Eigen::VectorXd&, double, Eigen::VectorXd&) {
+      return false;
+    };
+  const Step1CoxPathNewtonResult unavailable =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, unavailable_solve, evaluate);
+  if(unavailable.converged || unavailable.solver_supported ||
+     unavailable.stats.cached_gram_unavailable != 1 ||
+     unavailable.stats.prediction_calls != 0 ||
+     (unavailable.accepted_point.coefficients - initial).norm() != 0)
+    throw std::runtime_error(
+      "Cox path-Newton did not preserve fallback state");
+
+  const Step1CoxPathNewtonEvaluate stale_evaluate =
+    [&] (const Eigen::VectorXd&, Step1CoxPathNewtonPoint& point) {
+      point = initial_point;
+      return true;
+    };
+  const Step1CoxPathNewtonResult stale =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, exact_solve, stale_evaluate);
+  if(stale.converged || stale.stats.rejected_nonfinite != 5 ||
+     (stale.accepted_point.coefficients - initial).norm() != 0)
+    throw std::runtime_error(
+      "Cox path-Newton accepted stale evaluator coefficients");
+
+  const Step1CoxPathNewtonEvaluate truncated_evaluate =
+    [&] (const Eigen::VectorXd& coefficients,
+         Step1CoxPathNewtonPoint& point) {
+      point = quadratic_cox_path_point(coefficients, hessian, target);
+      point.linear_predictor.conservativeResize(2);
+      return true;
+    };
+  const Step1CoxPathNewtonResult truncated =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, exact_solve,
+      truncated_evaluate);
+  if(truncated.converged ||
+     truncated.stats.rejected_nonfinite != 5 ||
+     (truncated.accepted_point.coefficients - initial).norm() != 0)
+    throw std::runtime_error(
+      "Cox path-Newton accepted malformed predictor state");
+
+  const Step1CoxPathNewtonEvaluate worse_objective =
+    [&] (const Eigen::VectorXd& coefficients,
+         Step1CoxPathNewtonPoint& point) {
+      point = quadratic_cox_path_point(coefficients, hessian, target);
+      point.negative_log_likelihood += 100;
+      return true;
+    };
+  const Step1CoxPathNewtonResult objective_rejected =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, exact_solve, worse_objective);
+  if(objective_rejected.converged ||
+     objective_rejected.stats.rejected_objective != 5 ||
+     (objective_rejected.accepted_point.coefficients - initial).norm() != 0)
+    throw std::runtime_error(
+      "Cox path-Newton accepted a worse penalized objective");
+
+  const Step1CoxPathNewtonSolve non_descent_solve =
+    [] (const Eigen::VectorXd& score, double, Eigen::VectorXd& step) {
+      step = -score;
+      return true;
+    };
+  const Step1CoxPathNewtonResult non_descent =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 1e-12, non_descent_solve, evaluate);
+  if(non_descent.converged ||
+     non_descent.stats.rejected_non_descent != 1 ||
+     non_descent.stats.prediction_calls != 0)
+    throw std::runtime_error(
+      "Cox path-Newton evaluated a non-descent correction");
+
+  const Step1CoxPathNewtonSolve half_solve =
+    [&] (const Eigen::VectorXd& score, double current_penalty,
+         Eigen::VectorXd& step) {
+      Eigen::MatrixXd system = hessian;
+      system.diagonal().array() += current_penalty;
+      step = 0.5 * system.ldlt().solve(score);
+      return true;
+    };
+  const Step1CoxPathNewtonResult bounded =
+    run_step1_cox_path_newton(
+      initial_point, penalty, 0, half_solve, evaluate);
+  if(bounded.converged ||
+     bounded.stats.correction_solves != 4 ||
+     bounded.stats.accepted_corrections != 4)
+    throw std::runtime_error(
+      "Cox path-Newton exceeded its correction bound");
+
+  Step1CoxPathNewtonPoint stationary = initial_point;
+  stationary.unpenalized_score.setZero();
+  const Step1CoxPathNewtonResult initially_converged =
+    run_step1_cox_path_newton(
+      stationary, 0, 0, unavailable_solve, reject_all);
+  if(!initially_converged.converged ||
+     initially_converged.stats.correction_solves != 0 ||
+     initially_converged.stats.prediction_calls != 0)
+    throw std::runtime_error(
+      "Cox path-Newton did not recognize an exact stationary point");
+
+  Step1CoxPathNewtonStats totals;
+  accumulate_step1_cox_path_newton_stats(totals, exact.stats);
+  accumulate_step1_cox_path_newton_stats(totals, halved.stats);
+  if(totals.attempts != 2 || totals.accepted_corrections != 2 ||
+     totals.converged_without_irls != 2)
+    throw std::runtime_error(
+      "Cox path-Newton statistics did not accumulate");
+
+  std::cout
+    << "STEP1_BACKEND_TEST case=cox_path_newton status=PASS\n";
 }
 
 #ifdef WITH_CUDA
@@ -3121,6 +3327,7 @@ int main(int argc, char** argv) {
     check_static_input_cache_state();
     check_newton_cg();
     check_level1_optimizer();
+    check_cox_path_newton();
     std::unique_ptr<Step1ComputeBackend> backend =
       make_step1_compute_backend(options.backend, options.device);
     std::cout << "STEP1_BACKEND_TEST backend=" << backend->name()
