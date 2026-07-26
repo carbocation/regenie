@@ -280,7 +280,8 @@ cmake -S "${source_dir}" -B "${cmake_build_dir}" \
   "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=${cpu_architecture} -mtune=${cpu_tune}"
 build_targets=(regenie)
 if (( run_tests == 1 )); then
-  build_targets+=(step1_compute_test step2_compute_test cox_firth_test)
+  build_targets+=(
+    step1_compute_test step2_compute_test cox_firth_test cox_ridge_test)
 fi
 cmake --build "${cmake_build_dir}" \
   --target "${build_targets[@]}" \
