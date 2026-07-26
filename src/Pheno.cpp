@@ -1006,6 +1006,13 @@ void extract_interaction_snp(struct param* params, struct in_files* files, struc
   if(params->interaction_file) {// from external file
     extract_from_genofile("interaction", Gcov.matrix(), mean_impute, ind_in_cov_and_geno, filters, files, params, sout);
   } else { // from input file
+#ifdef REGENIE_USE_PGEN_RANS
+    if(gblock->rans_pgen_reader)
+      read_snp_rans_pgen(
+        mean_impute, params->interaction_snp_offset, Gcov,
+        ind_in_cov_and_geno, *gblock->rans_pgen_reader, true);
+    else
+#endif
     read_snp(mean_impute, params->interaction_snp_offset, Gcov, ind_in_cov_and_geno, filters->ind_ignore, files, gblock->pgr, params, true);
     /*
        cerr << params->interaction_snp_offset << " " << ind_in_cov_and_geno.count() <<  "\n\n"
@@ -1041,8 +1048,19 @@ void extract_condition_snps(struct param* params, struct in_files* files, struct
 
     sout << "    +conditioning on variants in [" << files->condition_snps_list << "] n_used = " << ncov_snps << endl;
 
-    for (itr = filters->condition_snp_names.begin(); itr != filters->condition_snp_names.end(); ++itr, count++) 
-      read_snp(mean_impute, itr->second, Gcov.col(count).array(), ind_in_cov_and_geno, filters->ind_ignore, files, gblock->pgr, params, true);
+#ifdef REGENIE_USE_PGEN_RANS
+    if(gblock->rans_pgen_reader)
+      read_snps_rans_pgen(
+        mean_impute, filters->condition_snp_names, Gcov,
+        ind_in_cov_and_geno, *gblock->rans_pgen_reader);
+    else
+#endif
+      for (itr = filters->condition_snp_names.begin();
+           itr != filters->condition_snp_names.end(); ++itr, count++)
+        read_snp(
+          mean_impute, itr->second, Gcov.col(count).array(),
+          ind_in_cov_and_geno, filters->ind_ignore, files,
+          gblock->pgr, params, true);
 
   }
 

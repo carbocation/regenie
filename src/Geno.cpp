@@ -32,6 +32,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -45,6 +46,16 @@ using namespace Eigen;
 using namespace boost;
 
 namespace {
+
+#ifdef REGENIE_USE_PGEN_RANS
+bool is_conditional_rans_pgen(const string& filename) {
+  ifstream input(filename.c_str(), ios::binary);
+  unsigned char header[3] = {};
+  if(!input.read(reinterpret_cast<char*>(header), sizeof(header)))
+    throw std::runtime_error("could not read PGEN header: " + filename);
+  return header[0] == 0x6c && header[1] == 0x1b && header[2] == 0x80;
+}
+#endif
 
 #if defined(WITH_LIBDEFLATE)
 class ThreadLocalLibdeflateDecompressor {
@@ -1362,7 +1373,6 @@ void prep_pgen(struct in_files const* files, struct filter const* filters, struc
 
   // need to know maximum block size before loading pgen
   fname = files->pgen_prefix + ".pgen";
-  sout << left << std::setw(20) << " * pgen" << ": [" << fname << "] " << endl;
 
   // set subset when samples have been excluded from analysis
   if( filters->ind_in_analysis.size() < gblock->ns ){
@@ -1372,6 +1382,41 @@ void prep_pgen(struct in_files const* files, struct filter const* filters, struc
         subset_indices_1based.push_back(i+1);
   }
 
+#ifdef REGENIE_USE_PGEN_RANS
+  if(is_conditional_rans_pgen(fname)) {
+    sout << left << std::setw(20) << " * pgen (rans)" << ": ["
+         << fname << "] " << endl;
+    gblock->rans_pgen_reader.reset(new pgen_rans::PackedVariantReader());
+    string error;
+    if(!gblock->rans_pgen_reader->Open(
+         fname, std::max(1, params->threads), &error))
+      throw std::runtime_error(
+        "could not open conditional-rANS PGEN file: " + error);
+    if(gblock->rans_pgen_reader->raw_sample_ct() != gblock->ns)
+      throw "number of samples in pgen file and psam file don't match.";
+    if(gblock->rans_pgen_reader->variant_ct() != gblock->nv)
+      throw "number of variants in pgen file and pvar file don't match.";
+    if(gblock->rans_pgen_reader->max_allele_ct() != 2)
+      throw "only bi-allelic conditional-rANS PGEN variants are accepted.";
+    if(!subset_indices_1based.empty()) {
+      vector<uint32_t> subset_indices;
+      subset_indices.reserve(subset_indices_1based.size());
+      for(const int index : subset_indices_1based)
+        subset_indices.push_back(static_cast<uint32_t>(index - 1));
+      if(!gblock->rans_pgen_reader->SetSampleSubset(
+           subset_indices.data(), subset_indices.size(), &error))
+        throw std::runtime_error(
+          "could not configure conditional-rANS PGEN sample subset: " +
+          error);
+    }
+    if(gblock->rans_pgen_reader->sample_ct() != params->n_samples)
+      throw "conditional-rANS PGEN sample subset does not match the analyzed samples.";
+    params->dosage_mode = false;
+    return;
+  }
+#endif
+
+  sout << left << std::setw(20) << " * pgen" << ": [" << fname << "] " << endl;
   gblock->pgr.Load(fname, gblock->ns, subset_indices_1based, params->threads);
   pgen_samples = gblock->pgr.GetRawSampleCt();
   pgen_variants = gblock->pgr.GetVariantCt();
@@ -1388,7 +1433,9 @@ void prep_pgen(struct in_files const* files, struct filter const* filters, struc
 
 }
 
-void prep_pgen(uint32_t& nsamples, uint32_t& nvars, struct ext_geno_info& ginfo, geno_file_info* ext_file_info){
+void prep_pgen(uint32_t& nsamples, uint32_t& nvars,
+  struct ext_geno_info& ginfo, geno_file_info* ext_file_info,
+  struct param* params) {
 
   vector<int> subset_indices_1based;
   string fname = ext_file_info->file + ".pgen";
@@ -1398,6 +1445,39 @@ void prep_pgen(uint32_t& nsamples, uint32_t& nvars, struct ext_geno_info& ginfo,
     for(size_t i = 0; i < nsamples; i++)
       if(ginfo.sample_keep(i))
         subset_indices_1based.push_back(i+1);
+
+#ifdef REGENIE_USE_PGEN_RANS
+  if(is_conditional_rans_pgen(fname)) {
+    ginfo.rans_pgen_reader.reset(new pgen_rans::PackedVariantReader());
+    string error;
+    if(!ginfo.rans_pgen_reader->Open(
+         fname, std::max(1, params->threads), &error))
+      throw std::runtime_error(
+        "could not open conditional-rANS PGEN file: " + error);
+    if(ginfo.rans_pgen_reader->raw_sample_ct() != nsamples)
+      throw "number of samples in pgen file and psam file don't match.";
+    if(ginfo.rans_pgen_reader->variant_ct() != nvars)
+      throw "number of variants in pgen file and pvar file don't match.";
+    if(ginfo.rans_pgen_reader->max_allele_ct() != 2)
+      throw "only bi-allelic conditional-rANS PGEN variants are accepted.";
+    if(!subset_indices_1based.empty()) {
+      vector<uint32_t> subset_indices;
+      subset_indices.reserve(subset_indices_1based.size());
+      for(const int index : subset_indices_1based)
+        subset_indices.push_back(static_cast<uint32_t>(index - 1));
+      if(!ginfo.rans_pgen_reader->SetSampleSubset(
+           subset_indices.data(), subset_indices.size(), &error))
+        throw std::runtime_error(
+          "could not configure conditional-rANS PGEN sample subset: " +
+          error);
+    }
+    if(ginfo.rans_pgen_reader->sample_ct() !=
+       static_cast<uint32_t>(ginfo.sample_keep.count()))
+      throw "conditional-rANS PGEN sample subset does not match the analyzed samples.";
+    ginfo.dosage_mode = false;
+    return;
+  }
+#endif
 
   ginfo.pgr.Load(fname, nsamples, subset_indices_1based, 1);
   if(ginfo.pgr.GetRawSampleCt() != nsamples)
@@ -1409,6 +1489,67 @@ void prep_pgen(uint32_t& nsamples, uint32_t& nvars, struct ext_geno_info& ginfo,
 
   ginfo.dosage_mode = ginfo.pgr.DosagePresent();
 }
+
+#ifdef REGENIE_USE_PGEN_RANS
+void readRansPGENPackedVariants(
+  vector<uint64> const& variant_offsets,
+  pgen_rans::PackedVariantReader& reader,
+  vector<unsigned char>& packed_hardcalls,
+  size_t& packed_stride_bytes,
+  pgen_rans::PackedReadStats* stats,
+  string const& context) {
+
+  packed_stride_bytes = reader.packed_variant_byte_ct();
+  if(variant_offsets.empty()) {
+    packed_hardcalls.clear();
+    return;
+  }
+  if(variant_offsets.size() > std::numeric_limits<uint32_t>::max())
+    throw std::runtime_error(context + " request count exceeds API limits");
+  if(packed_stride_bytes > 0 &&
+     variant_offsets.size() >
+       std::numeric_limits<size_t>::max() / packed_stride_bytes)
+    throw std::runtime_error(context + " packed output exceeds platform limits");
+
+  vector<uint32_t> variants;
+  variants.reserve(variant_offsets.size());
+  for(const uint64 offset : variant_offsets) {
+    if(offset >= reader.variant_ct())
+      throw std::runtime_error(
+        context + " request contains an out-of-range variant");
+    variants.push_back(static_cast<uint32_t>(offset));
+  }
+  packed_hardcalls.resize(variant_offsets.size() * packed_stride_bytes);
+
+  bool ok;
+  string error;
+  if(variants.size() == 1) {
+    ok = reader.ReadVariant(
+      variants[0], packed_hardcalls.data(), packed_stride_bytes,
+      stats, &error);
+  } else {
+    bool contiguous = true;
+    for(size_t index = 1; index < variants.size(); ++index) {
+      if(static_cast<uint64_t>(variants[index]) !=
+         static_cast<uint64_t>(variants[index - 1]) + 1) {
+        contiguous = false;
+        break;
+      }
+    }
+    if(contiguous) {
+      ok = reader.ReadRange(
+        variants[0], static_cast<uint32_t>(variants.size()),
+        packed_hardcalls.data(), packed_stride_bytes, stats, &error);
+    } else {
+      ok = reader.ReadList(
+        variants.data(), static_cast<uint32_t>(variants.size()),
+        packed_hardcalls.data(), packed_stride_bytes, stats, &error);
+    }
+  }
+  if(!ok)
+    throw std::runtime_error("could not read " + context + ": " + error);
+}
+#endif
 
 // determine if snps should be included/excluded for step 1
 void check_snps_include_exclude(struct in_files* files, struct param* params, struct filter* filters, vector<snp>& snpinfo, map<int,vector<int>>& chr_map, mstream& sout){
@@ -2056,11 +2197,225 @@ void readChunkFromBedFileToG(const int& bs, const int& chrom, const uint32_t& sn
 }
 
 
+#ifdef REGENIE_USE_PGEN_RANS
+void readChunkFromRansPGENFileToG(const int& bs, const uint32_t& snpcount,
+  vector<snp> const& snpinfo, struct param const* params,
+  struct geno_block* gblock, struct filter const* filters,
+  Step1PgenReadProfile* profile) {
+
+  vector<uint64> variants(bs);
+  for(int variant = 0; variant < bs; ++variant)
+    variants[variant] = snpinfo[snpcount + variant].offset;
+  vector<unsigned char>& packed =
+    gblock->step1_pgen_packed_hardcalls;
+  size_t packed_stride = 0;
+  pgen_rans::PackedReadStats read_stats;
+  readRansPGENPackedVariants(
+    variants, *gblock->rans_pgen_reader, packed, packed_stride,
+    profile ? &read_stats : nullptr,
+    "Step 1 conditional-rANS PGEN hardcalls");
+
+  const uint64_t matrix_element_ct =
+    static_cast<uint64_t>(bs) *
+    static_cast<uint64_t>(params->n_samples);
+  const bool use_sample_major_expansion =
+    bs >= 32 && matrix_element_ct >= uint64_t(4) * 1024 * 1024;
+  const int worker_count = std::max(1, params->neff_threads);
+  const bool all_samples_in_analysis =
+    filters->ind_in_analysis.all();
+  const uint64_t excluded_per_variant = all_samples_in_analysis ? 0 :
+    static_cast<uint64_t>(filters->ind_in_analysis.size() -
+      filters->ind_in_analysis.count());
+  vector<double> expansion_thread_ms(
+    profile ? worker_count : 0, 0);
+  vector<uint64_t> missing_values(
+    profile ? worker_count : 0, 0);
+  if(use_sample_major_expansion) {
+    vector<double> means(bs, 0);
+    const auto summarize_variant = [&](const int variant,
+      const int thread_num) {
+      const unsigned char* source =
+        packed.data() + static_cast<size_t>(variant) * packed_stride;
+      uint64_t allele_sum = 0;
+      uint64_t observed_count = 0;
+      uint64_t missing_count = 0;
+      if(all_samples_in_analysis) {
+        const PackedHardcallDecodeStats stats =
+          summarize_packed_hardcalls(source, params->n_samples);
+        allele_sum = stats.allele_sum;
+        observed_count = stats.nonmissing;
+        missing_count = stats.missing;
+      } else {
+        for(Eigen::Index sample = 0;
+            sample < params->n_samples; ++sample) {
+          if(!filters->ind_in_analysis(sample)) continue;
+          const unsigned char code =
+            (source[sample / 4] >> (2 * (sample % 4))) & 3U;
+          if(code == 3) {
+            missing_count++;
+            continue;
+          }
+          allele_sum += code;
+          observed_count++;
+        }
+      }
+      // Deliberately mirror native PGEN's division semantics: when every
+      // analyzed value is missing, 0 / 0 yields the imputation NaN.
+      means[variant] =
+        static_cast<double>(allele_sum) / observed_count;
+      if(params->alpha_prior != -1)
+        gblock->snp_afs(variant, 0) = means[variant] / 2;
+      if(profile)
+        missing_values[thread_num] += missing_count;
+    };
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(worker_count)
+    {
+      const int thread_num = omp_get_thread_num();
+      ScopedThreadWorkTimer expansion_timer(
+        profile ? &expansion_thread_ms[thread_num] : nullptr);
+#pragma omp for schedule(static) nowait
+      for(int variant = 0; variant < bs; ++variant)
+        summarize_variant(variant, thread_num);
+    }
+#else
+    {
+      ScopedThreadWorkTimer expansion_timer(
+        profile ? &expansion_thread_ms[0] : nullptr);
+      for(int variant = 0; variant < bs; ++variant)
+        summarize_variant(variant, 0);
+    }
+#endif
+
+    const Eigen::Index packed_sample_byte_ct =
+      (static_cast<Eigen::Index>(params->n_samples) + 3) / 4;
+    const Eigen::Index output_stride = gblock->Gmat.outerStride();
+    double* const output = gblock->Gmat.data();
+    const auto expand_sample_byte = [&](const Eigen::Index byte_index) {
+      const Eigen::Index first_sample = 4 * byte_index;
+      const Eigen::Index lane_count = std::min<Eigen::Index>(
+        4, params->n_samples - first_sample);
+      for(Eigen::Index lane = 0; lane < lane_count; ++lane) {
+        const Eigen::Index sample = first_sample + lane;
+        double* const destination = output + sample * output_stride;
+        if(!filters->ind_in_analysis(sample)) {
+          std::fill(destination, destination + bs, 0.0);
+          continue;
+        }
+        for(int variant = 0; variant < bs; ++variant) {
+          const unsigned char code =
+            (packed[static_cast<size_t>(variant) * packed_stride +
+                    byte_index] >>
+             (2 * lane)) & 3U;
+          destination[variant] =
+            code == 3 ? means[variant] : static_cast<double>(code);
+        }
+      }
+    };
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(worker_count)
+    {
+      const int thread_num = omp_get_thread_num();
+      ScopedThreadWorkTimer expansion_timer(
+        profile ? &expansion_thread_ms[thread_num] : nullptr);
+#pragma omp for schedule(static) nowait
+      for(Eigen::Index byte_index = 0;
+          byte_index < packed_sample_byte_ct; ++byte_index)
+        expand_sample_byte(byte_index);
+    }
+#else
+    {
+      ScopedThreadWorkTimer expansion_timer(
+        profile ? &expansion_thread_ms[0] : nullptr);
+      for(Eigen::Index byte_index = 0;
+          byte_index < packed_sample_byte_ct; ++byte_index)
+        expand_sample_byte(byte_index);
+    }
+#endif
+  } else {
+    const auto expand_variant = [&](const int variant,
+      const int thread_num) {
+      const unsigned char* source =
+        packed.data() + static_cast<size_t>(variant) * packed_stride;
+      double total = 0;
+      uint64_t observed_count = 0;
+      uint64_t missing_count = 0;
+      for(Eigen::Index sample = 0; sample < params->n_samples; ++sample) {
+        const unsigned char code =
+          (source[sample / 4] >> (2 * (sample % 4))) & 3U;
+        if(!filters->ind_in_analysis(sample)) {
+          gblock->Gmat(variant, sample) = 0;
+        } else if(code == 3) {
+          gblock->Gmat(variant, sample) = -3;
+          missing_count++;
+        } else {
+          gblock->Gmat(variant, sample) = code;
+          total += code;
+          observed_count++;
+        }
+      }
+      // Deliberately mirror native PGEN's division semantics for an
+      // all-missing analyzed variant instead of rejecting it only in rANS.
+      total /= observed_count;
+      if(params->alpha_prior != -1)
+        gblock->snp_afs(variant, 0) = total / 2;
+      for(Eigen::Index sample = 0;
+          sample < params->n_samples; ++sample)
+        if(gblock->Gmat(variant, sample) == -3)
+          gblock->Gmat(variant, sample) = total;
+      if(profile)
+        missing_values[thread_num] += missing_count;
+    };
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(worker_count)
+    {
+      const int thread_num = omp_get_thread_num();
+      ScopedThreadWorkTimer expansion_timer(
+        profile ? &expansion_thread_ms[thread_num] : nullptr);
+#pragma omp for schedule(static) nowait
+      for(int variant = 0; variant < bs; ++variant)
+        expand_variant(variant, thread_num);
+    }
+#else
+    {
+      ScopedThreadWorkTimer expansion_timer(
+        profile ? &expansion_thread_ms[0] : nullptr);
+      for(int variant = 0; variant < bs; ++variant)
+        expand_variant(variant, 0);
+    }
+#endif
+  }
+  if(profile) {
+    const double reader_call_thread_ms =
+      1000 * (read_stats.block_read_seconds +
+              read_stats.decode_seconds +
+              read_stats.projection_seconds);
+    profile->variants += bs;
+    profile->fused_variants += bs;
+    profile->packed_bytes += packed.size();
+    profile->missing_values += std::accumulate(
+      missing_values.begin(), missing_values.end(), uint64_t(0));
+    profile->excluded_values += excluded_per_variant * bs;
+    profile->thread_work_ms += reader_call_thread_ms +
+      std::accumulate(
+        expansion_thread_ms.begin(), expansion_thread_ms.end(), 0.0);
+    profile->reader_call_thread_ms += reader_call_thread_ms;
+  }
+}
+#endif
+
 // only for step 1
 void readChunkFromPGENFileToG(const int& bs, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, mstream& sout, Step1PgenReadProfile* profile) {
 
   (void)masked_indivs;
   (void)sout;
+#ifdef REGENIE_USE_PGEN_RANS
+  if(gblock->rans_pgen_reader) {
+    readChunkFromRansPGENFileToG(
+      bs, snpcount, snpinfo, params, gblock, filters, profile);
+    return;
+  }
+#endif
   readChunkFromPGENFileToG(bs, snpcount, snpinfo, params,
     gblock->Gmat, gblock->snp_afs, gblock->pgr, filters,
     &gblock->step1_pgen_worker_tiles, profile);
@@ -2280,6 +2635,36 @@ void readChunkFromPGENFileToPackedHardcalls(const int& bs,
       reader_call_thread_ms.begin(), reader_call_thread_ms.end(), 0.0);
   }
 }
+
+#ifdef REGENIE_USE_PGEN_RANS
+void readChunkFromRansPGENFileToPackedHardcalls(const int& bs,
+  const uint32_t& snpcount, vector<snp> const& snpinfo,
+  struct param const* params, pgen_rans::PackedVariantReader& pgr,
+  vector<unsigned char>& packed_hardcalls, size_t& packed_stride_bytes,
+  Step1PgenReadProfile* profile) {
+
+  (void)params;
+  vector<uint64> variants(bs);
+  for(int variant = 0; variant < bs; ++variant)
+    variants[variant] = snpinfo[snpcount + variant].offset;
+  pgen_rans::PackedReadStats read_stats;
+  readRansPGENPackedVariants(
+    variants, pgr, packed_hardcalls, packed_stride_bytes,
+    profile ? &read_stats : nullptr,
+    "Step 1 packed conditional-rANS PGEN hardcalls");
+  if(profile) {
+    const double reader_call_thread_ms =
+      1000 * (read_stats.block_read_seconds +
+              read_stats.decode_seconds +
+              read_stats.projection_seconds);
+    profile->variants += bs;
+    profile->packed_variants += bs;
+    profile->packed_bytes += packed_hardcalls.size();
+    profile->thread_work_ms += reader_call_thread_ms;
+    profile->reader_call_thread_ms += reader_call_thread_ms;
+  }
+}
+#endif
 
 
 // check if uses Layout 2 (v1.2/1.3) & check for first SNP if precision for probabilities is 8 bits
@@ -3114,7 +3499,7 @@ void update_autosomal_trait_counts_from_packed(
 }  // namespace
 
 // step 2
-void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile, vector<vector<unsigned char>>* retained_packed_hardcalls, bool retain_unexpanded_packed, vector<double>* retained_packed_means, vector<unsigned char>* retained_packed_unexpanded, bool retain_all_packed_hardcalls){
+void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, struct param const* params, struct filter const* filters, Ref<MatrixXd> Gmat, PgenReader& pgr, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, vector<snp> const& snpinfo, vector<variant_block> &all_snps_info, Step2PgenReadProfile* profile, vector<vector<unsigned char>>* retained_packed_hardcalls, bool retain_unexpanded_packed, vector<double>* retained_packed_means, vector<unsigned char>* retained_packed_unexpanded, bool retain_all_packed_hardcalls, pgen_rans::PackedVariantReader* rans_pgen_reader){
 
   int const bs = indices.size();
   ArrayXb oob_err = ArrayXb::Constant(bs, false), het_male_X = ArrayXb::Constant(bs, false);
@@ -3168,6 +3553,34 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
   vector<uint64_t> packed_hardcall_bytes(profile ? worker_count : 0, 0);
   vector<uint64_t> packed_unexpanded_variants(
     profile ? worker_count : 0, 0);
+  size_t pgr_packed_stride =
+    (static_cast<size_t>(params->n_samples) + 3) / 4;
+  vector<unsigned char> pgr_packed;
+#ifdef REGENIE_USE_PGEN_RANS
+  if(rans_pgen_reader) {
+    if(params->dosage_mode)
+      throw std::runtime_error(
+        "conditional-rANS PGEN input cannot provide dosages");
+    vector<uint64> pgr_variants(bs);
+    for(int variant = 0; variant < bs; ++variant)
+      pgr_variants[variant] = snpinfo[indices[variant]].offset;
+    pgen_rans::PackedReadStats pgr_stats;
+    readRansPGENPackedVariants(
+      pgr_variants, *rans_pgen_reader, pgr_packed,
+      pgr_packed_stride, profile ? &pgr_stats : nullptr,
+      "Step 2 conditional-rANS PGEN hardcalls");
+    if(profile) {
+      const double reader_call_thread_ms =
+        1000 * (pgr_stats.block_read_seconds +
+                pgr_stats.decode_seconds +
+                pgr_stats.projection_seconds);
+      decode_thread_ms[0] += reader_call_thread_ms;
+      thread_work_ms[0] += reader_call_thread_ms;
+    }
+  }
+#else
+  (void)rans_pgen_reader;
+#endif
 
 #if defined(_OPENMP)
   setNbThreads(1);
@@ -3218,17 +3631,35 @@ void readChunkFromPGENFileToG(vector<uint64> const& indices, const int &chrom, s
       if( params->dosage_mode )
         pgr.Read(Geno.data(), Geno.size(), thread_num, cur_index, 1);
       else if(use_packed_hardcall_path) {
-        vector<unsigned char>& packed = step2_pgen_packed_workspace();
         const size_t packed_bytes =
           (static_cast<size_t>(Geno.size()) + 3) / 4;
-        packed.resize(packed_bytes);
-        pgr.ReadHardcallsPacked(packed.data(), packed.size(), Geno.size(),
-          thread_num, cur_index, 1);
-        packed_data = packed.data();
+        if(rans_pgen_reader) {
+          packed_data = pgr_packed.data() +
+            static_cast<size_t>(j) * pgr_packed_stride;
+        } else {
+          vector<unsigned char>& packed =
+            step2_pgen_packed_workspace();
+          packed.resize(packed_bytes);
+          pgr.ReadHardcallsPacked(
+            packed.data(), packed.size(), Geno.size(),
+            thread_num, cur_index, 1);
+          packed_data = packed.data();
+        }
         if(profile)
           packed_hardcall_bytes[thread_num] += packed_bytes;
+      } else if(rans_pgen_reader) {
+        const unsigned char* packed_data_local =
+          pgr_packed.data() +
+          static_cast<size_t>(j) * pgr_packed_stride;
+        for(Eigen::Index sample = 0; sample < Geno.size(); ++sample) {
+          const unsigned char code =
+            (packed_data_local[sample / 4] >>
+             (2 * (sample % 4))) & 3U;
+          Geno(sample) = code == 3 ? -3 : code;
+        }
       } else
-        pgr.ReadHardcalls(Geno.data(), Geno.size(), thread_num, cur_index, 1);
+        pgr.ReadHardcalls(
+          Geno.data(), Geno.size(), thread_num, cur_index, 1);
     }
 
     if(use_packed_hardcall_path) {
@@ -4908,6 +5339,107 @@ void read_masks(const struct in_files* files, struct param* params, map<string, 
 
 
 // read a single variant
+#ifdef REGENIE_USE_PGEN_RANS
+void read_snp_rans_pgen(bool const& mean_impute, uint64 const& offset,
+  Ref<ArrayXd> Geno, Ref<ArrayXb> mask,
+  pgen_rans::PackedVariantReader& reader, bool const& check_miss) {
+
+  if(reader.sample_ct() != static_cast<uint32_t>(Geno.size()))
+    throw std::runtime_error(
+      "conditional-rANS PGEN sample count does not match output");
+  vector<uint64> offsets(1, offset);
+  vector<unsigned char> packed;
+  size_t packed_stride = 0;
+  readRansPGENPackedVariants(
+    offsets, reader, packed, packed_stride, nullptr,
+    "conditional-rANS PGEN variant");
+  expand_packed_hardcalls(packed.data(), Geno.size(), Geno.data());
+  Geno *= mask.cast<double>();
+
+  if(check_miss) {
+    if(mean_impute) {
+      const ArrayXb observed = mask && (Geno != -3);
+      const double meanG = observed.select(Geno, 0).sum() /
+        observed.count();
+      Geno = (mask && (Geno == -3)).select(meanG, Geno);
+    } else {
+      mask = (Geno != -3).select(mask, false);
+    }
+  }
+}
+
+void read_snps_rans_pgen(bool const& mean_impute,
+  map<string, uint64>& snp_map, Ref<MatrixXd> Gmat,
+  Ref<ArrayXb> mask, pgen_rans::PackedVariantReader& reader) {
+
+  if(snp_map.empty()) return;
+  if(reader.sample_ct() != static_cast<uint32_t>(Gmat.rows()))
+    throw std::runtime_error(
+      "conditional-rANS PGEN sample count does not match output");
+  if(snp_map.size() > static_cast<size_t>(Gmat.cols()))
+    throw std::runtime_error(
+      "conditional-rANS PGEN output has too few columns");
+
+  struct VariantRequest {
+    uint64 offset;
+    Eigen::Index output_column;
+  };
+  vector<VariantRequest> requests;
+  requests.reserve(snp_map.size());
+  Eigen::Index output_column = 0;
+  for(const auto& variant : snp_map)
+    requests.push_back({variant.second, output_column++});
+  std::sort(
+    requests.begin(), requests.end(),
+    [](const VariantRequest& lhs, const VariantRequest& rhs) {
+      if(lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+      return lhs.output_column < rhs.output_column;
+    });
+
+  const size_t packed_stride = reader.packed_variant_byte_ct();
+  const size_t packed_budget = size_t(64) * 1024 * 1024;
+  const size_t batch_capacity = std::max<size_t>(
+    1, std::min<size_t>(
+      std::numeric_limits<uint32_t>::max(),
+      packed_stride ? packed_budget / packed_stride : requests.size()));
+  vector<unsigned char> packed;
+  vector<uint64> offsets;
+  for(size_t batch_begin = 0; batch_begin < requests.size();
+      batch_begin += batch_capacity) {
+    const size_t batch_size =
+      std::min(batch_capacity, requests.size() - batch_begin);
+    offsets.resize(batch_size);
+    for(size_t index = 0; index < batch_size; ++index)
+      offsets[index] = requests[batch_begin + index].offset;
+    size_t output_stride = 0;
+    readRansPGENPackedVariants(
+      offsets, reader, packed, output_stride, nullptr,
+      "conditional-rANS PGEN conditioning variants");
+    for(size_t index = 0; index < batch_size; ++index) {
+      const Eigen::Index column =
+        requests[batch_begin + index].output_column;
+      expand_packed_hardcalls(
+        packed.data() + index * output_stride, Gmat.rows(),
+        Gmat.col(column).data());
+    }
+  }
+
+  for(Eigen::Index column = 0;
+      column < static_cast<Eigen::Index>(snp_map.size()); ++column) {
+    MapArXd Geno(Gmat.col(column).data(), Gmat.rows(), 1);
+    Geno *= mask.cast<double>();
+    if(mean_impute) {
+      const ArrayXb observed = mask && (Geno != -3);
+      const double meanG = observed.select(Geno, 0).sum() /
+        observed.count();
+      Geno = (mask && (Geno == -3)).select(meanG, Geno);
+    } else {
+      mask = (Geno != -3).select(mask, false);
+    }
+  }
+}
+#endif
+
 void read_snp(bool const& mean_impute, uint64 const& offset, Ref<ArrayXd> Geno, Ref<ArrayXb> mask, const Eigen::Ref<const ArrayXb>& ind_ignore, struct in_files* files, PgenReader& pgr, struct param* params, bool const& check_miss){
 
   Geno = 0;
@@ -5481,7 +6013,7 @@ void setup_pgen(struct ext_geno_info& ginfo, geno_file_info* ext_file_info, map<
   uint32_t nv = read_pvar(index_map, ext_file_info, params, sout);
   uint32_t ns = read_psam(ginfo, ext_file_info, mask, params, sout);
   //cerr << "Nsamples=" << ns << "\tNvariants=" << nv << endl;
-  prep_pgen(ns, nv, ginfo, ext_file_info);
+  prep_pgen(ns, nv, ginfo, ext_file_info, params);
 
 }
 
@@ -5491,6 +6023,74 @@ void read_snps_pgen(bool const& mean_impute, map<string, uint64>& snp_map, Ref<M
   double total, ns;
   std::map <std::string, uint64>::iterator itr;
   ArrayXd Gread (ginfo.sample_keep.count()); // some analyzed samples may not be in file
+
+#ifdef REGENIE_USE_PGEN_RANS
+  if(ginfo.rans_pgen_reader) {
+    struct VariantRequest {
+      uint64 offset;
+      Eigen::Index output_column;
+    };
+    vector<VariantRequest> requests;
+    requests.reserve(snp_map.size());
+    for(itr = snp_map.begin(); itr != snp_map.end(); ++itr)
+      requests.push_back({itr->second,
+                          static_cast<Eigen::Index>(requests.size())});
+    std::sort(
+      requests.begin(), requests.end(),
+      [](const VariantRequest& lhs, const VariantRequest& rhs) {
+        if(lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+        return lhs.output_column < rhs.output_column;
+      });
+
+    const size_t packed_stride =
+      ginfo.rans_pgen_reader->packed_variant_byte_ct();
+    const size_t packed_budget = size_t(64) * 1024 * 1024;
+    const size_t batch_capacity = std::max<size_t>(
+      1, std::min<size_t>(
+        std::numeric_limits<uint32_t>::max(),
+        packed_stride ? packed_budget / packed_stride : requests.size()));
+    vector<unsigned char> packed;
+    vector<uint64> offsets;
+    for(size_t batch_begin = 0; batch_begin < requests.size();
+        batch_begin += batch_capacity) {
+      const size_t batch_size =
+        std::min(batch_capacity, requests.size() - batch_begin);
+      offsets.resize(batch_size);
+      for(size_t request = 0; request < batch_size; ++request)
+        offsets[request] = requests[batch_begin + request].offset;
+      size_t output_stride = 0;
+      readRansPGENPackedVariants(
+        offsets, *ginfo.rans_pgen_reader, packed, output_stride, nullptr,
+        "external conditional-rANS PGEN variants");
+      for(size_t request = 0; request < batch_size; ++request) {
+        expand_packed_hardcalls(
+          packed.data() + request * output_stride, Gread.size(),
+          Gread.data());
+        MapArXd Geno(
+          Gmat.col(requests[batch_begin + request].output_column).data(),
+          Gmat.rows(), 1);
+        for(int i_raw = 0, i = 0;
+            i_raw < ginfo.sample_keep.size(); ++i_raw) {
+          if(!ginfo.sample_keep(i_raw)) continue;
+          Geno(ginfo.sample_index(i_raw)) = Gread(i++);
+        }
+      }
+    }
+
+    for(count = 0; count < static_cast<int>(snp_map.size()); ++count) {
+      MapArXd Geno(Gmat.col(count).data(), Gmat.rows(), 1);
+      const ArrayXb observed = mask && (Geno != -3);
+      ns = observed.count();
+      if(ns == 0) {
+        Geno = -3;
+        continue;
+      }
+      total = observed.select(Geno, 0).sum();
+      if(mean_impute) mean_impute_g(total / ns, Geno, mask);
+    }
+    return;
+  }
+#endif
 
   for (itr = snp_map.begin(); itr != snp_map.end(); ++itr, count++) {
 

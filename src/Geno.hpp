@@ -27,6 +27,8 @@
 #ifndef GENO_H
 #define GENO_H
 
+#include <memory>
+
 #if defined(__GNUC__)
 // turn off the specific warning
 #pragma GCC diagnostic push
@@ -38,7 +40,14 @@
 #endif
 
 #include "pgenlibr.h"
+#ifdef REGENIE_USE_PGEN_RANS
+#include "pgen_rans_reader.h"
+#endif
 #include "Step2_Compute.hpp"
+
+namespace pgen_rans {
+class PackedVariantReader;
+}
 
 struct annoinfo {
   uint64 regionid = 0ULL;
@@ -172,6 +181,9 @@ struct geno_block {
   uint32_t ns, nv;
   BgenParser bgen;
   PgenReader pgr;
+#ifdef REGENIE_USE_PGEN_RANS
+  std::unique_ptr<pgen_rans::PackedVariantReader> rans_pgen_reader;
+#endif
   Eigen::MatrixXd Gmat;
   // Retain simple Step 2 PGEN hardcalls so packed CPU or CUDA scores can be
   // accumulated from two-bit codes without materializing sample vectors.
@@ -252,6 +264,9 @@ struct variant_block {
 struct ext_geno_info {
   bool dosage_mode, zlib_compress, streamBGEN;
   PgenReader pgr;
+#ifdef REGENIE_USE_PGEN_RANS
+  std::unique_ptr<pgen_rans::PackedVariantReader> rans_pgen_reader;
+#endif
   ArrayXb sample_keep; // keep track of samples in analysis
   Eigen::ArrayXi sample_index; // index of samples in analysis
 };
@@ -299,13 +314,28 @@ void readChunkFromPGENFileToG(const int&,const uint32_t&,std::vector<snp> const&
 void readChunkFromPGENFileToPackedHardcalls(const int&,const uint32_t&,
   std::vector<snp> const&,struct param const*,PgenReader&,
   std::vector<unsigned char>&,size_t&,Step1PgenReadProfile* = nullptr);
+#ifdef REGENIE_USE_PGEN_RANS
+void readChunkFromRansPGENFileToPackedHardcalls(const int&,const uint32_t&,
+  std::vector<snp> const&,struct param const*,
+  pgen_rans::PackedVariantReader&,std::vector<unsigned char>&,size_t&,
+  Step1PgenReadProfile* = nullptr);
+void readRansPGENPackedVariants(
+  std::vector<uint64> const&,pgen_rans::PackedVariantReader&,
+  std::vector<unsigned char>&,size_t&,pgen_rans::PackedReadStats* = nullptr,
+  std::string const& = "conditional-rANS PGEN variants");
+void read_snp_rans_pgen(bool const&,uint64 const&,Eigen::Ref<Eigen::ArrayXd>,
+  Eigen::Ref<ArrayXb>,pgen_rans::PackedVariantReader&,bool const&);
+void read_snps_rans_pgen(bool const&,std::map<std::string,uint64>&,
+  Eigen::Ref<Eigen::MatrixXd>,Eigen::Ref<ArrayXb>,
+  pgen_rans::PackedVariantReader&);
+#endif
 
 void readChunkFromBGENFileToG(std::vector<uint64> const&,const int&,std::vector<snp> const&,struct param const*,Eigen::Ref<Eigen::MatrixXd>,BgenParser&,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<variant_block>&,mstream&);
 void readChunkFromBGEN(std::istream*,std::vector<uint32_t>&,std::vector<uint32_t>&,std::vector<std::vector<uchar>>&,std::vector<uint64>&);
 void parseSNP(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool = false,Step2BgenParseProfile* = nullptr);
 void parseSnpfromBGEN(const int&,const int&,std::vector<uchar>*,const uint32_t&,const uint32_t&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*,mstream&,bool,Step2BgenParseProfile* = nullptr);
 void parseSnpfromBed(const int&,const int&,const std::vector<uchar>&,struct param const*,struct filter const*,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,const snp*,struct geno_block*,variant_block*);
-void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&,Step2PgenReadProfile* = nullptr,std::vector<std::vector<unsigned char>>* = nullptr,bool = false,std::vector<double>* = nullptr,std::vector<unsigned char>* = nullptr,bool = false);
+void readChunkFromPGENFileToG(std::vector<uint64> const&,const int&,struct param const*,struct filter const*,Eigen::Ref<Eigen::MatrixXd>,PgenReader&,const Eigen::Ref<const MatrixXb>&,const Eigen::Ref<const Eigen::MatrixXd>&,std::vector<snp> const&,std::vector<variant_block>&,Step2PgenReadProfile* = nullptr,std::vector<std::vector<unsigned char>>* = nullptr,bool = false,std::vector<double>* = nullptr,std::vector<unsigned char>* = nullptr,bool = false,pgen_rans::PackedVariantReader* = nullptr);
 
 void skip_snps(uint64 const&,struct param const*,struct in_files*,struct geno_block*);
 void jumpto_bed(uint64 const&,uint64 const&,std::ifstream&);
@@ -390,7 +420,7 @@ void read_snps_bgen(bool const&,std::map<std::string,uint64>&,Eigen::Ref<Eigen::
 void setup_pgen(struct ext_geno_info&,geno_file_info*,std::map<std::string,std::vector<uint64>>&,Eigen::Ref<ArrayXb>,struct param*,mstream&);
 uint32_t read_pvar(std::map<std::string,std::vector<uint64>>&,geno_file_info*,mstream&);
 uint32_t read_psam(struct ext_geno_info&,geno_file_info*,Eigen::Ref<ArrayXb>,struct param*,mstream&);
-void prep_pgen(uint32_t&,uint32_t&,struct ext_geno_info&,geno_file_info*);
+void prep_pgen(uint32_t&,uint32_t&,struct ext_geno_info&,geno_file_info*,struct param*);
 void read_snps_pgen(bool const&,std::map<std::string,uint64>&,Eigen::Ref<Eigen::MatrixXd>,struct ext_geno_info&,Eigen::Ref<ArrayXb>);
 void setup_bed(struct ext_geno_info&,geno_file_info*,std::map<std::string,std::vector<uint64>>&,Eigen::Ref<ArrayXb>,struct param*,mstream&);
 uint32_t read_bim(std::map<std::string,std::vector<uint64>>&,geno_file_info*,mstream&);

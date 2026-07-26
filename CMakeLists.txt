@@ -28,6 +28,8 @@ include(GNUInstallDirs)
 include(CTest)
 
 option(REGENIE_WITH_CUDA "Build the experimental CUDA compute backends" OFF)
+set(REGENIE_PGEN_RANS_ROOT "" CACHE PATH
+  "PLINK 2 conditional-rANS source directory (optional PGEN storage mode)")
 cmake_dependent_option(REGENIE_WITH_STEP2_CUDA
   "Build the experimental Stage 2 CUDA compute backend" ON
   "REGENIE_WITH_CUDA" OFF)
@@ -251,6 +253,36 @@ add_custom_target(
 target_link_libraries(regenie PRIVATE ${PGEN_PATH}/pgenlib.a)
 target_include_directories(regenie PRIVATE ${PGEN_PATH} ${PGEN_PATH}/simde/ ${PGEN_PATH}/include/)
 add_dependencies(regenie pgenlib)
+
+if(REGENIE_PGEN_RANS_ROOT)
+  find_package(Threads REQUIRED)
+  foreach(pgen_rans_source IN ITEMS
+      pgen_rans_codec.cc
+      pgen_rans_container.cc
+      pgen_rans_cpu.cc
+      pgen_rans_hybrid.cc
+      pgen_rans_reader.cc)
+    if(NOT EXISTS "${REGENIE_PGEN_RANS_ROOT}/${pgen_rans_source}")
+      message(FATAL_ERROR
+        "REGENIE_PGEN_RANS_ROOT is missing ${pgen_rans_source}")
+    endif()
+  endforeach()
+  add_library(regenie_pgen_rans STATIC
+    ${REGENIE_PGEN_RANS_ROOT}/pgen_rans_codec.cc
+    ${REGENIE_PGEN_RANS_ROOT}/pgen_rans_container.cc
+    ${REGENIE_PGEN_RANS_ROOT}/pgen_rans_cpu.cc
+    ${REGENIE_PGEN_RANS_ROOT}/pgen_rans_hybrid.cc
+    ${REGENIE_PGEN_RANS_ROOT}/pgen_rans_reader.cc)
+  target_compile_features(regenie_pgen_rans PRIVATE cxx_std_17)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(regenie_pgen_rans PRIVATE -fno-fast-math)
+  endif()
+  target_include_directories(
+    regenie_pgen_rans PUBLIC ${REGENIE_PGEN_RANS_ROOT})
+  target_link_libraries(regenie_pgen_rans PRIVATE Threads::Threads)
+  target_compile_definitions(regenie PRIVATE REGENIE_USE_PGEN_RANS)
+  target_link_libraries(regenie PRIVATE regenie_pgen_rans)
+endif()
 
 # REMETA library
 if(EXISTS ${HTSLIB_PATH})

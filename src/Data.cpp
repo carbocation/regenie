@@ -1887,8 +1887,11 @@ void Data::level_0_calculations() {
       ((static_cast<uint64_t>(params.n_samples) + 3) / 4) :
     static_cast<uint64_t>(params.block_size) * params.n_samples *
       sizeof(double);
-  const bool pgen_prefetch_enabled = pgen_cuda_backend &&
+  bool pgen_prefetch_enabled = pgen_cuda_backend &&
     pgen_prefetch_limit > 0 && pgen_block_bytes <= pgen_prefetch_limit;
+#ifdef REGENIE_USE_PGEN_RANS
+  if(Gblock.rans_pgen_reader) pgen_prefetch_enabled = false;
+#endif
   const int level0_pipeline_mode = step1_level0_pipeline_mode();
   const uint64_t level0_pipeline_auto_limit_bytes =
     uint64_t(1000) * 1000000;
@@ -2020,6 +2023,14 @@ void Data::level_0_calculations() {
           read_process_io_counters() : ProcessIoCounters();
         if(pgen_packed_hardcalls) {
           sout << " block [" << block + 1 << "] : " << flush;
+#ifdef REGENIE_USE_PGEN_RANS
+          if(Gblock.rans_pgen_reader)
+            readChunkFromRansPGENFileToPackedHardcalls(
+              bs, in_filters.step1_snp_count, snpinfo, &params,
+              *Gblock.rans_pgen_reader, Gblock.step1_pgen_packed_hardcalls,
+              Gblock.step1_pgen_packed_stride_bytes, pgen_profile);
+          else
+#endif
           readChunkFromPGENFileToPackedHardcalls(
             bs, in_filters.step1_snp_count, snpinfo, &params,
             Gblock.pgr, Gblock.step1_pgen_packed_hardcalls,
@@ -5777,7 +5788,11 @@ void Data::readChunk(vector<uint64>& indices, int const& chrom, vector< vector <
       &Gblock.step2_pgen_packed_means,
       &Gblock.step2_pgen_packed_unexpanded,
       step2_compute_backend && step2_compute_backend->ready() &&
-        step2_compute_backend->uses_packed_hardcalls());
+        step2_compute_backend->uses_packed_hardcalls()
+#ifdef REGENIE_USE_PGEN_RANS
+      , Gblock.rans_pgen_reader.get()
+#endif
+      );
   } else {
 
     snp_data_blocks.resize( n_snps );
@@ -5946,12 +5961,75 @@ void Data::getMask_loo(int const& chrom, int const& varset, vector< vector < uch
   in_lovo_mask = false; ur_variant = false; var_flip = false;
   ArrayXd Gvec(params.n_samples), var_mafs(n_snps);
 
-  for(int snp = 0, j = 0; snp < n_snps; snp++){
-    snp_index = orig_indices[ snp ];
-    read_snp(false, snpinfo[ snp_index ].offset, Gvec, in_filters.ind_in_analysis, in_filters.ind_ignore, &files, Gblock.pgr, &params, false);
-    in_lovo_mask(snp) = bm.check_in_lovo_mask(Gvec, in_filters, set_info->ID, snpinfo[ snp_index ], ur_variant(j), var_flip(j), var_mafs(j), chrom, &params);
-    if( in_lovo_mask(snp) )
-      rv_mat.col(j++) = Gvec.matrix().sparseView();
+  int lovo_column = 0;
+#ifdef REGENIE_USE_PGEN_RANS
+  if(Gblock.rans_pgen_reader) {
+    const size_t packed_stride =
+      Gblock.rans_pgen_reader->packed_variant_byte_ct();
+    const size_t packed_budget = size_t(64) * 1024 * 1024;
+    const size_t batch_capacity = std::max<size_t>(
+      1, std::min<size_t>(
+        std::numeric_limits<uint32_t>::max(),
+        packed_stride ? packed_budget / packed_stride :
+          static_cast<size_t>(n_snps)));
+    vector<uint64> offsets;
+    vector<unsigned char> packed;
+    for(size_t batch_begin = 0;
+        batch_begin < static_cast<size_t>(n_snps);
+        batch_begin += batch_capacity) {
+      const size_t batch_size = std::min(
+        batch_capacity, static_cast<size_t>(n_snps) - batch_begin);
+      offsets.resize(batch_size);
+      for(size_t batch_variant = 0;
+          batch_variant < batch_size; ++batch_variant) {
+        const int snp = static_cast<int>(batch_begin + batch_variant);
+        offsets[batch_variant] =
+          snpinfo[orig_indices[snp]].offset;
+      }
+      size_t output_stride = 0;
+      readRansPGENPackedVariants(
+        offsets, *Gblock.rans_pgen_reader, packed, output_stride, nullptr,
+        "LOVO conditional-rANS PGEN variants");
+      for(size_t batch_variant = 0;
+          batch_variant < batch_size; ++batch_variant) {
+        const int snp = static_cast<int>(batch_begin + batch_variant);
+        snp_index = orig_indices[snp];
+        const unsigned char* source =
+          packed.data() + batch_variant * output_stride;
+        for(Eigen::Index sample = 0;
+            sample < params.n_samples; ++sample) {
+          if(!in_filters.ind_in_analysis(sample)) {
+            Gvec(sample) = 0;
+            continue;
+          }
+          const unsigned char code =
+            (source[sample / 4] >> (2 * (sample % 4))) & 3U;
+          Gvec(sample) = code == 3 ? -3 : code;
+        }
+        in_lovo_mask(snp) = bm.check_in_lovo_mask(
+          Gvec, in_filters, set_info->ID, snpinfo[snp_index],
+          ur_variant(lovo_column), var_flip(lovo_column),
+          var_mafs(lovo_column), chrom, &params);
+        if(in_lovo_mask(snp))
+          rv_mat.col(lovo_column++) = Gvec.matrix().sparseView();
+      }
+    }
+  } else
+#endif
+  {
+    for(int snp = 0; snp < n_snps; snp++) {
+      snp_index = orig_indices[snp];
+      read_snp(
+        false, snpinfo[snp_index].offset, Gvec,
+        in_filters.ind_in_analysis, in_filters.ind_ignore, &files,
+        Gblock.pgr, &params, false);
+      in_lovo_mask(snp) = bm.check_in_lovo_mask(
+        Gvec, in_filters, set_info->ID, snpinfo[snp_index],
+        ur_variant(lovo_column), var_flip(lovo_column),
+        var_mafs(lovo_column), chrom, &params);
+      if(in_lovo_mask(snp))
+        rv_mat.col(lovo_column++) = Gvec.matrix().sparseView();
+    }
   }
 
   int n_snps_lovo = in_lovo_mask.count();
